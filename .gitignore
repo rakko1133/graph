@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS / ショートカット
+*.lnk
+Thumbs.db
+.DS_Store
+
+# 仮想環境
+.venv/
+venv/
+env/
+
+# エディタ/ツールの内部状態
+.claude/
+.vscode/
+.idea/
+
+# 大容量サンプルデータ・出力（tools/ のスクリプトで再生成可能なため含めない）
+サンプルデータ/
+出力/
+copilot版/
+csv_graph_scope_tool_scaffold/
+
+# tools が生成する作業データ（スクリプト *.py は残す）
+tools/doe_work/
+tools/ltspice_work/
+tools/fb_work/
+tools/noisy_work/
+
+# 生波形・ログ・一時画像
+*.raw
+importlog.txt
+graph.png

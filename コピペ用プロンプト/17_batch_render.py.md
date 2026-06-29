@@ -1,0 +1,114 @@
+# [17/30] ファイル `batch_render.py` を作成
+
+あなたは PySide6 + matplotlib 製のデスクトップアプリ「CSV / TSV / 波形 グラフ・解析ツール」を、複数ファイルに分けて再現しています。
+これはその **17 番目** のファイルです（全 30 ファイル）。
+
+## 指示（厳守）
+- 下のコードブロックの内容で、ファイル `batch_render.py` を**新規作成**してください。
+- **一字一句そのまま・省略なし**で出力すること。`pass` だけの空クラス／`# TODO`／`… 省略 …`／要約・解説への置き換えは**禁止**。
+- 出力が途中で切れたら、こちらが「続き」と言うので、**最後の行まで**出力してください。
+- 前置き・後書き・他ファイルの説明は不要。**このファイルの完全な中身だけ**を返してください。
+- 文字コードは UTF-8。フォルダ付きパス（例 `graph_app_mixins/...`）はその階層に作成してください。
+
+## `batch_render.py` の中身（このまま出力）
+```python
+# -*- coding: utf-8 -*-
+"""一括出力のワーカー（Qt非依存・別プロセスでも実行可能）。
+
+ProcessPoolExecutor から呼ぶため、ここでは Qt や graph_app を import しない。
+matplotlib は Agg バックエンド固定。タスクは完全に picklable な dict 1個で渡す。
+"""
+import matplotlib
+matplotlib.use("Agg", force=True)
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+import plotter
+
+_FONT_DONE = False
+
+
+def _ensure_font(font_name):
+    """ワーカープロセスごとに1回だけ日本語フォントを設定（□□□化を防ぐ）。"""
+    global _FONT_DONE
+    if not _FONT_DONE:
+        try:
+            import jp_font
+            jp_font.setup_japanese_font(font_name)
+        except Exception:        # noqa: BLE001  フォント未検出でも既定で続行
+            pass
+        _FONT_DONE = True
+
+
+def render_one(task):
+    """1ファイル分を描画して保存し、保存パスを返す。task は picklable な dict。
+
+    画面描画・逐次出力と同一の plot_series 経路を使うため、出力はピクセル一致する。
+    """
+    _ensure_font(task.get("font_name"))
+    fig = Figure(figsize=task["figsize"], dpi=task["dpi"])
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    plotter.plot_series(
+        ax, task["series"], task["ctype"], categories=task["categories"],
+        title=task["title"], xlabel=task["xlabel"], ylabel=task["ylabel"],
+        xlim=task["xlim"], ylim=task["ylim"],
+        secondary_label=task["sec_label"], max_points=task["max_points"],
+        **task["fmt"])
+    ratio = task.get("ratio")
+    if ratio:
+        ax.set_box_aspect(ratio)
+        ax2 = getattr(ax, "_twin_secondary", None)
+        if ax2 is not None:
+            ax2.set_box_aspect(ratio)
+    tight = task.get("tight", True)
+    if not tight:                       # 図サイズ＝画像比率。ラベルが収まるよう整える
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
+    fig.savefig(task["path"], dpi=task["dpi"],
+                bbox_inches=("tight" if tight else None),
+                transparent=task["transparent"])
+    return task["path"]
+
+
+def render_sequential(tasks):
+    """逐次出力（図を1つ再利用）。並列が使えない/不要なときのフォールバック。
+    戻り値 (saved_paths, skipped_msgs)。"""
+    import os
+    saved, skipped = [], []
+    if not tasks:
+        return saved, skipped
+    fig = Figure(figsize=tasks[0]["figsize"], dpi=tasks[0]["dpi"])
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    for t in tasks:
+        try:
+            ax.clear()
+            plotter.plot_series(
+                ax, t["series"], t["ctype"], categories=t["categories"],
+                title=t["title"], xlabel=t["xlabel"], ylabel=t["ylabel"],
+                xlim=t["xlim"], ylim=t["ylim"],
+                secondary_label=t["sec_label"], max_points=t["max_points"],
+                **t["fmt"])
+            ratio = t.get("ratio")
+            if ratio:
+                ax.set_box_aspect(ratio)
+                ax2 = getattr(ax, "_twin_secondary", None)
+                if ax2 is not None:
+                    ax2.set_box_aspect(ratio)
+            tight = t.get("tight", True)
+            if not tight:
+                try:
+                    fig.tight_layout()
+                except Exception:
+                    pass
+            fig.savefig(t["path"], dpi=t["dpi"],
+                        bbox_inches=("tight" if tight else None),
+                        transparent=t["transparent"])
+            saved.append(t["path"])
+        except Exception as e:  # noqa: BLE001
+            skipped.append(f"{os.path.basename(t['path'])}（{e}）")
+    return saved, skipped
+```
