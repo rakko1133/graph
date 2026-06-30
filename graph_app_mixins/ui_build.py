@@ -191,6 +191,16 @@ class UIBuildMixin:
         self.y_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.y_list.customContextMenuRequested.connect(self._y_list_menu)
         v.addWidget(self.y_list, 1)
+        # 名前で選択（入力した名前を含む系列だけをチェックし、他は解除）
+        yf = QtWidgets.QHBoxLayout()
+        self.y_filter = QtWidgets.QLineEdit()
+        self.y_filter.setPlaceholderText("名前で選択（例: 電圧）")
+        self.y_filter.setToolTip("入力した名前を含む系列だけを選択します（他は解除）。Enter でも実行。\n"
+                                 "複数ファイルで同じ列名だけ選びたいときに便利です。")
+        self.y_filter.returnPressed.connect(self.select_by_name)
+        b_yf = QtWidgets.QPushButton("名前で選択"); b_yf.clicked.connect(self.select_by_name)
+        yf.addWidget(self.y_filter, 1); yf.addWidget(b_yf)
+        v.addLayout(yf)
         ybtns = QtWidgets.QHBoxLayout()
         for text, fn in (("全選択", lambda: self._check_all_y(True)),
                          ("全解除", lambda: self._check_all_y(False)),

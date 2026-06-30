@@ -105,6 +105,32 @@ class StyleTableMixin:
         ck = QtCore.Qt.CheckState.Checked
         self._set_all_checks(lambda it: it.checkState() != ck)
 
+    def select_by_name(self):
+        """入力した名前を含む系列だけを選択（他は解除）。複数ファイルで同名列だけ選ぶのに便利。"""
+        text = self.y_filter.text().strip()
+        if not text:
+            self._set_status("名前を入力してください（例: 電圧）。")
+            return
+        tl = text.lower()
+
+        def match(it):
+            fl, col = it.data(UserRole)
+            return tl in str(col).lower() or tl in it.text().lower()
+
+        self._set_all_checks(match)
+        n = sum(1 for i in range(self.y_list.count())
+                if self.y_list.item(i).checkState() == QtCore.Qt.CheckState.Checked)
+        self._set_status(f"「{text}」を含む系列を {n} 件選択しました。"
+                         if n else f"「{text}」を含む系列はありません。")
+
+    def _select_same_name(self, item):
+        """指定系列と同じ列名の系列を（全ファイルから）すべて選択する。"""
+        if item is None:
+            return
+        col = item.data(UserRole)[1]
+        self._set_all_checks(lambda it: it.data(UserRole)[1] == col)
+        self._set_status(f"列名「{col}」の系列をすべて選択しました。")
+
     def _on_y_double_clicked(self, item):
         """Y行をダブルクリック → その系列だけにして描画。"""
         self._set_all_checks(lambda it: it is item)
@@ -120,6 +146,8 @@ class StyleTableMixin:
         if item is not None:
             menu.addAction("この系列だけ表示", lambda: self._solo_series(item))
             menu.addAction("この系列を非表示", lambda: self._hide_series(item))
+            menu.addAction("同じ列名をすべて選択",
+                           lambda: (self._select_same_name(item), self._maybe_draw()))
             menu.addSeparator()
         menu.addAction("すべて表示", lambda: (self._check_all_y(True), self._maybe_draw()))
         menu.addAction("すべて非表示", lambda: (self._check_all_y(False), self._maybe_draw()))
