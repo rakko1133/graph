@@ -1,0 +1,136 @@
+# -*- coding: utf-8 -*-
+"""アプリのオフスクリーン・スモーク＋数値正しさテスト。
+
+pytest でもスクリプト単体でも実行できる:
+    python -m pytest tests/                  （CI）
+    python tests/test_app.py                 （手元での簡易確認）
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import config_io  # noqa: E402
+
+config_io.load_last_session = lambda: None  # セッション復元を無効化（テスト独立）
+
+import graph_app  # noqa: E402
+from matplotlib.backends.qt_compat import QtCore, QtWidgets  # noqa: E402
+
+_app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+for _m in ("information", "critical", "warning"):
+    setattr(QtWidgets.QMessageBox, _m, staticmethod(lambda *a, **k: None))
+QtWidgets.QMessageBox.question = staticmethod(
+    lambda *a, **k: QtWidgets.QMessageBox.StandardButton.Yes)
+QtWidgets.QDialog.exec = lambda self: 0
+
+
+def _make_app(df, x="時間"):
+    w = graph_app.GraphApp()
+    w.datasets.clear(); w.file_list.clear(); w.y_list.clear()
+    w.datasets["t.csv"] = df
+    w.meta["t.csv"] = {"path": "t.csv", "enc": "utf-8", "delim": ","}
+    w._add_file_item("t.csv"); w.file_list.setCurrentRow(0); w._refresh_columns()
+    w.x_combo.setCurrentText(x)
+    for r in range(w.y_list.count()):
+        it = w.y_list.item(r)
+        on = it.data(graph_app.UserRole)[1] != x
+        it.setCheckState(QtCore.Qt.CheckState.Checked if on else QtCore.Qt.CheckState.Unchecked)
+    w._on_y_selection_changed()
+    return w
+
+
+def _wave():
+    t = np.linspace(0, 0.02, 1000)
+    return pd.DataFrame({"時間": t, "電圧": np.sin(2 * np.pi * 500 * t),
+                         "電流": np.cos(2 * np.pi * 500 * t)})
+
+
+# ---------------- スモーク（GUI が壊れていないか）----------------
+def test_construct():
+    w = _make_app(_wave())
+    assert w.tabs.count() == 4
+    assert hasattr(w, "ax")
+
+
+def test_draw_all_chart_types():
+    import plotter
+    w = _make_app(_wave())
+    for ct in plotter.CHART_TYPES:
+        w.chart_combo.setCurrentText(ct)
+        w.draw_graph()   # 例外を投げないこと
+
+
+def test_oscilloscope_and_fft():
+    w = _make_app(_wave())
+    w.chart_combo.setCurrentText("折れ線")
+    w.scope_check.setChecked(True); w.tdiv.setCurrentText("1ms"); w.vdiv.setCurrentText("500m")
+    w.draw_graph()
+    assert tuple(round(c, 3) for c in w.ax.get_facecolor()) != (1.0, 1.0, 1.0, 1.0)  # 濃色背景
+    w.scope_check.setChecked(False)
+    w.analysis_target.setCurrentText("電圧")
+    w.show_fft()
+    w.run_analysis()
+
+
+def test_axis_invert_and_power_notation():
+    w = _make_app(_wave())
+    w.chart_combo.setCurrentText("折れ線")
+    w.xinvert_check.setChecked(True); w.draw_graph()
+    x0, x1 = w.ax.get_xlim()
+    assert w.ax.xaxis_inverted() and x0 > x1
+    w.xscale_edit.setText("10^-6")
+    assert abs(w._plot_format_kwargs()["xscale"] - 1e-6) < 1e-18
+
+
+def test_config_roundtrip():
+    w = _make_app(_wave())
+    w.title_edit.setText("テスト"); w.xinvert_check.setChecked(True)
+    cfg = w._collect_config()
+    w2 = graph_app.GraphApp()
+    w2._apply_config(cfg, load_files=False)
+    assert w2.title_edit.text() == "テスト"
+    assert w2.xinvert_check.isChecked() is True
+
+
+# ---------------- 数値の正しさ（過去に直したバグの回帰防止）----------------
+def test_zero_crossing_period_all_duties():
+    import analysis_common as ac
+    fs = 10000.0
+    t = np.arange(0, 0.6, 1 / fs)
+    for duty in (0.1, 0.3, 0.5):
+        y = np.where((t % 0.1) < 0.1 * duty, 5.0, 0.0)
+        assert abs(ac._zero_crossing_period(t, y) - 0.1) < 5e-3   # 全デューティで0.1s
+
+
+def test_fft_nyquist_amplitude():
+    import analysis_spectrum as asp
+    n = 1024
+    tt = np.arange(n) / 1000.0
+    f, amp = asp.fft_spectrum(tt, 2 * np.cos(2 * np.pi * 500 * tt), window="rect", detrend=False)
+    assert abs(amp[-1] - 2.0) < 0.05   # ナイキストは2倍にならない
+
+
+def test_linear_regression():
+    import datasci
+    x = np.linspace(0, 10, 50)
+    d = datasci.linear_regression(x, 2 * x + 1)
+    assert abs(d["slope"] - 2) < 1e-6 and abs(d["intercept"] - 1) < 1e-6 and abs(d["r2"] - 1) < 1e-9
+
+
+# ---------------- スクリプト単体実行用ランナー ----------------
+if __name__ == "__main__":
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    ok = 0
+    for fn in tests:
+        try:
+            fn(); print(f"  [PASS] {fn.__name__}"); ok += 1
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            print(f"  [FAIL] {fn.__name__}: {traceback.format_exc().splitlines()[-1]}")
+    print(f"総合: {ok}/{len(tests)} PASS")
+    sys.exit(0 if ok == len(tests) else 1)

@@ -12,6 +12,7 @@ OUT = os.path.join(ROOT, "graph_onefile.py")
 
 # 連結順（facade analysis.py と graph_app_mixins/__init__.py は不要なので除外）
 ORDER = [
+    "applog.py",
     "config_io.py", "jp_font.py", "data_loader.py",
     "plotter_format.py", "plotter_draw.py", "plotter.py",
     "analysis_common.py", "analysis_spectrum.py", "analysis_measure.py",
@@ -26,7 +27,7 @@ ORDER = [
 ]
 # 内部モジュール名（これらへの import と修飾参照を消す）
 INTERNAL = {
-    "config_io", "jp_font", "data_loader", "plotter_format", "plotter_draw", "plotter",
+    "applog", "config_io", "jp_font", "data_loader", "plotter_format", "plotter_draw", "plotter",
     "analysis_common", "analysis_spectrum", "analysis_measure", "analysis",
     "advanced", "mathchan", "datasci", "batch_render", "graph_app_common", "graph_app_mixins",
 }
@@ -34,7 +35,7 @@ INTERNAL = {
 QUALIFIERS = sorted(
     {"plotter_format", "plotter_draw", "plotter", "analysis_common", "analysis_spectrum",
      "analysis_measure", "analysis", "mathchan", "config_io", "data_loader", "jp_font",
-     "advanced", "datasci", "batch_render"}, key=len, reverse=True)
+     "advanced", "datasci", "batch_render", "applog"}, key=len, reverse=True)
 
 
 def is_internal_import(stripped):

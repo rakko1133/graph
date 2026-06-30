@@ -46,6 +46,7 @@ class GraphApp(UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin,
         self._has_drawn = False       # 一度でも描画したか（リアルタイム更新の発火条件）
 
         self.font_name = jp_font.setup_japanese_font()
+        applog.get_logger().info("GraphApp 起動（フォント: %s）", self.font_name or "未検出")
         self.setWindowTitle("CSV / TSV / 波形 グラフ・解析ツール")
         self.resize(1280, 800)
         self.setAcceptDrops(True)     # Explorer からのドラッグ&ドロップ読み込み
@@ -86,17 +87,32 @@ class GraphApp(UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin,
         try:
             config_io.save_last_session(self._collect_config())
         except Exception:
-            pass
+            applog.get_logger().exception("終了時の設定保存に失敗")
+        applog.get_logger().info("GraphApp 終了")
         super().closeEvent(event)
 
 
 
 
 def main():
+    applog.setup_logging()
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-    win = GraphApp()
-    win.show()
-    sys.exit(app.exec())
+
+    def _notify(text):
+        try:
+            QtWidgets.QMessageBox.critical(None, "予期しないエラー",
+                                           f"{text}\n\n詳細は app.log を確認してください:\n{applog.LOG_FILE}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    applog.install_excepthook(on_error=_notify)   # 未捕捉例外もログ＋通知（無言終了の防止）
+    try:
+        win = GraphApp()
+        win.show()
+        sys.exit(app.exec())
+    except Exception:
+        applog.get_logger().exception("起動に失敗")
+        raise
 
 
 if __name__ == "__main__":

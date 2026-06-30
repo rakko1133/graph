@@ -13,6 +13,7 @@ from matplotlib.figure import Figure
 
 import advanced
 import analysis
+import applog
 import config_io
 import data_loader
 import datasci
@@ -106,6 +107,7 @@ __all__ = [
     "Figure",
     "advanced",
     "analysis",
+    "applog",
     "config_io",
     "data_loader",
     "datasci",

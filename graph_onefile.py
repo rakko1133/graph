@@ -4,8 +4,11 @@
 全モジュールを結合した版。これ1ファイルだけで動作する（依存: requirements.txt）。
 tools/build_onefile.py で再生成できる。使い方:  python graph_onefile.py
 """
-import json
+import logging
+import logging.handlers
 import os
+import sys
+import json
 import matplotlib
 import matplotlib.font_manager as fm
 import csv
@@ -19,13 +22,74 @@ import ast as _ast
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 import re
-import sys
 from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg as FigureCanvas,
     NavigationToolbar2QT as NavigationToolbar,
 )
 
+"""アプリのロギング設定（Qt 非依存）。
+
+ファイル（~/.csv_graph_tool/app.log・ローテーション付き）とコンソールへ出力し、
+未捕捉の例外も記録する。pythonw（コンソール無し）で無言終了しても、原因が
+app.log に残るようにするのが目的。
+"""
+
+LOG_DIR = os.path.join(os.path.expanduser("~"), ".csv_graph_tool")
+LOG_FILE = os.path.join(LOG_DIR, "app.log")
+_logger = None
+
+
+def setup_logging(level=logging.INFO):
+    """ロガーを構成して返す（多重構成しない）。"""
+    global _logger
+    if _logger is not None:
+        return _logger
+    logger = logging.getLogger("graphtool")
+    logger.setLevel(level)
+    logger.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except OSError:
+        pass  # 書き込めない環境でもアプリは動かす
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+    logger.propagate = False
+    _logger = logger
+    return logger
+
+
+def get_logger():
+    """構成済みロガー（未構成なら構成して返す）。"""
+    return _logger or setup_logging()
+
+
+def install_excepthook(on_error=None):
+    """未捕捉例外を app.log に記録する。on_error(text) があれば併せて呼ぶ（GUI通知用）。"""
+    logger = get_logger()
+
+    def _hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        logger.critical("未捕捉の例外", exc_info=(exc_type, exc, tb))
+        if on_error is not None:
+            try:
+                on_error(f"{exc_type.__name__}: {exc}")
+            except Exception:  # noqa: BLE001  通知失敗でフックを壊さない
+                pass
+
+    sys.excepthook = _hook
+
+# ======================================================================
+# ↑ py
+# ======================================================================
 """設定（グラフ・解析・表示状態）の保存と読み込み。
 
 UI の状態を 1 つの dict にまとめ、JSON で保存／読込する。
@@ -2806,6 +2870,7 @@ __all__ = [
     "Figure",
     "advanced",
     "analysis",
+    "applog",
     "config_io",
     "data_loader",
     "datasci",
@@ -4807,6 +4872,7 @@ class PlotMixin:
                 msg += "  ⚠ " + " / ".join(issues)
             self._set_status(msg)
         except Exception as e:  # noqa: BLE001
+            get_logger().exception("描画エラー")
             QtWidgets.QMessageBox.critical(self, "描画エラー", str(e))
 
     def _apply_tick_spacing(self, ctype, scope):
@@ -6562,6 +6628,7 @@ class GraphApp(UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin,
         self._has_drawn = False       # 一度でも描画したか（リアルタイム更新の発火条件）
 
         self.font_name = setup_japanese_font()
+        get_logger().info("GraphApp 起動（フォント: %s）", self.font_name or "未検出")
         self.setWindowTitle("CSV / TSV / 波形 グラフ・解析ツール")
         self.resize(1280, 800)
         self.setAcceptDrops(True)     # Explorer からのドラッグ&ドロップ読み込み
@@ -6602,17 +6669,32 @@ class GraphApp(UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin,
         try:
             save_last_session(self._collect_config())
         except Exception:
-            pass
+            get_logger().exception("終了時の設定保存に失敗")
+        get_logger().info("GraphApp 終了")
         super().closeEvent(event)
 
 
 
 
 def main():
+    setup_logging()
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-    win = GraphApp()
-    win.show()
-    sys.exit(app.exec())
+
+    def _notify(text):
+        try:
+            QtWidgets.QMessageBox.critical(None, "予期しないエラー",
+                                           f"{text}\n\n詳細は app.log を確認してください:\n{LOG_FILE}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    install_excepthook(on_error=_notify)   # 未捕捉例外もログ＋通知（無言終了の防止）
+    try:
+        win = GraphApp()
+        win.show()
+        sys.exit(app.exec())
+    except Exception:
+        get_logger().exception("起動に失敗")
+        raise
 
 
 if __name__ == "__main__":

@@ -288,6 +288,7 @@ class PlotMixin:
                 msg += "  ⚠ " + " / ".join(issues)
             self._set_status(msg)
         except Exception as e:  # noqa: BLE001
+            applog.get_logger().exception("描画エラー")
             QtWidgets.QMessageBox.critical(self, "描画エラー", str(e))
 
     def _apply_tick_spacing(self, ctype, scope):
