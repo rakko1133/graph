@@ -122,6 +122,49 @@ def test_linear_regression():
     assert abs(d["slope"] - 2) < 1e-6 and abs(d["intercept"] - 1) < 1e-6 and abs(d["r2"] - 1) < 1e-9
 
 
+def test_curve_fit_extensions():
+    import plotter
+    import plotter_draw
+    assert plotter.TRENDLINES[-3:] == ["ガウシアン", "ローレンツ", "シグモイド"]
+    x = np.linspace(-5, 5, 200)
+    y = 3.0 * np.exp(-((x - 1.0) ** 2) / (2 * 0.8 ** 2)) + 0.5
+    fit = plotter_draw.fit_trendline(x, y, "ガウシアン")
+    assert fit is not None and fit[3] > 0.999   # R² ほぼ1
+
+
+def test_clipboard_paste():
+    w = _make_app(_wave())
+    n0 = len(w.datasets)
+    QtWidgets.QApplication.clipboard().setText("A\tB\n1\t10\n2\t20")
+    w.paste_from_clipboard()
+    assert len(w.datasets) == n0 + 1
+
+
+def test_format_preset_roundtrip():
+    import glob
+    w = _make_app(_wave())
+    for p in glob.glob(os.path.join(w._presets_dir(), "*.json")):
+        os.remove(p)
+    w.grid_check.setChecked(False); w.fs_title.setValue(21)
+    QtWidgets.QInputDialog.getText = staticmethod(lambda *a, **k: ("p1", True))
+    w.save_preset()
+    assert "p1" in w._list_presets()
+    w.grid_check.setChecked(True); w.fs_title.setValue(10)
+    w.preset_combo.setCurrentText("p1"); w.apply_preset()
+    assert w.grid_check.isChecked() is False and w.fs_title.value() == 21
+    w.delete_preset()
+
+
+def test_undo_redo():
+    w = _make_app(_wave())
+    for s in ("A", "B", "C"):
+        w.title_edit.setText(s); w.draw_graph()
+    w.undo()
+    assert w.title_edit.text() == "B"
+    w.redo()
+    assert w.title_edit.text() == "C"
+
+
 # ---------------- スクリプト単体実行用ランナー ----------------
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

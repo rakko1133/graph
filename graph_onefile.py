@@ -341,13 +341,39 @@ def detect_delimiter(path, encoding):
     return "," if ext == ".csv" else "\t"
 
 
-def load_table(path, encoding=None, delimiter=None):
-    """CSV/TSV を読み込み (DataFrame, 使用した encoding, 使用した delimiter) を返す。
+def _normalize_columns(df):
+    """列名を文字列化・前後空白除去し、重複は ".1" 付与で一意化（CSV/Excel共通）。"""
+    used, new_cols = set(), []
+    for c in df.columns:
+        base = str(c).strip() or "列"
+        name, k = base, 1
+        while name in used:
+            name = f"{base}.{k}"
+            k += 1
+        used.add(name)
+        new_cols.append(name)
+    df.columns = new_cols
+    return df
 
-    encoding / delimiter を None にすると自動判定する。
+
+def load_table(path, encoding=None, delimiter=None):
+    """CSV/TSV/Excel を読み込み (DataFrame, 使用した encoding, 使用した delimiter) を返す。
+
+    encoding / delimiter を None にすると自動判定する。.xlsx/.xls/.xlsm は Excel として読む。
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"ファイルが見つかりません: {path}")
+
+    # --- Excel（先頭シート）---
+    if os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm", ".xls"):
+        try:
+            df = pd.read_excel(path)
+        except ImportError as e:
+            raise ValueError("Excel(.xlsx) の読み込みには openpyxl が必要です"
+                             "（pip install openpyxl）。") from e
+        if df.shape[1] == 0:
+            raise ValueError("シートから列を読み取れませんでした。")
+        return _normalize_columns(df), "excel", "excel"
 
     if encoding is None:
         encoding = detect_encoding(path)
@@ -378,21 +404,7 @@ def load_table(path, encoding=None, delimiter=None):
     if df.shape[1] == 0:
         raise ValueError("列を読み取れませんでした。区切り文字を確認してください。")
 
-    # 列名を文字列に統一し前後の空白を除去。空白除去で重複が生じた場合は
-    # pandas 同様に ".1" を付けて一意化する（df[col] が DataFrame になり
-    # 数値判定・描画が壊れるのを防ぐ）。
-    used = set()
-    new_cols = []
-    for c in df.columns:
-        base = str(c).strip() or "列"
-        name, k = base, 1
-        while name in used:  # 生成した名前も含めて必ず一意化する
-            name = f"{base}.{k}"
-            k += 1
-        used.add(name)
-        new_cols.append(name)
-    df.columns = new_cols
-    return df, encoding, delimiter
+    return _normalize_columns(df), encoding, delimiter
 
 
 def numeric_columns(df):
@@ -566,6 +578,47 @@ def fit_trendline(x, y, kind, degree=2, window=5):
             kern = np.ones(w) / w
             yf = np.convolve(y, kern, mode="same")
             return x, yf, f"移動平均(窓={w})", None
+        elif kind in ("ガウシアン", "ローレンツ", "シグモイド"):
+            # 非線形最小二乗（scipy 必須）。滑らかな曲線で返す。R² は実データ点で算出。
+            try:
+                from scipy.optimize import curve_fit
+            except Exception:
+                return None
+            if len(x) < 4:
+                return None
+            span = float(x.max() - x.min()) or 1.0
+            ymin, ymax = float(np.min(y)), float(np.max(y))
+            amp = (ymax - ymin) or 1.0
+            xpeak = float(x[int(np.argmax(y))])
+            if kind == "ガウシアン":
+                def model(xx, a, mu, sg, c):
+                    return a * np.exp(-((xx - mu) ** 2) / (2.0 * sg * sg)) + c
+                p0 = (amp, xpeak, span / 6.0, ymin)
+            elif kind == "ローレンツ":
+                def model(xx, a, x0, g, c):
+                    return a / (1.0 + ((xx - x0) / g) ** 2) + c
+                p0 = (amp, xpeak, span / 6.0, ymin)
+            else:  # シグモイド
+                def model(xx, L, k, x0, c):
+                    return L / (1.0 + np.exp(-k * (xx - x0))) + c
+                slope = 4.0 / span * (1.0 if y[-1] >= y[0] else -1.0)
+                p0 = (amp, slope, float(np.median(x)), ymin)
+            try:
+                popt, _ = curve_fit(model, x, y, p0=p0, maxfev=20000)
+            except Exception:
+                return None
+            yf_d = model(x, *popt)
+            ss_res = float(np.sum((y - yf_d) ** 2))
+            ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+            r2 = (1 - ss_res / ss_tot) if ss_tot > 0 else None
+            xfit = np.linspace(float(x.min()), float(x.max()), 200)
+            if kind == "ガウシアン":
+                eq = f"ガウシアン μ={popt[1]:.3g} σ={abs(popt[2]):.3g}"
+            elif kind == "ローレンツ":
+                eq = f"ローレンツ x0={popt[1]:.3g} γ={abs(popt[2]):.3g}"
+            else:
+                eq = f"シグモイド x0={popt[2]:.3g} k={popt[1]:.3g}"
+            return xfit, model(xfit, *popt), eq, r2
         else:
             return None
     except Exception:
@@ -968,7 +1021,8 @@ LEGEND_LOCS = ["best", "upper right", "upper left", "lower left",
                "lower center", "upper center", "center"]
 
 
-TRENDLINES = ["なし", "線形", "多項式", "指数", "対数", "移動平均"]
+TRENDLINES = ["なし", "線形", "多項式", "指数", "対数", "移動平均",
+              "ガウシアン", "ローレンツ", "シグモイド"]
 
 
 SERIES_KINDS = {"自動": "", "折れ線": "line", "棒": "bar", "面": "area",
@@ -2910,6 +2964,8 @@ class UIBuildMixin:
         # ファイル
         fm = m.addMenu("ファイル(&F)")
         self._menu_action(fm, "ファイル追加...", self.add_file, "Ctrl+O")
+        self._menu_action(fm, "クリップボードから貼り付け", self.paste_from_clipboard, "Ctrl+Shift+V",
+                          tip="Excel等からコピーした表を新規データとして読み込む")
         self.recent_menu = fm.addMenu("最近使ったファイル")
         self._rebuild_recent_menu()
         fm.addSeparator()
@@ -2921,6 +2977,10 @@ class UIBuildMixin:
         self._menu_action(fm, "設定を読み込み...", self.load_config_dialog, None)
         fm.addSeparator()
         self._menu_action(fm, "終了", self.close, "Ctrl+Q")
+        # 編集
+        em = m.addMenu("編集(&E)")
+        self._menu_action(em, "元に戻す", self.undo, "Ctrl+Z", tip="書式・設定の変更を1つ戻す")
+        self._menu_action(em, "やり直す", self.redo, "Ctrl+Y", tip="戻した変更をやり直す")
         # 表示
         vm = m.addMenu("表示(&V)")
         self._menu_action(vm, "グラフを描画", self.draw_graph, "F5")
@@ -3008,13 +3068,16 @@ class UIBuildMixin:
         row = QtWidgets.QHBoxLayout()
         b_add = QtWidgets.QPushButton("ファイル追加...")
         b_add.clicked.connect(self.add_file)
+        b_paste = QtWidgets.QPushButton("貼り付け")
+        b_paste.setToolTip("Excel等からコピーした表を新規データとして読み込む（Ctrl+Shift+V）")
+        b_paste.clicked.connect(self.paste_from_clipboard)
         b_del = QtWidgets.QPushButton("削除")
         b_del.setToolTip("選択中のファイルを削除（Ctrl/Shift＋クリックで複数選択→まとめて削除）")
         b_del.clicked.connect(self.remove_file)
         b_clear = QtWidgets.QPushButton("全削除")
         b_clear.setToolTip("読み込み済みファイルをすべて一覧から削除します。")
         b_clear.clicked.connect(self.clear_all_files)
-        row.addWidget(b_add)
+        row.addWidget(b_add); row.addWidget(b_paste)
         tv.addLayout(row)
         row_b = QtWidgets.QHBoxLayout()
         row_b.addWidget(b_del); row_b.addWidget(b_clear)
@@ -3141,6 +3204,20 @@ class UIBuildMixin:
     def _build_tab_graph(self):
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
+
+        # 書式プリセット（今の見た目に名前を付けて保存・呼び出し）
+        pre = QtWidgets.QHBoxLayout()
+        pre.addWidget(QtWidgets.QLabel("書式プリセット"))
+        self.preset_combo = QtWidgets.QComboBox()
+        self.preset_combo.setToolTip("保存した書式（フォント・グリッド・凡例・色・軸など）を呼び出します。")
+        pre.addWidget(self.preset_combo, 1)
+        b_pa = QtWidgets.QPushButton("適用"); b_pa.clicked.connect(self.apply_preset)
+        b_ps = QtWidgets.QPushButton("保存"); b_ps.clicked.connect(self.save_preset)
+        b_ps.setToolTip("現在の書式設定に名前を付けて保存")
+        b_pd = QtWidgets.QPushButton("削除"); b_pd.clicked.connect(self.delete_preset)
+        pre.addWidget(b_pa); pre.addWidget(b_ps); pre.addWidget(b_pd)
+        v.addLayout(pre)
+        self._refresh_preset_combo()
 
         v.addWidget(self._bold("グラフ種別"))
         self.chart_combo = QtWidgets.QComboBox()
@@ -3831,7 +3908,7 @@ class DataIOMixin:
         paths = []
         for url in event.mimeData().urls():
             p = url.toLocalFile()
-            if p and os.path.splitext(p)[1].lower() in (".csv", ".tsv", ".txt"):
+            if p and os.path.splitext(p)[1].lower() in (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls"):
                 paths.append(p)
         if not paths:
             return
@@ -3846,12 +3923,42 @@ class DataIOMixin:
     def add_file(self):
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "ファイルを追加（複数選択可）", self.last_dir,
-            "データ (*.csv *.tsv *.txt);;すべて (*.*)")
+            "データ (*.csv *.tsv *.txt *.xlsx *.xls *.xlsm);;Excel (*.xlsx *.xls *.xlsm);;"
+            "CSV/TSV (*.csv *.tsv *.txt);;すべて (*.*)")
         for p in paths:
             self._load_file(p)
         if paths:
             self.last_dir = os.path.dirname(paths[-1])
             self._refresh_columns()
+
+    def paste_from_clipboard(self):
+        """クリップボードの表データ（Excel等からのコピー＝TSV/CSV）を新規データとして読み込む。"""
+        import io
+        import pandas as pd
+        text = QtWidgets.QApplication.clipboard().text()
+        if not text or not text.strip():
+            QtWidgets.QMessageBox.information(self, "貼り付け", "クリップボードに表データがありません。")
+            return
+        first = text.splitlines()[0]
+        sep = "\t" if first.count("\t") >= first.count(",") else ","   # Excelコピーはタブ区切り
+        try:
+            df = pd.read_csv(io.StringIO(text), sep=sep, engine="python", skip_blank_lines=True)
+            df = _normalize_columns(df)
+        except Exception as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(self, "貼り付け", f"表として読み取れませんでした:\n{e}")
+            return
+        if df.shape[1] == 0 or len(df) == 0:
+            QtWidgets.QMessageBox.warning(self, "貼り付け", "表として読み取れませんでした。")
+            return
+        label, i = "貼り付け", 2
+        while label in self.datasets:
+            label = f"貼り付け ({i})"; i += 1
+        self.datasets[label] = df
+        self.meta[label] = {"path": "(clipboard)", "enc": "clipboard", "delim": sep}
+        self._add_file_item(label)
+        self.file_list.setCurrentRow(self.file_list.count() - 1)
+        self._refresh_columns()
+        self._set_status(f"クリップボードから {len(df)}行 × {len(df.columns)}列 を貼り付けました。")
 
     def _load_file(self, path):
         enc = self.enc_combo.currentText()
@@ -4865,6 +4972,7 @@ class PlotMixin:
             # スタイルのみ変更を即時反映するための skey->Line2D マップ（安全な場合のみ）
             self._style_artists = self._build_style_artist_map(series, ctype, bool(max_points))
             self._has_drawn = True
+            self._snapshot()   # Undo/Redo 用に設定の履歴を記録
             msg = f"「{ctype}」を描画しました（系列 {len(series)}）。"
             if max_points:
                 msg += f"（{total:,}点を間引き表示）"
@@ -6589,6 +6697,171 @@ class PersistenceMixin:
             return True
         except Exception:
             return False
+
+    # ------------------------------------------------------------ 書式プリセット
+    # 「データ/ファイル選択」に依存しない“見た目”だけを名前付きで保存・呼び出す。
+    _PRESET_KEYS = ("chart_type", "fonts", "grid", "legend", "legend_loc",
+                    "show_filename", "show_ext", "frame_width", "grid_width",
+                    "xlog", "ylog", "xinvert", "yinvert", "bins", "pct", "data_labels",
+                    "trend", "trend_degree", "trend_window", "trend_eq", "trend_color",
+                    "bg_color", "aspect", "aspect_w", "aspect_h")
+
+    def _presets_dir(self):
+        d = os.path.join(APP_DIR, "presets")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        return d
+
+    def _list_presets(self):
+        import glob
+        return sorted(os.path.splitext(os.path.basename(p))[0]
+                      for p in glob.glob(os.path.join(self._presets_dir(), "*.json")))
+
+    def _refresh_preset_combo(self, select=None):
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItems(self._list_presets())
+        if select:
+            i = self.preset_combo.findText(select)
+            if i >= 0:
+                self.preset_combo.setCurrentIndex(i)
+        self.preset_combo.blockSignals(False)
+
+    def save_preset(self):
+        import json
+        name, ok = QtWidgets.QInputDialog.getText(self, "書式プリセット保存", "プリセット名:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        data = {k: v for k, v in self._collect_config().items() if k in self._PRESET_KEYS}
+        try:
+            with open(os.path.join(self._presets_dir(), name + ".json"), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except OSError as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(self, "保存", str(e))
+            return
+        self._refresh_preset_combo(select=name)
+        self._set_status(f"書式プリセット「{name}」を保存しました。")
+
+    def apply_preset(self):
+        import json
+        name = self.preset_combo.currentText()
+        if not name:
+            return
+        try:
+            with open(os.path.join(self._presets_dir(), name + ".json"), encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            QtWidgets.QMessageBox.warning(self, "適用", "プリセットを読み込めませんでした。")
+            return
+        self._apply_format(data)
+        self._set_status(f"書式プリセット「{name}」を適用しました。")
+
+    def delete_preset(self):
+        name = self.preset_combo.currentText()
+        if not name:
+            return
+        try:
+            os.remove(os.path.join(self._presets_dir(), name + ".json"))
+        except OSError:
+            pass
+        self._refresh_preset_combo()
+
+    def _apply_format(self, d):
+        """プリセット（見た目のみ）を現在のウィジェットへ適用。データ選択には触れない。"""
+        prev = self._suspend_redraw
+        self._suspend_redraw = True
+        try:
+            if "chart_type" in d:
+                self.chart_combo.setCurrentText(d["chart_type"])
+            f = d.get("fonts") or {}
+            if f:
+                self.fs_title.setValue(f.get("title", 12)); self.fs_label.setValue(f.get("label", 10))
+                self.fs_tick.setValue(f.get("tick", 9)); self.fs_legend.setValue(f.get("legend", 9))
+                self.fs_annot.setValue(f.get("annot", 9))
+            for key, widget, kind in (
+                    ("grid", self.grid_check, "chk"), ("legend", self.legend_check, "chk"),
+                    ("legend_loc", self.legend_loc, "txt"),
+                    ("show_filename", self.show_filename_check, "chk"),
+                    ("show_ext", self.show_ext_check, "chk"),
+                    ("frame_width", self.frame_width, "val"), ("grid_width", self.grid_width, "val"),
+                    ("xlog", self.xlog, "chk"), ("ylog", self.ylog, "chk"),
+                    ("xinvert", self.xinvert_check, "chk"), ("yinvert", self.yinvert_check, "chk"),
+                    ("bins", self.bins_spin, "val"), ("pct", self.pct_check, "chk"),
+                    ("data_labels", self.data_labels_check, "chk"),
+                    ("trend", self.trend_combo, "txt"), ("trend_degree", self.trend_degree, "val"),
+                    ("trend_window", self.trend_window, "val"), ("trend_eq", self.trend_eq, "chk")):
+                if key in d:
+                    if kind == "chk":
+                        widget.setChecked(bool(d[key]))
+                    elif kind == "txt":
+                        widget.setCurrentText(d[key])
+                    else:
+                        widget.setValue(d[key])
+            tc = d.get("trend_color", "")
+            if tc:
+                self.trend_color = tc; self.trend_color_btn.setText("色: " + tc)
+                self.trend_color_btn.setStyleSheet(f"background:{tc};")
+            bgc = d.get("bg_color", "")
+            if bgc:
+                self.bg_color = bgc; self.bg_btn.setText("背景色: " + bgc)
+                self.bg_btn.setStyleSheet(f"background:{bgc};")
+            if "aspect" in d:
+                self.aspect_w.setValue(int(d.get("aspect_w", 16)))
+                self.aspect_h.setValue(int(d.get("aspect_h", 9)))
+                self.aspect_combo.setCurrentText(d["aspect"])
+        finally:
+            self._suspend_redraw = prev
+        if self.datasets:
+            self.draw_graph()
+
+    # ------------------------------------------------------------ Undo / Redo
+    def _snapshot(self):
+        """現在の設定を履歴に記録（Undo/Redo 用）。直前と同じなら積まない。"""
+        if getattr(self, "_restoring_undo", False):
+            return
+        import json
+        cfg = self._collect_config()
+        hist = getattr(self, "_hist", None)
+        if hist is None:
+            self._hist, self._hist_i = [cfg], 0
+            return
+        if json.dumps(cfg, ensure_ascii=False, sort_keys=True) == \
+                json.dumps(self._hist[self._hist_i], ensure_ascii=False, sort_keys=True):
+            return
+        del self._hist[self._hist_i + 1:]      # redo 分岐を捨てる
+        self._hist.append(cfg)
+        if len(self._hist) > 50:               # 上限
+            self._hist.pop(0)
+        self._hist_i = len(self._hist) - 1
+
+    def _apply_snapshot(self, cfg):
+        self._restoring_undo = True
+        try:
+            self._apply_config(cfg, load_files=False)
+            self.draw_graph()
+        finally:
+            self._restoring_undo = False
+
+    def undo(self):
+        hist = getattr(self, "_hist", None)
+        if not hist or self._hist_i <= 0:
+            self._set_status("これ以上戻せません。")
+            return
+        self._hist_i -= 1
+        self._apply_snapshot(self._hist[self._hist_i])
+        self._set_status("元に戻しました。")
+
+    def redo(self):
+        hist = getattr(self, "_hist", None)
+        if not hist or self._hist_i >= len(hist) - 1:
+            self._set_status("これ以上やり直せません。")
+            return
+        self._hist_i += 1
+        self._apply_snapshot(self._hist[self._hist_i])
+        self._set_status("やり直しました。")
 
 # ======================================================================
 # ↑ graph_app_mixins/persistence.py

@@ -103,6 +103,47 @@ def fit_trendline(x, y, kind, degree=2, window=5):
             kern = np.ones(w) / w
             yf = np.convolve(y, kern, mode="same")
             return x, yf, f"移動平均(窓={w})", None
+        elif kind in ("ガウシアン", "ローレンツ", "シグモイド"):
+            # 非線形最小二乗（scipy 必須）。滑らかな曲線で返す。R² は実データ点で算出。
+            try:
+                from scipy.optimize import curve_fit
+            except Exception:
+                return None
+            if len(x) < 4:
+                return None
+            span = float(x.max() - x.min()) or 1.0
+            ymin, ymax = float(np.min(y)), float(np.max(y))
+            amp = (ymax - ymin) or 1.0
+            xpeak = float(x[int(np.argmax(y))])
+            if kind == "ガウシアン":
+                def model(xx, a, mu, sg, c):
+                    return a * np.exp(-((xx - mu) ** 2) / (2.0 * sg * sg)) + c
+                p0 = (amp, xpeak, span / 6.0, ymin)
+            elif kind == "ローレンツ":
+                def model(xx, a, x0, g, c):
+                    return a / (1.0 + ((xx - x0) / g) ** 2) + c
+                p0 = (amp, xpeak, span / 6.0, ymin)
+            else:  # シグモイド
+                def model(xx, L, k, x0, c):
+                    return L / (1.0 + np.exp(-k * (xx - x0))) + c
+                slope = 4.0 / span * (1.0 if y[-1] >= y[0] else -1.0)
+                p0 = (amp, slope, float(np.median(x)), ymin)
+            try:
+                popt, _ = curve_fit(model, x, y, p0=p0, maxfev=20000)
+            except Exception:
+                return None
+            yf_d = model(x, *popt)
+            ss_res = float(np.sum((y - yf_d) ** 2))
+            ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+            r2 = (1 - ss_res / ss_tot) if ss_tot > 0 else None
+            xfit = np.linspace(float(x.min()), float(x.max()), 200)
+            if kind == "ガウシアン":
+                eq = f"ガウシアン μ={popt[1]:.3g} σ={abs(popt[2]):.3g}"
+            elif kind == "ローレンツ":
+                eq = f"ローレンツ x0={popt[1]:.3g} γ={abs(popt[2]):.3g}"
+            else:
+                eq = f"シグモイド x0={popt[2]:.3g} k={popt[1]:.3g}"
+            return xfit, model(xfit, *popt), eq, r2
         else:
             return None
     except Exception:

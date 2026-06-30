@@ -131,13 +131,39 @@ def detect_delimiter(path, encoding):
     return "," if ext == ".csv" else "\t"
 
 
-def load_table(path, encoding=None, delimiter=None):
-    """CSV/TSV を読み込み (DataFrame, 使用した encoding, 使用した delimiter) を返す。
+def _normalize_columns(df):
+    """列名を文字列化・前後空白除去し、重複は ".1" 付与で一意化（CSV/Excel共通）。"""
+    used, new_cols = set(), []
+    for c in df.columns:
+        base = str(c).strip() or "列"
+        name, k = base, 1
+        while name in used:
+            name = f"{base}.{k}"
+            k += 1
+        used.add(name)
+        new_cols.append(name)
+    df.columns = new_cols
+    return df
 
-    encoding / delimiter を None にすると自動判定する。
+
+def load_table(path, encoding=None, delimiter=None):
+    """CSV/TSV/Excel を読み込み (DataFrame, 使用した encoding, 使用した delimiter) を返す。
+
+    encoding / delimiter を None にすると自動判定する。.xlsx/.xls/.xlsm は Excel として読む。
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"ファイルが見つかりません: {path}")
+
+    # --- Excel（先頭シート）---
+    if os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm", ".xls"):
+        try:
+            df = pd.read_excel(path)
+        except ImportError as e:
+            raise ValueError("Excel(.xlsx) の読み込みには openpyxl が必要です"
+                             "（pip install openpyxl）。") from e
+        if df.shape[1] == 0:
+            raise ValueError("シートから列を読み取れませんでした。")
+        return _normalize_columns(df), "excel", "excel"
 
     if encoding is None:
         encoding = detect_encoding(path)
@@ -168,21 +194,7 @@ def load_table(path, encoding=None, delimiter=None):
     if df.shape[1] == 0:
         raise ValueError("列を読み取れませんでした。区切り文字を確認してください。")
 
-    # 列名を文字列に統一し前後の空白を除去。空白除去で重複が生じた場合は
-    # pandas 同様に ".1" を付けて一意化する（df[col] が DataFrame になり
-    # 数値判定・描画が壊れるのを防ぐ）。
-    used = set()
-    new_cols = []
-    for c in df.columns:
-        base = str(c).strip() or "列"
-        name, k = base, 1
-        while name in used:  # 生成した名前も含めて必ず一意化する
-            name = f"{base}.{k}"
-            k += 1
-        used.add(name)
-        new_cols.append(name)
-    df.columns = new_cols
-    return df, encoding, delimiter
+    return _normalize_columns(df), encoding, delimiter
 
 
 def numeric_columns(df):

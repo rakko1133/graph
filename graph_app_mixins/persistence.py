@@ -189,3 +189,168 @@ class PersistenceMixin:
             return True
         except Exception:
             return False
+
+    # ------------------------------------------------------------ 書式プリセット
+    # 「データ/ファイル選択」に依存しない“見た目”だけを名前付きで保存・呼び出す。
+    _PRESET_KEYS = ("chart_type", "fonts", "grid", "legend", "legend_loc",
+                    "show_filename", "show_ext", "frame_width", "grid_width",
+                    "xlog", "ylog", "xinvert", "yinvert", "bins", "pct", "data_labels",
+                    "trend", "trend_degree", "trend_window", "trend_eq", "trend_color",
+                    "bg_color", "aspect", "aspect_w", "aspect_h")
+
+    def _presets_dir(self):
+        d = os.path.join(config_io.APP_DIR, "presets")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        return d
+
+    def _list_presets(self):
+        import glob
+        return sorted(os.path.splitext(os.path.basename(p))[0]
+                      for p in glob.glob(os.path.join(self._presets_dir(), "*.json")))
+
+    def _refresh_preset_combo(self, select=None):
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItems(self._list_presets())
+        if select:
+            i = self.preset_combo.findText(select)
+            if i >= 0:
+                self.preset_combo.setCurrentIndex(i)
+        self.preset_combo.blockSignals(False)
+
+    def save_preset(self):
+        import json
+        name, ok = QtWidgets.QInputDialog.getText(self, "書式プリセット保存", "プリセット名:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        data = {k: v for k, v in self._collect_config().items() if k in self._PRESET_KEYS}
+        try:
+            with open(os.path.join(self._presets_dir(), name + ".json"), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except OSError as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(self, "保存", str(e))
+            return
+        self._refresh_preset_combo(select=name)
+        self._set_status(f"書式プリセット「{name}」を保存しました。")
+
+    def apply_preset(self):
+        import json
+        name = self.preset_combo.currentText()
+        if not name:
+            return
+        try:
+            with open(os.path.join(self._presets_dir(), name + ".json"), encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            QtWidgets.QMessageBox.warning(self, "適用", "プリセットを読み込めませんでした。")
+            return
+        self._apply_format(data)
+        self._set_status(f"書式プリセット「{name}」を適用しました。")
+
+    def delete_preset(self):
+        name = self.preset_combo.currentText()
+        if not name:
+            return
+        try:
+            os.remove(os.path.join(self._presets_dir(), name + ".json"))
+        except OSError:
+            pass
+        self._refresh_preset_combo()
+
+    def _apply_format(self, d):
+        """プリセット（見た目のみ）を現在のウィジェットへ適用。データ選択には触れない。"""
+        prev = self._suspend_redraw
+        self._suspend_redraw = True
+        try:
+            if "chart_type" in d:
+                self.chart_combo.setCurrentText(d["chart_type"])
+            f = d.get("fonts") or {}
+            if f:
+                self.fs_title.setValue(f.get("title", 12)); self.fs_label.setValue(f.get("label", 10))
+                self.fs_tick.setValue(f.get("tick", 9)); self.fs_legend.setValue(f.get("legend", 9))
+                self.fs_annot.setValue(f.get("annot", 9))
+            for key, widget, kind in (
+                    ("grid", self.grid_check, "chk"), ("legend", self.legend_check, "chk"),
+                    ("legend_loc", self.legend_loc, "txt"),
+                    ("show_filename", self.show_filename_check, "chk"),
+                    ("show_ext", self.show_ext_check, "chk"),
+                    ("frame_width", self.frame_width, "val"), ("grid_width", self.grid_width, "val"),
+                    ("xlog", self.xlog, "chk"), ("ylog", self.ylog, "chk"),
+                    ("xinvert", self.xinvert_check, "chk"), ("yinvert", self.yinvert_check, "chk"),
+                    ("bins", self.bins_spin, "val"), ("pct", self.pct_check, "chk"),
+                    ("data_labels", self.data_labels_check, "chk"),
+                    ("trend", self.trend_combo, "txt"), ("trend_degree", self.trend_degree, "val"),
+                    ("trend_window", self.trend_window, "val"), ("trend_eq", self.trend_eq, "chk")):
+                if key in d:
+                    if kind == "chk":
+                        widget.setChecked(bool(d[key]))
+                    elif kind == "txt":
+                        widget.setCurrentText(d[key])
+                    else:
+                        widget.setValue(d[key])
+            tc = d.get("trend_color", "")
+            if tc:
+                self.trend_color = tc; self.trend_color_btn.setText("色: " + tc)
+                self.trend_color_btn.setStyleSheet(f"background:{tc};")
+            bgc = d.get("bg_color", "")
+            if bgc:
+                self.bg_color = bgc; self.bg_btn.setText("背景色: " + bgc)
+                self.bg_btn.setStyleSheet(f"background:{bgc};")
+            if "aspect" in d:
+                self.aspect_w.setValue(int(d.get("aspect_w", 16)))
+                self.aspect_h.setValue(int(d.get("aspect_h", 9)))
+                self.aspect_combo.setCurrentText(d["aspect"])
+        finally:
+            self._suspend_redraw = prev
+        if self.datasets:
+            self.draw_graph()
+
+    # ------------------------------------------------------------ Undo / Redo
+    def _snapshot(self):
+        """現在の設定を履歴に記録（Undo/Redo 用）。直前と同じなら積まない。"""
+        if getattr(self, "_restoring_undo", False):
+            return
+        import json
+        cfg = self._collect_config()
+        hist = getattr(self, "_hist", None)
+        if hist is None:
+            self._hist, self._hist_i = [cfg], 0
+            return
+        if json.dumps(cfg, ensure_ascii=False, sort_keys=True) == \
+                json.dumps(self._hist[self._hist_i], ensure_ascii=False, sort_keys=True):
+            return
+        del self._hist[self._hist_i + 1:]      # redo 分岐を捨てる
+        self._hist.append(cfg)
+        if len(self._hist) > 50:               # 上限
+            self._hist.pop(0)
+        self._hist_i = len(self._hist) - 1
+
+    def _apply_snapshot(self, cfg):
+        self._restoring_undo = True
+        try:
+            self._apply_config(cfg, load_files=False)
+            self.draw_graph()
+        finally:
+            self._restoring_undo = False
+
+    def undo(self):
+        hist = getattr(self, "_hist", None)
+        if not hist or self._hist_i <= 0:
+            self._set_status("これ以上戻せません。")
+            return
+        self._hist_i -= 1
+        self._apply_snapshot(self._hist[self._hist_i])
+        self._set_status("元に戻しました。")
+
+    def redo(self):
+        hist = getattr(self, "_hist", None)
+        if not hist or self._hist_i >= len(hist) - 1:
+            self._set_status("これ以上やり直せません。")
+            return
+        self._hist_i += 1
+        self._apply_snapshot(self._hist[self._hist_i])
+        self._set_status("やり直しました。")

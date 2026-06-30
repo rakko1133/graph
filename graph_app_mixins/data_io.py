@@ -13,7 +13,7 @@ class DataIOMixin:
         paths = []
         for url in event.mimeData().urls():
             p = url.toLocalFile()
-            if p and os.path.splitext(p)[1].lower() in (".csv", ".tsv", ".txt"):
+            if p and os.path.splitext(p)[1].lower() in (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls"):
                 paths.append(p)
         if not paths:
             return
@@ -28,12 +28,42 @@ class DataIOMixin:
     def add_file(self):
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "ファイルを追加（複数選択可）", self.last_dir,
-            "データ (*.csv *.tsv *.txt);;すべて (*.*)")
+            "データ (*.csv *.tsv *.txt *.xlsx *.xls *.xlsm);;Excel (*.xlsx *.xls *.xlsm);;"
+            "CSV/TSV (*.csv *.tsv *.txt);;すべて (*.*)")
         for p in paths:
             self._load_file(p)
         if paths:
             self.last_dir = os.path.dirname(paths[-1])
             self._refresh_columns()
+
+    def paste_from_clipboard(self):
+        """クリップボードの表データ（Excel等からのコピー＝TSV/CSV）を新規データとして読み込む。"""
+        import io
+        import pandas as pd
+        text = QtWidgets.QApplication.clipboard().text()
+        if not text or not text.strip():
+            QtWidgets.QMessageBox.information(self, "貼り付け", "クリップボードに表データがありません。")
+            return
+        first = text.splitlines()[0]
+        sep = "\t" if first.count("\t") >= first.count(",") else ","   # Excelコピーはタブ区切り
+        try:
+            df = pd.read_csv(io.StringIO(text), sep=sep, engine="python", skip_blank_lines=True)
+            df = data_loader._normalize_columns(df)
+        except Exception as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(self, "貼り付け", f"表として読み取れませんでした:\n{e}")
+            return
+        if df.shape[1] == 0 or len(df) == 0:
+            QtWidgets.QMessageBox.warning(self, "貼り付け", "表として読み取れませんでした。")
+            return
+        label, i = "貼り付け", 2
+        while label in self.datasets:
+            label = f"貼り付け ({i})"; i += 1
+        self.datasets[label] = df
+        self.meta[label] = {"path": "(clipboard)", "enc": "clipboard", "delim": sep}
+        self._add_file_item(label)
+        self.file_list.setCurrentRow(self.file_list.count() - 1)
+        self._refresh_columns()
+        self._set_status(f"クリップボードから {len(df)}行 × {len(df.columns)}列 を貼り付けました。")
 
     def _load_file(self, path):
         enc = self.enc_combo.currentText()

@@ -20,6 +20,8 @@ class UIBuildMixin:
         # ファイル
         fm = m.addMenu("ファイル(&F)")
         self._menu_action(fm, "ファイル追加...", self.add_file, "Ctrl+O")
+        self._menu_action(fm, "クリップボードから貼り付け", self.paste_from_clipboard, "Ctrl+Shift+V",
+                          tip="Excel等からコピーした表を新規データとして読み込む")
         self.recent_menu = fm.addMenu("最近使ったファイル")
         self._rebuild_recent_menu()
         fm.addSeparator()
@@ -31,6 +33,10 @@ class UIBuildMixin:
         self._menu_action(fm, "設定を読み込み...", self.load_config_dialog, None)
         fm.addSeparator()
         self._menu_action(fm, "終了", self.close, "Ctrl+Q")
+        # 編集
+        em = m.addMenu("編集(&E)")
+        self._menu_action(em, "元に戻す", self.undo, "Ctrl+Z", tip="書式・設定の変更を1つ戻す")
+        self._menu_action(em, "やり直す", self.redo, "Ctrl+Y", tip="戻した変更をやり直す")
         # 表示
         vm = m.addMenu("表示(&V)")
         self._menu_action(vm, "グラフを描画", self.draw_graph, "F5")
@@ -118,13 +124,16 @@ class UIBuildMixin:
         row = QtWidgets.QHBoxLayout()
         b_add = QtWidgets.QPushButton("ファイル追加...")
         b_add.clicked.connect(self.add_file)
+        b_paste = QtWidgets.QPushButton("貼り付け")
+        b_paste.setToolTip("Excel等からコピーした表を新規データとして読み込む（Ctrl+Shift+V）")
+        b_paste.clicked.connect(self.paste_from_clipboard)
         b_del = QtWidgets.QPushButton("削除")
         b_del.setToolTip("選択中のファイルを削除（Ctrl/Shift＋クリックで複数選択→まとめて削除）")
         b_del.clicked.connect(self.remove_file)
         b_clear = QtWidgets.QPushButton("全削除")
         b_clear.setToolTip("読み込み済みファイルをすべて一覧から削除します。")
         b_clear.clicked.connect(self.clear_all_files)
-        row.addWidget(b_add)
+        row.addWidget(b_add); row.addWidget(b_paste)
         tv.addLayout(row)
         row_b = QtWidgets.QHBoxLayout()
         row_b.addWidget(b_del); row_b.addWidget(b_clear)
@@ -251,6 +260,20 @@ class UIBuildMixin:
     def _build_tab_graph(self):
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
+
+        # 書式プリセット（今の見た目に名前を付けて保存・呼び出し）
+        pre = QtWidgets.QHBoxLayout()
+        pre.addWidget(QtWidgets.QLabel("書式プリセット"))
+        self.preset_combo = QtWidgets.QComboBox()
+        self.preset_combo.setToolTip("保存した書式（フォント・グリッド・凡例・色・軸など）を呼び出します。")
+        pre.addWidget(self.preset_combo, 1)
+        b_pa = QtWidgets.QPushButton("適用"); b_pa.clicked.connect(self.apply_preset)
+        b_ps = QtWidgets.QPushButton("保存"); b_ps.clicked.connect(self.save_preset)
+        b_ps.setToolTip("現在の書式設定に名前を付けて保存")
+        b_pd = QtWidgets.QPushButton("削除"); b_pd.clicked.connect(self.delete_preset)
+        pre.addWidget(b_pa); pre.addWidget(b_ps); pre.addWidget(b_pd)
+        v.addLayout(pre)
+        self._refresh_preset_combo()
 
         v.addWidget(self._bold("グラフ種別"))
         self.chart_combo = QtWidgets.QComboBox()

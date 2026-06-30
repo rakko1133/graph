@@ -64,7 +64,8 @@ LEGEND_LOCS = ["best", "upper right", "upper left", "lower left",
                "lower center", "upper center", "center"]
 
 
-TRENDLINES = ["なし", "線形", "多項式", "指数", "対数", "移動平均"]
+TRENDLINES = ["なし", "線形", "多項式", "指数", "対数", "移動平均",
+              "ガウシアン", "ローレンツ", "シグモイド"]
 
 
 SERIES_KINDS = {"自動": "", "折れ線": "line", "棒": "bar", "面": "area",

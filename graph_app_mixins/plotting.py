@@ -281,6 +281,7 @@ class PlotMixin:
             # スタイルのみ変更を即時反映するための skey->Line2D マップ（安全な場合のみ）
             self._style_artists = self._build_style_artist_map(series, ctype, bool(max_points))
             self._has_drawn = True
+            self._snapshot()   # Undo/Redo 用に設定の履歴を記録
             msg = f"「{ctype}」を描画しました（系列 {len(series)}）。"
             if max_points:
                 msg += f"（{total:,}点を間引き表示）"
