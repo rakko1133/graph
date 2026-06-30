@@ -367,6 +367,13 @@ class UIBuildMixin:
         self.ytick_edit = QtWidgets.QLineEdit(); self.ytick_edit.setPlaceholderText("自動")
         self.ytick_edit.setToolTip("Y軸の目盛り間隔（1メモリの値）。空欄=自動。例: 10。対数軸では無効。")
         ax.addWidget(self.xtick_edit, 2, 1); ax.addWidget(self.ytick_edit, 2, 2)
+        # 軸の向き反転（0→1 を 1→0 のように）
+        ax.addWidget(QtWidgets.QLabel("軸反転"), 3, 0)
+        self.xinvert_check = QtWidgets.QCheckBox("X軸反転")
+        self.xinvert_check.setToolTip("X軸の向きを反転します（例: 0→1 を 1→0 に）。")
+        self.yinvert_check = QtWidgets.QCheckBox("Y軸反転")
+        self.yinvert_check.setToolTip("Y軸の向きを反転します（例: 下→上 を 上→下 に）。")
+        ax.addWidget(self.xinvert_check, 3, 1); ax.addWidget(self.yinvert_check, 3, 2)
         v.addLayout(ax)
 
         # 近似曲線（トレンドライン）・データラベル（折れ線/散布図向け）
@@ -867,7 +874,8 @@ class UIBuildMixin:
                   self.bins_spin, self.frame_width, self.grid_width):
             s.valueChanged.connect(r)
         for c in (self.grid_check, self.legend_check, self.pct_check,
-                  self.xlog, self.ylog, self.show_filename_check, self.show_ext_check):
+                  self.xlog, self.ylog, self.show_filename_check, self.show_ext_check,
+                  self.xinvert_check, self.yinvert_check):
             c.toggled.connect(r)
         self.legend_loc.currentTextChanged.connect(r)
         # 近似曲線・データラベル

@@ -187,6 +187,8 @@ class PlotMixin:
             bg_color=getattr(self, "bg_color", "") or "",
             grid_width=self.grid_width.value(),
             frame_width=self.frame_width.value(),
+            xinvert=self.xinvert_check.isChecked(),
+            yinvert=self.yinvert_check.isChecked(),
         )
 
     def draw_graph(self):

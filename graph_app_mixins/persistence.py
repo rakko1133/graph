@@ -45,6 +45,7 @@ class PersistenceMixin:
             "xunit": self.xunit_edit.text(), "yunit": self.yunit_edit.text(),
             "xscale": self.xscale_edit.text(), "yscale": self.yscale_edit.text(),
             "xlog": self.xlog.isChecked(), "ylog": self.ylog.isChecked(),
+            "xinvert": self.xinvert_check.isChecked(), "yinvert": self.yinvert_check.isChecked(),
             "bins": self.bins_spin.value(), "pct": self.pct_check.isChecked(),
             "trend": self.trend_combo.currentText(),
             "trend_degree": self.trend_degree.value(),
@@ -116,6 +117,7 @@ class PersistenceMixin:
         self.xunit_edit.setText(cfg.get("xunit", "")); self.yunit_edit.setText(cfg.get("yunit", ""))
         self.xscale_edit.setText(cfg.get("xscale", "1")); self.yscale_edit.setText(cfg.get("yscale", "1"))
         self.xlog.setChecked(cfg.get("xlog", False)); self.ylog.setChecked(cfg.get("ylog", False))
+        self.xinvert_check.setChecked(cfg.get("xinvert", False)); self.yinvert_check.setChecked(cfg.get("yinvert", False))
         self.bins_spin.setValue(cfg.get("bins", 30)); self.pct_check.setChecked(cfg.get("pct", True))
         self.trend_combo.setCurrentText(cfg.get("trend", "なし"))
         self.trend_degree.setValue(cfg.get("trend_degree", 2))

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """GraphApp と各 Mixin が共有する import・定数・補助クラス。"""
 import os
+import re
 import sys
 
 from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets
@@ -31,9 +32,17 @@ def _parse_float(text, default=None):
     if text == "":
         return default
     try:
-        return float(text)
+        return float(text)        # 1e-6 / 0.000001 / 1000 などはそのまま
     except ValueError:
-        return default
+        pass
+    # 『底^指数』表記も許可: 10^-6 → 1e-6, 2^10 → 1024（^ は累乗）
+    m = re.fullmatch(r"([+-]?[\d.]+)\s*\^\s*([+-]?[\d.]+)", text)
+    if m:
+        try:
+            return float(m.group(1)) ** float(m.group(2))
+        except (ValueError, OverflowError, ZeroDivisionError):
+            return default
+    return default
 
 
 class CheckListWidget(QtWidgets.QListWidget):

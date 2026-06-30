@@ -17,6 +17,10 @@ env/
 .claude/
 .vscode/
 .idea/
+.obsidian/
+
+# デバッグ起動.bat が出力する実行ログ
+log.txt
 
 # 大容量サンプルデータ・出力（tools/ のスクリプトで再生成可能なため含めない）
 サンプルデータ/

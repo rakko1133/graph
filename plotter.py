@@ -106,6 +106,8 @@ def plot_series(
     bg_color="",
     grid_width=None,
     frame_width=None,
+    xinvert=False,
+    yinvert=False,
 ):
     """ax に系列群を描画する。
 
@@ -240,6 +242,13 @@ def plot_series(
                             textcoords="offset points", xytext=(0, 8),
                             ha="center", color=m.get("color", "red"),
                             fontsize=fonts.get("tick", 9))
+
+    # --- 軸の向き反転（最後に適用。範囲指定・オシロ表示の後でも効く）---
+    if chart_type != "円":
+        if xinvert and not ax.xaxis_inverted():
+            ax.invert_xaxis()
+        if yinvert and not ax.yaxis_inverted():
+            ax.invert_yaxis()
     return ax
 
 
