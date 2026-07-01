@@ -190,6 +190,7 @@ class AdvancedMixin:
         if S is None:
             QtWidgets.QMessageBox.warning(self, "スペクトログラム", "計算できませんでした。")
             return
+        self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
         self._reset_figure_axes()
         self.ax.clear()
         self.ax.set_facecolor("white"); self.ax.tick_params(colors="black")
@@ -221,17 +222,18 @@ class AdvancedMixin:
             QtWidgets.QMessageBox.information(self, "情報", "上限または下限を入力してください。")
             return
         res = advanced.mask_test(t, np.asarray(y, float), upper=up, lower=lo)
-        # マスク線と違反点を重畳
+        # マスク線と違反点を重畳（現在のグラフに重ねる。3Dの上には重ねない）
         self.draw_graph()
-        if up is not None:
-            self.ax.axhline(up, color="#d00", ls="--", lw=0.8)
-        if lo is not None:
-            self.ax.axhline(lo, color="#d00", ls="--", lw=0.8)
-        if res["violations"]:
-            vt = res["violation_times"]
-            yv = np.asarray(y, float)[res["mask"]]
-            self.ax.plot(vt, yv, ".", color="#d00", ms=3)
-        self.canvas.draw()
+        if getattr(self.ax, "name", None) != "3d":
+            if up is not None:
+                self.ax.axhline(up, color="#d00", ls="--", lw=0.8)
+            if lo is not None:
+                self.ax.axhline(lo, color="#d00", ls="--", lw=0.8)
+            if res["violations"]:
+                vt = res["violation_times"]
+                yv = np.asarray(y, float)[res["mask"]]
+                self.ax.plot(vt, yv, ".", color="#d00", ms=3)
+            self.canvas.draw()
         verdict = "PASS ✅" if res["passed"] else f"FAIL ❌（{res['violations']}点 超過）"
         self.adv_result.setText(f"マスク判定: {verdict}")
         self._set_status(f"マスク判定 {label}: {verdict}")
@@ -246,6 +248,7 @@ class AdvancedMixin:
         # シンボルレート[Hz] と解釈（>1 ならレート、<1 なら周期[s]とみなす）
         sym_period = (1.0 / val) if val and val > 1 else (val or 1e-6)
         phase, yy = advanced.eye_diagram(t, np.asarray(y, float), sym_period, n_ui=2)
+        self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
         self._reset_figure_axes()
         self.ax.clear()
         self.ax.set_facecolor("white"); self.ax.tick_params(colors="black")
@@ -319,6 +322,7 @@ class AdvancedMixin:
         if len(cm["cycle_time"]) < 2:
             QtWidgets.QMessageBox.warning(self, "トレンド", "サイクルが不足しています。")
             return
+        self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
         self._reset_figure_axes()
         self.ax.clear()
         self.ax.set_facecolor("white"); self.ax.tick_params(colors="black")

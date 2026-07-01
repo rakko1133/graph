@@ -17,6 +17,13 @@ class StyleTableMixin:
         info = plotter.CHART_INFO.get(self.chart_combo.currentText(), {})
         self.x_combo.setEnabled(info.get("use_x", True) and not self._use_leftmost_x())
 
+    def _update_z_combo_enabled(self):
+        """Z名コンボ（3Dの奥行き軸）の有効状態を種別から決める。3D種別のみ有効。"""
+        if not hasattr(self, "z_combo"):
+            return
+        info = plotter.CHART_INFO.get(self.chart_combo.currentText(), {})
+        self.z_combo.setEnabled(bool(info.get("use_z", False)))
+
     def _use_leftmost_x(self):
         return bool(getattr(self, "xleft_check", None) and self.xleft_check.isChecked())
 
@@ -26,6 +33,11 @@ class StyleTableMixin:
             return df.iloc[:, 0].to_numpy()
         xname = self.x_combo.currentText()
         return df[xname].to_numpy() if xname in df.columns else df.iloc[:, 0].to_numpy()
+
+    def _z_values(self, df):
+        """Z軸データ列（3D用）。選択名が無ければ最終列で代用する。"""
+        zname = self.z_combo.currentText() if hasattr(self, "z_combo") else ""
+        return df[zname].to_numpy() if zname in df.columns else df.iloc[:, -1].to_numpy()
 
     def _effective_x_label(self):
         """既定のX軸ラベル（『一番左の列』ONなら先頭列名、OFFなら選択名）。"""

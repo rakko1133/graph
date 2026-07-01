@@ -235,6 +235,17 @@ class DataIOMixin:
             self.x_combo.setCurrentText(cur_x)
         self.x_combo.blockSignals(False)
 
+        # Z軸候補（3D用）。X と同じ列集合。既定は最終列。
+        if hasattr(self, "z_combo"):
+            cur_z = self.z_combo.currentText()
+            self.z_combo.blockSignals(True)
+            self.z_combo.clear(); self.z_combo.addItems(xcols)
+            if cur_z in xcols:
+                self.z_combo.setCurrentText(cur_z)
+            elif xcols:
+                self.z_combo.setCurrentText(xcols[-1])
+            self.z_combo.blockSignals(False)
+
         # Y軸候補（ファイル｜列）。選択状態は表示名ではなく安定した
         # (ファイル, 列) 識別子で保持する（ファイル数で表示名が変わっても消えない）。
         checked = QtCore.Qt.CheckState.Checked

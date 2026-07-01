@@ -70,6 +70,8 @@ class ScopeCursorMixin:
     def _on_cursor_press(self, event):
         if event.inaxes is not self.ax or event.xdata is None:
             return
+        if getattr(self.ax, "name", None) == "3d":   # 3Dは回転を優先しカーソル無効
+            return
         near = self._cursor_near(event)
         if near is not None:                       # 既存カーソルを掴んで微調整
             self._cursor_drag = near
@@ -226,11 +228,13 @@ class ScopeCursorMixin:
     def _wheel_zoom(self, event):
         """通常グラフのマウスホイール拡大縮小。カーソル位置を中心にズームする。
         Shift+ホイールはX方向のみ（波形の横拡大）。"""
-        # カーソル測定中・ツールバーのパン/ズーム中・未描画・円グラフでは無効
+        # カーソル測定中・ツールバーのパン/ズーム中・未描画・円・3Dでは無効
+        # （3Dは mplot3d 標準のドラッグ回転・ホイールに任せる）
         if (self._cursor_cid is not None
                 or getattr(self.toolbar, "mode", "")
                 or not getattr(self, "_has_drawn", False)
-                or self.chart_combo.currentText() == "円"):
+                or self.chart_combo.currentText() == "円"
+                or getattr(self.ax, "name", None) == "3d"):
             return
         factor = 0.8 if event.button == "up" else 1.25   # up=拡大（範囲を狭める）
         x0, x1 = self.ax.get_xlim()

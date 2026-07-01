@@ -9,7 +9,7 @@ class BatchMixin:
         """現在のグラフを保存。縦横比の指定があれば画像そのものをその比率にする
         （図を比率サイズにして bbox トリミングせず保存）。自動なら従来どおり tight 保存。"""
         ratio = self._aspect_ratio()
-        if not ratio:
+        if not ratio or self._is_3d():   # 3D は box_aspect 比率調整をせずそのまま保存
             self.fig.savefig(target, dpi=dpi, bbox_inches="tight",
                              transparent=transparent, format=fmt)
             return
@@ -71,7 +71,8 @@ class BatchMixin:
         import re
         return re.sub(r'[\\/:*?"<>|]+', "_", str(name)).strip() or "graph"
 
-    def _build_series_for_file(self, label, x_name, y_names, chart_type, style_by_col):
+    def _build_series_for_file(self, label, x_name, y_names, chart_type, style_by_col,
+                               z_name=""):
         """1ファイルから、指定した列名テンプレートで系列を作る（一括出力用）。
         『一番左の列をX軸』ONなら、各ファイルの先頭列を位置でX軸に使う。"""
         df = self.datasets[label]
@@ -84,6 +85,12 @@ class BatchMixin:
             for c in y_names:
                 series.append({"label": c, "y": df[c].to_numpy(),
                                "style": style_by_col.get(c)})
+        elif plotter.is_3d_type(chart_type):
+            zv = (df[z_name].to_numpy() if z_name in df.columns else df.iloc[:, -1].to_numpy())
+            for c in y_names:
+                st = style_by_col.get(c) or {}
+                series.append({"label": c, "x": xv, "y": df[c].to_numpy(), "z": zv,
+                               "style": st, "kind": st.get("kind", "")})
         elif chart_type in ("折れ線", "散布図", "面", "積み上げ面",
                             "ステップ", "ステム", "2Dヒストグラム", "hexbin"):
             for c in y_names:
@@ -152,6 +159,10 @@ class BatchMixin:
                 "その列名を各ファイルに適用し、ファイルごとに1枚ずつ出力します。")
             return
         x_name = self.x_combo.currentText()
+        z_name = self.z_combo.currentText() if hasattr(self, "z_combo") else ""
+        is3d = plotter.is_3d_type(ctype)
+        view_init = self._view_angles() if is3d else None
+        zlabel = z_name if is3d else ""
         opts = self._batch_options_dialog()   # タイトル・形式・DPI・透過を調整
         if opts is None:
             return
@@ -189,7 +200,7 @@ class BatchMixin:
                 continue
             try:
                 series, categories = self._build_series_for_file(
-                    label, x_name, cols, ctype, style_by_col)
+                    label, x_name, cols, ctype, style_by_col, z_name=z_name)
             except Exception as e:  # noqa: BLE001
                 skipped.append(f"{label}（{e}）")
                 continue
@@ -209,6 +220,7 @@ class BatchMixin:
                 "xlabel": xlab, "ylabel": auto_ylabel,
                 "xlim": xlim, "ylim": ylim, "sec_label": sec_label,
                 "max_points": max_points, "fmt": fmt, "ratio": None,
+                "zlabel": zlabel, "view_init": view_init,
                 "figsize": tuple(figsize), "tight": tight,
                 "dpi": dpi, "transparent": transparent,
                 "path": os.path.join(out_dir, f"{name}.{ext}"),

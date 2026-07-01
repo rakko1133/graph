@@ -98,6 +98,53 @@ def test_new_chart_types_render_and_colorbar_cleanup():
     assert any("近似" in str(ln.get_label()) for ln in w.ax.get_lines())
 
 
+def test_3d_charts_and_axis_swap():
+    """3D種別が3D軸で描画され、2D⇔3D往復や視点角度・特殊表示への復帰が壊れないこと。"""
+    import plotter
+    df = pd.DataFrame({"時間": np.linspace(0, 10, 60),
+                       "電圧": np.sin(np.linspace(0, 10, 60)) + 2,
+                       "電流": np.cos(np.linspace(0, 10, 60))})
+    w = _make_app(df, x="時間")
+    w.z_combo.setCurrentText("電流")
+
+    for ct in ("3D散布図", "3D折れ線", "3D曲面", "3D棒"):
+        w.chart_combo.setCurrentText(ct)
+        w.draw_graph()
+        assert getattr(w.ax, "name", None) == "3d", f"{ct} が3D軸で描かれていない"
+        assert (len(w.ax.collections) + len(w.ax.lines)) > 0, f"{ct} が空"
+
+    # 視点角度がグラフに反映される
+    w.chart_combo.setCurrentText("3D散布図")
+    w.elev_spin.setValue(45); w.azim_spin.setValue(120)
+    w.draw_graph()
+    assert round(w.ax.elev) == 45 and round(w.ax.azim) == 120
+
+    # 2D⇔3D を往復しても補助軸（カラーバー等）が積み重ならない
+    for ct in ("折れ線", "3D散布図", "2Dヒストグラム", "3D曲面", "折れ線"):
+        w.chart_combo.setCurrentText(ct)
+        w.draw_graph()
+        assert len(w.fig.axes) <= 2, f"{ct} 後に補助軸が累積"
+    assert getattr(w.ax, "name", None) != "3d"
+
+    # 3D表示中でも FFT（2D専用ビュー）が2D軸に戻って描ける
+    w.chart_combo.setCurrentText("3D散布図"); w.draw_graph()
+    w.analysis_target.setCurrentText("電圧")
+    w.show_fft()
+    assert getattr(w.ax, "name", None) != "3d"
+
+    # 3D棒は複数系列でも凡例が出る（bar3d に label を渡している）
+    w.chart_combo.setCurrentText("3D棒"); w.legend_check.setChecked(True); w.draw_graph()
+    _, labels = w.ax.get_legend_handles_labels()
+    assert len(labels) >= 2
+
+    # 3D表示中に全Y選択を外しても、案内表示（2D軸）へ安全に戻る（クラッシュしない）
+    w.chart_combo.setCurrentText("3D散布図"); w.draw_graph()
+    for r in range(w.y_list.count()):
+        w.y_list.item(r).setCheckState(QtCore.Qt.CheckState.Unchecked)
+    w.draw_graph()   # 空選択 → プレースホルダ。3D軸のままだと例外になっていた
+    assert getattr(w.ax, "name", None) != "3d"
+
+
 def test_oscilloscope_and_fft():
     w = _make_app(_wave())
     w.chart_combo.setCurrentText("折れ線")

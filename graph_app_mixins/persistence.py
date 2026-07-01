@@ -28,9 +28,12 @@ class PersistenceMixin:
         return {
             "files": [self.meta[l]["path"] for l in self.datasets],
             "x_col": self.x_combo.currentText(),
+            "z_col": self.z_combo.currentText() if hasattr(self, "z_combo") else "",
             "x_leftmost": self.xleft_check.isChecked(),
             "selected_y": [[fl, col] for fl, col, _ in self._selected_series_items()],
             "chart_type": self.chart_combo.currentText(),
+            "view_elev": self.elev_spin.value() if hasattr(self, "elev_spin") else 30,
+            "view_azim": self.azim_spin.value() if hasattr(self, "azim_spin") else -60,
             "title": self.title_edit.text(),
             "xlabel": self.xlabel_edit.text(), "ylabel": self.ylabel_edit.text(),
             "fonts": self._fonts(),
@@ -88,6 +91,13 @@ class PersistenceMixin:
             i = self.x_combo.findText(cfg["x_col"])
             if i >= 0:
                 self.x_combo.setCurrentIndex(i)
+        if cfg.get("z_col") and hasattr(self, "z_combo"):
+            j = self.z_combo.findText(cfg["z_col"])
+            if j >= 0:
+                self.z_combo.setCurrentIndex(j)
+        if hasattr(self, "elev_spin") and "view_elev" in cfg:
+            self.elev_spin.setValue(int(cfg["view_elev"]))
+            self.azim_spin.setValue(int(cfg.get("view_azim", -60)))
         self.xleft_check.setChecked(bool(cfg.get("x_leftmost", False)))
         self._refresh_columns()
         # Y 選択を復元（安定した (ファイル, 列) 識別子で照合）

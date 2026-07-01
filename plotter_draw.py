@@ -556,6 +556,80 @@ def _draw_heatmap(ax, series):
     _add_colorbar(ax, im, label="値")
 
 
+def _xyz_finite(sr):
+    """1系列から数値の (x, y, z) を取り出し、非有限を除いて長さを揃える。"""
+    x = _num(sr.get("x")); y = _num(sr["y"]); z = _num(sr.get("z"))
+    n = min(len(x), len(y), len(z))
+    x, y, z = x[:n], y[:n], z[:n]
+    m = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+    return x[m], y[m], z[m]
+
+
+def _bar3d_size(v):
+    """bar3d の底面サイズ。データ間隔の6割を目安に、無ければ小さな既定値。"""
+    v = np.asarray(v, dtype=float)
+    v = v[np.isfinite(v)]
+    if len(v) < 2:
+        return 0.5
+    d = np.diff(np.sort(v)); d = d[d > 0]
+    return float(np.min(d) * 0.6) if len(d) else 0.5
+
+
+def _data_labels_3d(ax, x, y, z, color, fs):
+    """3D各点に値（Z）を注記する。点が多いと潰れるので上限を設ける。"""
+    if len(x) > 60:      # 密集すると読めないので多すぎるときは付けない
+        return
+    for xi, yi, zi in zip(x, y, z):
+        ax.text(xi, yi, zi, f"{zi:.3g}", color=color, fontsize=max(7, fs - 1))
+
+
+def _draw_3d(ax, series, chart_type, fonts=None, data_labels=False, zlabel=""):
+    """3D 描画。各系列は x（X列）・y（Y列）・z（Z列）を持つ。
+
+    3D散布図 / 3D折れ線: 選んだ各Y列を1系列として (x,y,z) を描く。
+    3D曲面: 先頭系列の散らばった (x,y,z) を三角形分割して曲面にする。
+    3D棒:   各系列の (x,y) を底面位置、z を高さとして立てる。
+    """
+    fonts = fonts or {}
+    fs = fonts.get("tick", 9)
+    if chart_type == "3D曲面":
+        x, y, z = _xyz_finite(series[0])
+        if len(x) < 3:
+            raise ValueError("3D曲面には有効な (X, Y, Z) が3点以上必要です。")
+        # 全点が一直線上だと三角形分割に失敗するので分かりやすく案内する
+        if np.ptp(x) == 0 or np.ptp(y) == 0:
+            raise ValueError("3D曲面は X と Y に広がりが必要です（一直線上では作れません）。")
+        try:
+            surf = ax.plot_trisurf(x, y, z, cmap="viridis",
+                                   linewidth=0.2, antialiased=True)
+        except (RuntimeError, ValueError) as e:
+            raise ValueError("3D曲面を作成できませんでした（点が一直線上／不足の可能性）。") from e
+        # 色は Z を表すので、カラーバーは Z軸ラベル（無ければ 'Z'）を付ける
+        _add_colorbar(ax, surf, label=(zlabel or "Z"))
+        return
+
+    for sr in series:
+        x, y, z = _xyz_finite(sr)
+        if len(x) == 0:
+            continue
+        st = style_for(sr)
+        if chart_type == "3D散布図":
+            ax.scatter(x, y, z, label=sr["label"], color=st["color"],
+                       s=st["markersize"] ** 2, marker=st["marker"] or "o",
+                       alpha=st["alpha"])
+        elif chart_type == "3D折れ線":
+            ax.plot(x, y, z, label=sr["label"], color=st["color"],
+                    linestyle=st["linestyle"], linewidth=st["linewidth"],
+                    marker=st["marker"], markersize=st["markersize"], alpha=st["alpha"])
+        elif chart_type == "3D棒":
+            dx = _bar3d_size(x); dy = _bar3d_size(y)
+            ax.bar3d(x - dx / 2, y - dy / 2, np.zeros(len(z)), dx, dy, z,
+                     color=st["color"], alpha=min(st["alpha"], 0.85), shade=True,
+                     label=sr["label"])   # 凡例に系列名が出るようにラベルを渡す
+        if data_labels:
+            _data_labels_3d(ax, x, y, z, st["color"], fs)
+
+
 def _is_dark(color):
     """色（名前/HEX）が暗いか（相対輝度<0.45）。目盛り色などの自動切替に使う。"""
     try:

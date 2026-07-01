@@ -18,7 +18,7 @@ from plotter_draw import *     # noqa: F401,F403
 # plot_series が直接呼ぶ低レベル描画（アンダースコア）を取り込む
 from plotter_draw import (_draw_xy, _draw_hist, _draw_box, _draw_bar, _draw_pie,
                           _draw_area, _draw_stack, _draw_violin, _draw_hist2d,
-                          _draw_hexbin, _draw_heatmap,
+                          _draw_hexbin, _draw_heatmap, _draw_3d,
                           _remove_twin, _remove_aux_axes, _apply_scope, _data_labels)
 
 
@@ -40,6 +40,10 @@ CHART_TYPES = [
     "ヒートマップ",
     "円",
     "ドーナツ",
+    "3D散布図",
+    "3D折れ線",
+    "3D曲面",
+    "3D棒",
 ]
 
 
@@ -78,6 +82,14 @@ CHART_INFO = {
           "hint": "X軸にラベル列、Y軸に値の列を1つ（単一ファイル）"},
     "ドーナツ": {"use_x": True, "multi_y": False, "multi_file": False,
               "hint": "X軸にラベル列、Y軸に値の列を1つ（中央が空いた円）"},
+    "3D散布図": {"use_x": True, "use_z": True, "multi_y": True, "multi_file": True,
+              "hint": "X軸・Z軸に1列ずつ、Y軸に1列以上（点を3Dにプロット。ドラッグで回転）"},
+    "3D折れ線": {"use_x": True, "use_z": True, "multi_y": True, "multi_file": True,
+              "hint": "X軸・Z軸に1列ずつ、Y軸に1列以上（線を3Dに描く。ドラッグで回転）"},
+    "3D曲面": {"use_x": True, "use_z": True, "multi_y": False, "multi_file": False,
+             "hint": "X軸・Y軸・Z軸に1列ずつ（散らばった点から曲面を生成。ドラッグで回転）"},
+    "3D棒": {"use_x": True, "use_z": True, "multi_y": True, "multi_file": True,
+           "hint": "X軸・Z軸に1列ずつ、Y軸に1列以上（(X,Y)位置にZの高さで棒を立てる）"},
 }
 
 
@@ -90,6 +102,13 @@ _XY_DEFAULT_KIND = {"折れ線": "line", "散布図": "scatter", "面": "area",
                     "ステップ": "step", "ステム": "stem"}
 # オシロ格子・カーソルを許可する種別
 _SCOPE_TYPES = ("折れ線", "散布図")
+# 3D 種別（projection='3d' の軸で描く。2D専用処理はすべて無効化する）
+_3D_TYPES = ("3D散布図", "3D折れ線", "3D曲面", "3D棒")
+
+
+def is_3d_type(chart_type):
+    """3D グラフ種別かどうか（GUI 側の軸切替判定に使う）。"""
+    return chart_type in _3D_TYPES
 
 
 LINESTYLES = {"実線": "-", "破線": "--", "一点鎖線": "-.", "点線": ":", "なし": "None"}
@@ -149,6 +168,8 @@ def plot_series(
     frame_width=None,
     xinvert=False,
     yinvert=False,
+    zlabel="",
+    view_init=None,
 ):
     """ax に系列群を描画する。
 
@@ -192,15 +213,21 @@ def plot_series(
             scaled.append(sr)
         series = scaled
 
+    is3d = chart_type in _3D_TYPES
+
     ax.clear()
     _remove_twin(ax)               # 前回の第2軸を掃除
     _remove_aux_axes(ax)           # 前回のカラーバー等を掃除
-    ax.set_aspect("auto")          # 円グラフの equal を持ち越さない
+    if not is3d:                   # 3D軸の set_aspect はスカラー不可なので触らない
+        ax.set_aspect("auto")      # 円グラフの equal を持ち越さない
     ax.set_facecolor(bg_color or "white")   # 背景色（空=白）。オシロは下で上書き
     ax.tick_params(colors="black")  # オシロ表示の目盛り色を既定へ戻す
 
     ax2 = None
-    if chart_type in _XY_TYPES:
+    if is3d:
+        _draw_3d(ax, series, chart_type, fonts=fonts, data_labels=data_labels,
+                 zlabel=zlabel)
+    elif chart_type in _XY_TYPES:
         if chart_type != "積み上げ面" and any((sr.get("axis") == "secondary") for sr in series):
             ax2 = ax.twinx()
             ax._twin_secondary = ax2
@@ -247,14 +274,16 @@ def plot_series(
         ax.set_xlabel(xl, fontsize=fonts.get("label", 10))
         ax.set_ylabel(yl, fontsize=fonts.get("label", 10))
         ax.tick_params(labelsize=fonts.get("tick", 9))
+        if is3d and zlabel:        # 3D の奥行き軸ラベル
+            ax.set_zlabel(zlabel, fontsize=fonts.get("label", 10))
 
     # --- 対数軸・軸範囲 ---
     # min/max は片側だけの指定でも反映する（例: min=0 のみ → 左端を0に詰め、
     # 自動の5%余白を消す。両方そろわないと無視する旧仕様が「0でも余白が残る」原因だった）。
     if chart_type not in _PIE_TYPES:
-        if xlog:
+        if xlog and not is3d:      # 3D軸は対数スケール非対応
             ax.set_xscale("log")
-        if ylog:
+        if ylog and not is3d:
             ax.set_yscale("log")
         if xlim:
             if xlim[0] is not None:
@@ -283,13 +312,16 @@ def plot_series(
             ax.legend(handles, labels, loc=legend_loc,
                       fontsize=(fonts.get("legend") or fonts.get("tick", 9)))
     if grid and chart_type not in _PIE_TYPES:
-        # grid_width=None は「既定の太さ」。matplotlib は linewidth=None を float(None) に
-        # 渡してしまうため、指定があるときだけ linewidth を渡す。
-        gkw = {} if grid_width is None else {"linewidth": grid_width}
-        ax.grid(True, linestyle="--", alpha=0.4, **gkw)
+        if is3d:
+            ax.grid(True)          # 3D は linestyle/alpha を受け付けないので簡素に
+        else:
+            # grid_width=None は「既定の太さ」。matplotlib は linewidth=None を float(None) に
+            # 渡してしまうため、指定があるときだけ linewidth を渡す。
+            gkw = {} if grid_width is None else {"linewidth": grid_width}
+            ax.grid(True, linestyle="--", alpha=0.4, **gkw)
 
-    # 枠線（spine）の太さ。0 以下なら枠を消す。None なら既定のまま
-    if frame_width is not None:
+    # 枠線（spine）の太さ。0 以下なら枠を消す。None なら既定のまま（3D軸に spine は無い）
+    if frame_width is not None and not is3d:
         for sp in ax.spines.values():
             sp.set_linewidth(frame_width)
             sp.set_visible(frame_width > 0)
@@ -298,8 +330,8 @@ def plot_series(
                 sp.set_linewidth(frame_width)
                 sp.set_visible(frame_width > 0)
 
-    # --- マーカー（ピーク等の注記）---
-    if markers:
+    # --- マーカー（ピーク等の注記。3Dは2D座標の注記が合わないので出さない）---
+    if markers and not is3d:
         for m in markers:
             ax.plot(m["x"], m["y"], m.get("symbol", "v"),
                     color=m.get("color", "red"), markersize=8)
@@ -309,8 +341,15 @@ def plot_series(
                             ha="center", color=m.get("color", "red"),
                             fontsize=fonts.get("tick", 9))
 
+    # --- 3D の視点角度（仰角・方位）---
+    if is3d and view_init is not None:
+        try:
+            ax.view_init(elev=view_init[0], azim=view_init[1])
+        except Exception:
+            pass
+
     # --- 軸の向き反転（最後に適用。範囲指定・オシロ表示の後でも効く）---
-    if chart_type not in _PIE_TYPES:
+    if chart_type not in _PIE_TYPES and not is3d:
         if xinvert and not ax.xaxis_inverted():
             ax.invert_xaxis()
         if yinvert and not ax.yaxis_inverted():

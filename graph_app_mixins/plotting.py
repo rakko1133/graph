@@ -22,10 +22,14 @@ class PlotMixin:
         info = plotter.CHART_INFO.get(ctype, {})
         self.hint_label.setText("➤ " + info.get("hint", ""))
         self._update_x_combo_enabled()
+        self._update_z_combo_enabled()   # Z軸コンボは3D種別のみ有効
         uses_bins = ctype in ("ヒストグラム", "2Dヒストグラム", "hexbin")
         self.bins_spin.setEnabled(uses_bins)
         self.bins_caption.setEnabled(uses_bins)
         self.pct_check.setEnabled(ctype in ("円", "ドーナツ"))
+        is3d = plotter.is_3d_type(ctype)
+        if hasattr(self, "elev_spin"):   # 視点角度は3Dのみ操作可
+            self.elev_spin.setEnabled(is3d); self.azim_spin.setEnabled(is3d)
         if hasattr(self, "series_bar"):
             self._rebuild_series_bar(ctype)   # 折れ線/散布図でのみ上部バーを出す
 
@@ -54,6 +58,16 @@ class PlotMixin:
                     continue
                 series.append({"label": lbl(fl, col, disp, col), "y": self.datasets[fl][col].to_numpy(),
                                "style": self.series_styles.get(self._style_key(fl, col))})
+        elif plotter.is_3d_type(chart_type):
+            # X（x_combo）と Z（z_combo）は共有座標。チェックした各Y列を
+            # それぞれ (x, y, z) の3D系列にする（多Y選択の直感を保つ）。
+            for fl, col, disp in items:
+                df = self.datasets[fl]
+                stmap = self.series_styles.get(self._style_key(fl, col)) or {}
+                series.append({"label": self._series_label(fl, col),
+                               "x": self._x_values(df), "y": df[col].to_numpy(),
+                               "z": self._z_values(df), "style": stmap,
+                               "kind": stmap.get("kind", "")})
         elif chart_type in ("折れ線", "散布図", "面", "積み上げ面",
                             "ステップ", "ステム", "2Dヒストグラム", "hexbin"):
             for fl, col, disp in items:
@@ -90,6 +104,22 @@ class PlotMixin:
                 "legend": self.fs_legend.value(),
                 "annot": self.fs_annot.value()}
 
+    def _view_angles(self):
+        """3Dグラフの視点角度 (仰角 elev, 方位 azim)。UI が無ければ既定値。"""
+        elev = self.elev_spin.value() if hasattr(self, "elev_spin") else 30
+        azim = self.azim_spin.value() if hasattr(self, "azim_spin") else -60
+        return (elev, azim)
+
+    def _on_view_angle_changed(self, *_):
+        """仰角・方位スピンの変更を、再描画せず視点だけ更新して反映する。"""
+        if self._is_3d() and getattr(self, "_has_drawn", False):
+            try:
+                self.ax.view_init(elev=self.elev_spin.value(),
+                                  azim=self.azim_spin.value())
+                self.canvas.draw_idle()
+            except Exception:
+                pass
+
     def _on_aspect_changed(self, *_):
         custom = self.aspect_combo.currentText() == "カスタム"
         self.aspect_w.setEnabled(custom)
@@ -111,6 +141,8 @@ class PlotMixin:
 
     def _apply_aspect(self):
         """プロット領域の縦横比を固定（None で解除）。第2軸にも適用。画面プレビュー用。"""
+        if self._is_3d():
+            return   # 3D軸の box_aspect は3要素タプル。スカラー比率は適用しない
         ratio = self._aspect_ratio()
         try:
             self.ax.set_box_aspect(ratio)
@@ -226,6 +258,7 @@ class PlotMixin:
                 issues.append("time/div・V/div は正の値が必要（オシロ表示を無効化）")
                 scope = dict(scope, enabled=False)
 
+        self._ensure_axes_projection(plotter.is_3d_type(ctype))  # 3D⇔2D 軸を用意
         self._clear_dynamic_resample()
         self._reset_figure_axes()   # スペクトログラム等のカラーバー軸を除去
         self._cursor_pts = []; self._cursor_artists = []  # 再描画で軸がクリアされる
@@ -259,6 +292,8 @@ class PlotMixin:
                     xlim=xlim, ylim=ylim,
                     scope=scope, markers=markers, max_points=max_points,
                     secondary_label=sec_label,
+                    zlabel=(self.z_combo.currentText() if plotter.is_3d_type(ctype) else ""),
+                    view_init=(self._view_angles() if plotter.is_3d_type(ctype) else None),
                     **self._plot_format_kwargs(),
                 )
                 self._apply_aspect()   # 縦横比の固定（自動なら解除）
@@ -297,8 +332,8 @@ class PlotMixin:
 
     def _apply_tick_spacing(self, ctype, scope):
         """目盛り間隔（メモリ間隔）の手動指定を適用する。
-        空欄や非対応（オシロdiv表示中・対数軸・カテゴリ軸・円）では何もしない。"""
-        if ctype == "円":
+        空欄や非対応（オシロdiv表示中・対数軸・カテゴリ軸・円・3D）では何もしない。"""
+        if ctype == "円" or self._is_3d():
             return
         if scope.get("enabled") and ctype in ("折れ線", "散布図"):
             return   # オシロ表示中は div 目盛りを優先
@@ -384,6 +419,8 @@ class PlotMixin:
     def _draw_ds_annotations(self):
         """『表示』にチェックした指標をグラフへ注記する。
         データサイエンス＝左上、オシロ/解析の測定値＝右上に分けて描く。"""
+        if self._is_3d():
+            return   # 3D軸では transAxes 注記が正しく置けないため出さない
         self._draw_annotation_box(getattr(self, "_ds_annotations", None), "tl")
         self._draw_annotation_box(getattr(self, "_meas_annotations", None), "tr")
 
@@ -411,6 +448,37 @@ class PlotMixin:
                 except Exception:
                     pass
         # 系列選択バーの表示/非表示は _rebuild_series_bar が管理する（ここでは触らない）
+
+    def _is_3d(self):
+        """現在のメイン軸が 3D（projection='3d'）かどうか。"""
+        return getattr(getattr(self, "ax", None), "name", None) == "3d"
+
+    def _ensure_axes_projection(self, want_3d):
+        """メイン軸を 2D↔3D で必要なときだけ差し替える。
+
+        2D 前提のイベント接続はキャンバス側にあり軸差し替えの影響を受けないが、
+        軸に紐づくコールバック（動的リサンプル）や描画キャッシュは張り替える。"""
+        cur = getattr(self, "ax", None)
+        if cur is not None and bool(want_3d) == (getattr(cur, "name", None) == "3d"):
+            return   # 既に目的の投影。差し替え不要（clear で再利用）
+        self._clear_dynamic_resample()          # 旧軸の xlim コールバックを外す
+        for a in list(self.fig.axes):           # 旧軸・残ったカラーバー等を一掃
+            try:
+                a.remove()
+            except Exception:
+                pass
+        if want_3d:
+            from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  '3d' 投影を登録
+            self.ax = self.fig.add_subplot(111, projection="3d")
+        else:
+            self.ax = self.fig.add_subplot(111)
+        self.ax._twin_secondary = None
+        # 旧軸を指していたキャッシュ参照をリセット
+        self._plotted_artists = []
+        self._style_artists = {}
+        self._cursor_pts = []; self._cursor_artists = []
+        self._cursors = []; self._cursor_drag = None; self._cursor_text = None
+        self._dyn = []; self._dyn_cid = None
 
     # ------------------------------------------------------------ ズーム再サンプル
     def _clear_dynamic_resample(self):
@@ -477,6 +545,7 @@ class PlotMixin:
             self._resampling = False
 
     def _draw_placeholder(self):
+        self._ensure_axes_projection(False)   # 3D表示中でも必ず2D軸で案内を描く
         self._reset_figure_axes()
         self.ax.clear()
         self.ax.set_facecolor("white"); self.ax.tick_params(colors="black")

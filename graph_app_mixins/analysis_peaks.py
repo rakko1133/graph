@@ -140,6 +140,7 @@ class AnalysisMixin:
         if drawn == 0:
             QtWidgets.QMessageBox.warning(self, "FFT", "FFT を計算できませんでした。")
             return
+        self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
         self._reset_figure_axes()
         plotter.plot_series(
             self.ax, series, "折れ線",

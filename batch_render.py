@@ -14,6 +14,23 @@ import plotter
 _FONT_DONE = False
 
 
+def _make_ax(fig, ctype):
+    """種別に応じた投影の軸を作る（3D種別は projection='3d'）。"""
+    if plotter.is_3d_type(ctype):
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  '3d' 投影を登録
+        return fig.add_subplot(111, projection="3d")
+    return fig.add_subplot(111)
+
+
+def _apply_ratio(ax, ratio, ctype):
+    """縦横比を適用（3D軸はスカラー box_aspect 不可なのでスキップ）。"""
+    if ratio and not plotter.is_3d_type(ctype):
+        ax.set_box_aspect(ratio)
+        ax2 = getattr(ax, "_twin_secondary", None)
+        if ax2 is not None:
+            ax2.set_box_aspect(ratio)
+
+
 def _ensure_font(font_name):
     """ワーカープロセスごとに1回だけ日本語フォントを設定（□□□化を防ぐ）。"""
     global _FONT_DONE
@@ -34,19 +51,15 @@ def render_one(task):
     _ensure_font(task.get("font_name"))
     fig = Figure(figsize=task["figsize"], dpi=task["dpi"])
     FigureCanvasAgg(fig)
-    ax = fig.add_subplot(111)
+    ax = _make_ax(fig, task["ctype"])
     plotter.plot_series(
         ax, task["series"], task["ctype"], categories=task["categories"],
         title=task["title"], xlabel=task["xlabel"], ylabel=task["ylabel"],
         xlim=task["xlim"], ylim=task["ylim"],
         secondary_label=task["sec_label"], max_points=task["max_points"],
+        zlabel=task.get("zlabel", ""), view_init=task.get("view_init"),
         **task["fmt"])
-    ratio = task.get("ratio")
-    if ratio:
-        ax.set_box_aspect(ratio)
-        ax2 = getattr(ax, "_twin_secondary", None)
-        if ax2 is not None:
-            ax2.set_box_aspect(ratio)
+    _apply_ratio(ax, task.get("ratio"), task["ctype"])
     tight = task.get("tight", True)
     if not tight:                       # 図サイズ＝画像比率。ラベルが収まるよう整える
         try:
@@ -68,7 +81,7 @@ def render_sequential(tasks):
         return saved, skipped
     fig = Figure(figsize=tasks[0]["figsize"], dpi=tasks[0]["dpi"])
     FigureCanvasAgg(fig)
-    ax = fig.add_subplot(111)
+    ax = _make_ax(fig, tasks[0]["ctype"])   # 同一バッチは同一種別（投影を固定）
     for t in tasks:
         try:
             ax.clear()
@@ -77,13 +90,9 @@ def render_sequential(tasks):
                 title=t["title"], xlabel=t["xlabel"], ylabel=t["ylabel"],
                 xlim=t["xlim"], ylim=t["ylim"],
                 secondary_label=t["sec_label"], max_points=t["max_points"],
+                zlabel=t.get("zlabel", ""), view_init=t.get("view_init"),
                 **t["fmt"])
-            ratio = t.get("ratio")
-            if ratio:
-                ax.set_box_aspect(ratio)
-                ax2 = getattr(ax, "_twin_secondary", None)
-                if ax2 is not None:
-                    ax2.set_box_aspect(ratio)
+            _apply_ratio(ax, t.get("ratio"), t["ctype"])
             tight = t.get("tight", True)
             if not tight:
                 try:

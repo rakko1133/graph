@@ -178,6 +178,14 @@ class UIBuildMixin:
         self.x_combo.currentTextChanged.connect(self._on_x_changed)
         v.addWidget(self.x_combo)
 
+        self.z_label = QtWidgets.QLabel("Z軸（3Dの奥行き）")
+        v.addWidget(self.z_label)
+        self.z_combo = QtWidgets.QComboBox()
+        self.z_combo.setToolTip("3Dグラフの奥行き（Z軸）に使う列。3D種別のときだけ有効になります。")
+        self.z_combo.currentTextChanged.connect(self._on_x_changed)
+        self.z_combo.setEnabled(False)
+        v.addWidget(self.z_combo)
+
         ylab = QtWidgets.QLabel("Y軸（値）※チェックした系列を描画（行クリックでON/OFF）")
         ylab.setWordWrap(True)
         v.addWidget(ylab)
@@ -294,6 +302,24 @@ class UIBuildMixin:
         self.hint_label.setWordWrap(True)
         self.hint_label.setStyleSheet("color:#0a7a55;")
         v.addWidget(self.hint_label)
+
+        # 3D の視点角度（マウスドラッグでも回転可。ここで数値指定もできる）
+        view = QtWidgets.QHBoxLayout()
+        view.addWidget(QtWidgets.QLabel("3D視点 仰角"))
+        self.elev_spin = QtWidgets.QSpinBox(); self.elev_spin.setRange(-90, 90)
+        self.elev_spin.setValue(30)
+        self.elev_spin.setToolTip("3Dグラフの仰角（上下の見おろし角）。ドラッグでも回転できます。")
+        self.elev_spin.valueChanged.connect(self._on_view_angle_changed)
+        view.addWidget(self.elev_spin)
+        view.addWidget(QtWidgets.QLabel("方位"))
+        self.azim_spin = QtWidgets.QSpinBox(); self.azim_spin.setRange(-180, 180)
+        self.azim_spin.setValue(-60)
+        self.azim_spin.setToolTip("3Dグラフの方位（左右の回転角）。ドラッグでも回転できます。")
+        self.azim_spin.valueChanged.connect(self._on_view_angle_changed)
+        view.addWidget(self.azim_spin)
+        view.addStretch(1)
+        self.elev_spin.setEnabled(False); self.azim_spin.setEnabled(False)
+        v.addLayout(view)
 
         # タイトル・ラベル・フォント
         form = QtWidgets.QGridLayout()
