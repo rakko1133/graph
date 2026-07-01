@@ -79,12 +79,13 @@ class BatchMixin:
         leftmost = self._use_leftmost_x()
         xv = (df.iloc[:, 0].to_numpy() if leftmost
               else (df[x_name].to_numpy() if x_name in df.columns else df.iloc[:, 0].to_numpy()))
-        if chart_type in ("棒", "横棒", "積み上げ棒", "円"):
+        if chart_type in ("棒", "横棒", "積み上げ棒", "円", "ドーナツ"):
             categories = xv
             for c in y_names:
                 series.append({"label": c, "y": df[c].to_numpy(),
                                "style": style_by_col.get(c)})
-        elif chart_type in ("折れ線", "散布図"):
+        elif chart_type in ("折れ線", "散布図", "面", "積み上げ面",
+                            "ステップ", "ステム", "2Dヒストグラム", "hexbin"):
             for c in y_names:
                 st = style_by_col.get(c) or {}
                 errcol = st.get("errcol")

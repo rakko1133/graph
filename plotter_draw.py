@@ -179,6 +179,34 @@ def _remove_twin(ax):
     ax._twin_secondary = None
 
 
+def _remove_aux_axes(ax):
+    """前回 plot_series が作った付随軸（カラーバー等）を図から取り除く。
+
+    GUI 側でも `_reset_figure_axes` が掃除するが、単体呼び出しや一括出力でも
+    カラーバーが積み重ならないよう plot_series 自身でも後始末する。"""
+    fig = getattr(ax, "figure", None)
+    if fig is None:
+        return
+    for a in list(fig.axes):
+        if a is not ax and getattr(a, "_plotter_aux", False):
+            try:
+                a.remove()
+            except Exception:
+                pass
+
+
+def _add_colorbar(ax, mappable, label=""):
+    """付随カラーバーを追加し、次回描画で消せるよう目印を付ける。"""
+    fig = getattr(ax, "figure", None)
+    if fig is None:
+        return
+    try:
+        cb = fig.colorbar(mappable, ax=ax, label=label)
+        cb.ax._plotter_aux = True
+    except Exception:
+        pass
+
+
 def _bar_width(xx):
     """数値Xに棒を描くときの適切な幅。"""
     xx = np.asarray(xx, dtype=float)
@@ -191,7 +219,7 @@ def _bar_width(xx):
 
 
 def _draw_xy(ax, series, line=True, max_points=0, ax2=None, data_labels=False,
-             trendline=None, fonts=None):
+             trendline=None, fonts=None, default_skind=None):
     # 各系列の X を評価し、カテゴリがあれば全系列で共有する位置マッピングを作る
     # （系列ごとに目盛りラベルを上書きして取り違える不具合を防ぐ）。
     fonts = fonts or {}
@@ -222,7 +250,7 @@ def _draw_xy(ax, series, line=True, max_points=0, ax2=None, data_labels=False,
     for kind, x, y, sr in prepared:
         st = style_for(sr)
         target = ax2 if (ax2 is not None and sr.get("axis") == "secondary") else ax
-        skind = sr.get("kind") or ("line" if line else "scatter")
+        skind = sr.get("kind") or default_skind or ("line" if line else "scatter")
         yerr = sr.get("yerr")
         yerr = _num(yerr) if yerr is not None else None
         if kind == "index":
@@ -232,11 +260,11 @@ def _draw_xy(ax, series, line=True, max_points=0, ax2=None, data_labels=False,
         else:
             xx = np.asarray(x, dtype=float)
         xx_full = xx        # 間引き前のフル解像度X（近似曲線・R²はこちらでフィットする）
-        # 大容量データの間引き（カテゴリ以外・誤差バー無し・線/散布のみ）
+        # 大容量データの間引き（カテゴリ以外・誤差バー無し・線/散布/ステップのみ）
         decim = (max_points and kind != "category" and yerr is None
-                 and skind in ("line", "scatter") and len(y) > max_points)
+                 and skind in ("line", "scatter", "step") and len(y) > max_points)
         if decim:
-            if skind == "line":
+            if skind in ("line", "step"):
                 xx, yv = decimate_minmax(xx, y, max_points)
             else:
                 step = max(1, len(y) // max_points)
@@ -256,6 +284,20 @@ def _draw_xy(ax, series, line=True, max_points=0, ax2=None, data_labels=False,
             target.fill_between(xx, yv, color=st["color"], alpha=min(st["alpha"], 0.4))
             target.plot(xx, yv, label=sr["label"], color=st["color"],
                         linewidth=st["linewidth"], alpha=st["alpha"])
+        elif skind == "step":
+            target.step(xx, yv, where="post", label=sr["label"], color=st["color"],
+                        linestyle=st["linestyle"], linewidth=st["linewidth"],
+                        marker=st["marker"], markersize=st["markersize"], alpha=st["alpha"])
+        elif skind == "stem":
+            order = np.argsort(np.asarray(xx, dtype=float))
+            markerline, stemlines, baseline = target.stem(
+                np.asarray(xx, float)[order], np.asarray(yv, float)[order], label=sr["label"])
+            col = st["color"]
+            if col:
+                markerline.set_color(col); stemlines.set_color(col)
+            markerline.set_markersize(max(2.0, st["markersize"]))
+            markerline.set_alpha(st["alpha"]); stemlines.set_alpha(st["alpha"])
+            baseline.set_alpha(min(st["alpha"], 0.5))
         elif skind == "scatter":
             target.scatter(xx, yv, label=sr["label"], color=st["color"],
                            s=st["markersize"] ** 2, marker=st["marker"] or "o",
@@ -390,7 +432,7 @@ def _draw_bar(ax, series, categories, horizontal=False, stacked=False,
                            ha="right" if len(labels) > 6 else "center")
 
 
-def _draw_pie(ax, sr, categories, pct=False):
+def _draw_pie(ax, sr, categories, pct=False, donut=False):
     labels = np.asarray([str(c) for c in categories])
     values = np.nan_to_num(_num(sr["y"]))
     n = min(len(labels), len(values))
@@ -398,10 +440,120 @@ def _draw_pie(ax, sr, categories, pct=False):
     mask = values > 0
     labels, values = labels[mask], values[mask]
     if len(values) == 0:
-        raise ValueError("円グラフに使える正の数値データがありません。")
+        raise ValueError(("ドーナツ" if donut else "円")
+                         + "グラフに使える正の数値データがありません。")
+    # ドーナツは中央を空ける（wedgeprops の width で内径を作る）
+    wedgeprops = dict(width=0.42) if donut else None
     ax.pie(values, labels=labels, autopct="%1.1f%%" if pct else None,
-           startangle=90, counterclock=False)
+           startangle=90, counterclock=False, wedgeprops=wedgeprops,
+           pctdistance=0.78 if donut else 0.6)
     ax.axis("equal")
+
+
+def _draw_area(ax, series, max_points=0, ax2=None, data_labels=False,
+               trendline=None, fonts=None):
+    """面グラフ。各系列を塗り＋線で描く（既定 kind=area）。"""
+    _draw_xy(ax, series, line=True, max_points=max_points, ax2=ax2,
+             data_labels=data_labels, trendline=trendline, fonts=fonts,
+             default_skind="area")
+
+
+def _prep_xy_numeric(sr, need_x=True):
+    """1系列から数値の (x, y) を取り出し、非有限を除いて返す。"""
+    y = _num(sr["y"])
+    x_raw = sr.get("x")
+    if x_raw is None:
+        if need_x:
+            raise ValueError("この種別には X 軸の列が必要です。")
+        x = np.arange(len(y), dtype=float)
+    else:
+        x = _num(x_raw)
+    m = np.isfinite(x) & np.isfinite(y)
+    return x[m], y[m]
+
+
+def _draw_stack(ax, series):
+    """積み上げ面（stackplot）。系列ごとにXが違っても共通グリッドへ補間して積む。"""
+    prepared = []
+    for sr in series:
+        y = _num(sr["y"])
+        x_raw = sr.get("x")
+        if x_raw is None:
+            x = np.arange(len(y), dtype=float)
+        else:
+            x = _num(x_raw)
+            if not np.isfinite(x).any():
+                x = np.arange(len(y), dtype=float)
+        m = np.isfinite(x) & np.isfinite(y)
+        if m.sum() >= 1:
+            prepared.append((x[m], y[m], sr))
+    if not prepared:
+        raise ValueError("積み上げ面に使える数値データがありません。")
+    gx = np.unique(np.concatenate([p[0] for p in prepared]))
+    ys, labels, colors = [], [], []
+    for x, y, sr in prepared:
+        order = np.argsort(x)
+        ys.append(np.interp(gx, x[order], y[order]))   # 範囲外は端値で補間
+        labels.append(sr["label"]); colors.append(style_for(sr)["color"])
+    colors = colors if all(colors) else None
+    ax.stackplot(gx, ys, labels=labels, colors=colors, alpha=0.8)
+
+
+def _draw_violin(ax, series):
+    """バイオリン図（分布の密度）。系列ごとに1本ずつ並べる。"""
+    data, labels, colors = [], [], []
+    for sr in series:
+        y = _num(sr["y"]); y = y[np.isfinite(y)]
+        if len(y):
+            data.append(y); labels.append(sr["label"])
+            colors.append(style_for(sr)["color"])
+    if not data:
+        raise ValueError("バイオリン図に使える数値データがありません。")
+    parts = ax.violinplot(data, showmeans=True, showmedians=True)
+    for body, col in zip(parts["bodies"], colors):
+        if col:
+            body.set_facecolor(col); body.set_alpha(0.55)
+    ax.set_xticks(range(1, len(labels) + 1))
+    ax.set_xticklabels(labels, rotation=45 if len(labels) > 6 else 0,
+                       ha="right" if len(labels) > 6 else "center")
+
+
+def _draw_hist2d(ax, series, bins):
+    """2次元ヒストグラム（XとYの同時分布）。先頭系列の x, y を使う。"""
+    x, y = _prep_xy_numeric(series[0], need_x=True)
+    if len(x) < 2:
+        raise ValueError("2Dヒストグラムに使える数値データが足りません。")
+    b = max(2, int(bins))
+    h = ax.hist2d(x, y, bins=b, cmap="viridis")
+    _add_colorbar(ax, h[3], label="頻度")
+
+
+def _draw_hexbin(ax, series, bins):
+    """六角ビンによる密度プロット。先頭系列の x, y を使う。"""
+    x, y = _prep_xy_numeric(series[0], need_x=True)
+    if len(x) < 2:
+        raise ValueError("hexbin に使える数値データが足りません。")
+    grid = max(6, int(bins) * 2)
+    hb = ax.hexbin(x, y, gridsize=grid, cmap="viridis", mincnt=1)
+    _add_colorbar(ax, hb, label="件数")
+
+
+def _draw_heatmap(ax, series):
+    """ヒートマップ。選択した各Y列を1行として濃淡で表示する。"""
+    rows, labels = [], []
+    for sr in series:
+        y = _num(sr["y"])
+        rows.append(y); labels.append(sr["label"])
+    if not rows:
+        raise ValueError("ヒートマップに使える数値データがありません。")
+    n = min(len(r) for r in rows)
+    if n < 1:
+        raise ValueError("ヒートマップに使える数値データが足りません。")
+    mat = np.array([np.asarray(r[:n], dtype=float) for r in rows])
+    im = ax.imshow(mat, aspect="auto", cmap="viridis", interpolation="nearest")
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels)
+    _add_colorbar(ax, im, label="値")
 
 
 def _is_dark(color):

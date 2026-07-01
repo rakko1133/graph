@@ -65,6 +65,39 @@ def test_draw_all_chart_types():
         w.draw_graph()   # 例外を投げないこと
 
 
+def test_new_chart_types_render_and_colorbar_cleanup():
+    """拡充したグラフ種別が実際に描画され、カラーバーが積み重ならないこと。"""
+    import plotter
+    w = _make_app(_wave())
+
+    def _artist_count():
+        ax = w.ax
+        return (len(ax.collections) + len(ax.patches)
+                + len(ax.get_lines()) + len(ax.images))
+
+    for ct in ("面", "積み上げ面", "ステップ", "ステム", "2Dヒストグラム",
+               "hexbin", "バイオリン", "ヒートマップ", "ドーナツ"):
+        w.chart_combo.setCurrentText(ct)
+        w.draw_graph()
+        assert _artist_count() > 0, f"{ct} が何も描画していない"
+
+    # カラーバーを使う種別を繰り返し描いても補助軸は1本までしか残らない
+    for ct in ("2Dヒストグラム", "hexbin", "折れ線", "ヒートマップ", "2Dヒストグラム"):
+        w.chart_combo.setCurrentText(ct)
+        w.draw_graph()
+        assert len(w.fig.axes) <= 2, f"{ct} 後に補助軸が累積 ({len(w.fig.axes)})"
+    # 折れ線に戻すとカラーバーは消える（メイン軸のみ）
+    w.chart_combo.setCurrentText("折れ線")
+    w.draw_graph()
+    assert len(w.fig.axes) == 1
+
+    # 面グラフでも近似曲線が描ける（間引き前フルデータでフィット）
+    w.chart_combo.setCurrentText("面")
+    w.trend_combo.setCurrentText("線形"); w.trend_eq.setChecked(True)
+    w.draw_graph()
+    assert any("近似" in str(ln.get_label()) for ln in w.ax.get_lines())
+
+
 def test_oscilloscope_and_fft():
     w = _make_app(_wave())
     w.chart_combo.setCurrentText("折れ線")

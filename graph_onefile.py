@@ -658,6 +658,34 @@ def _remove_twin(ax):
     ax._twin_secondary = None
 
 
+def _remove_aux_axes(ax):
+    """前回 plot_series が作った付随軸（カラーバー等）を図から取り除く。
+
+    GUI 側でも `_reset_figure_axes` が掃除するが、単体呼び出しや一括出力でも
+    カラーバーが積み重ならないよう plot_series 自身でも後始末する。"""
+    fig = getattr(ax, "figure", None)
+    if fig is None:
+        return
+    for a in list(fig.axes):
+        if a is not ax and getattr(a, "_plotter_aux", False):
+            try:
+                a.remove()
+            except Exception:
+                pass
+
+
+def _add_colorbar(ax, mappable, label=""):
+    """付随カラーバーを追加し、次回描画で消せるよう目印を付ける。"""
+    fig = getattr(ax, "figure", None)
+    if fig is None:
+        return
+    try:
+        cb = fig.colorbar(mappable, ax=ax, label=label)
+        cb.ax._plotter_aux = True
+    except Exception:
+        pass
+
+
 def _bar_width(xx):
     """数値Xに棒を描くときの適切な幅。"""
     xx = np.asarray(xx, dtype=float)
@@ -670,7 +698,7 @@ def _bar_width(xx):
 
 
 def _draw_xy(ax, series, line=True, max_points=0, ax2=None, data_labels=False,
-             trendline=None, fonts=None):
+             trendline=None, fonts=None, default_skind=None):
     # 各系列の X を評価し、カテゴリがあれば全系列で共有する位置マッピングを作る
     # （系列ごとに目盛りラベルを上書きして取り違える不具合を防ぐ）。
     fonts = fonts or {}
@@ -701,7 +729,7 @@ def _draw_xy(ax, series, line=True, max_points=0, ax2=None, data_labels=False,
     for kind, x, y, sr in prepared:
         st = style_for(sr)
         target = ax2 if (ax2 is not None and sr.get("axis") == "secondary") else ax
-        skind = sr.get("kind") or ("line" if line else "scatter")
+        skind = sr.get("kind") or default_skind or ("line" if line else "scatter")
         yerr = sr.get("yerr")
         yerr = _num(yerr) if yerr is not None else None
         if kind == "index":
@@ -711,11 +739,11 @@ def _draw_xy(ax, series, line=True, max_points=0, ax2=None, data_labels=False,
         else:
             xx = np.asarray(x, dtype=float)
         xx_full = xx        # 間引き前のフル解像度X（近似曲線・R²はこちらでフィットする）
-        # 大容量データの間引き（カテゴリ以外・誤差バー無し・線/散布のみ）
+        # 大容量データの間引き（カテゴリ以外・誤差バー無し・線/散布/ステップのみ）
         decim = (max_points and kind != "category" and yerr is None
-                 and skind in ("line", "scatter") and len(y) > max_points)
+                 and skind in ("line", "scatter", "step") and len(y) > max_points)
         if decim:
-            if skind == "line":
+            if skind in ("line", "step"):
                 xx, yv = decimate_minmax(xx, y, max_points)
             else:
                 step = max(1, len(y) // max_points)
@@ -735,6 +763,20 @@ def _draw_xy(ax, series, line=True, max_points=0, ax2=None, data_labels=False,
             target.fill_between(xx, yv, color=st["color"], alpha=min(st["alpha"], 0.4))
             target.plot(xx, yv, label=sr["label"], color=st["color"],
                         linewidth=st["linewidth"], alpha=st["alpha"])
+        elif skind == "step":
+            target.step(xx, yv, where="post", label=sr["label"], color=st["color"],
+                        linestyle=st["linestyle"], linewidth=st["linewidth"],
+                        marker=st["marker"], markersize=st["markersize"], alpha=st["alpha"])
+        elif skind == "stem":
+            order = np.argsort(np.asarray(xx, dtype=float))
+            markerline, stemlines, baseline = target.stem(
+                np.asarray(xx, float)[order], np.asarray(yv, float)[order], label=sr["label"])
+            col = st["color"]
+            if col:
+                markerline.set_color(col); stemlines.set_color(col)
+            markerline.set_markersize(max(2.0, st["markersize"]))
+            markerline.set_alpha(st["alpha"]); stemlines.set_alpha(st["alpha"])
+            baseline.set_alpha(min(st["alpha"], 0.5))
         elif skind == "scatter":
             target.scatter(xx, yv, label=sr["label"], color=st["color"],
                            s=st["markersize"] ** 2, marker=st["marker"] or "o",
@@ -869,7 +911,7 @@ def _draw_bar(ax, series, categories, horizontal=False, stacked=False,
                            ha="right" if len(labels) > 6 else "center")
 
 
-def _draw_pie(ax, sr, categories, pct=False):
+def _draw_pie(ax, sr, categories, pct=False, donut=False):
     labels = np.asarray([str(c) for c in categories])
     values = np.nan_to_num(_num(sr["y"]))
     n = min(len(labels), len(values))
@@ -877,10 +919,120 @@ def _draw_pie(ax, sr, categories, pct=False):
     mask = values > 0
     labels, values = labels[mask], values[mask]
     if len(values) == 0:
-        raise ValueError("円グラフに使える正の数値データがありません。")
+        raise ValueError(("ドーナツ" if donut else "円")
+                         + "グラフに使える正の数値データがありません。")
+    # ドーナツは中央を空ける（wedgeprops の width で内径を作る）
+    wedgeprops = dict(width=0.42) if donut else None
     ax.pie(values, labels=labels, autopct="%1.1f%%" if pct else None,
-           startangle=90, counterclock=False)
+           startangle=90, counterclock=False, wedgeprops=wedgeprops,
+           pctdistance=0.78 if donut else 0.6)
     ax.axis("equal")
+
+
+def _draw_area(ax, series, max_points=0, ax2=None, data_labels=False,
+               trendline=None, fonts=None):
+    """面グラフ。各系列を塗り＋線で描く（既定 kind=area）。"""
+    _draw_xy(ax, series, line=True, max_points=max_points, ax2=ax2,
+             data_labels=data_labels, trendline=trendline, fonts=fonts,
+             default_skind="area")
+
+
+def _prep_xy_numeric(sr, need_x=True):
+    """1系列から数値の (x, y) を取り出し、非有限を除いて返す。"""
+    y = _num(sr["y"])
+    x_raw = sr.get("x")
+    if x_raw is None:
+        if need_x:
+            raise ValueError("この種別には X 軸の列が必要です。")
+        x = np.arange(len(y), dtype=float)
+    else:
+        x = _num(x_raw)
+    m = np.isfinite(x) & np.isfinite(y)
+    return x[m], y[m]
+
+
+def _draw_stack(ax, series):
+    """積み上げ面（stackplot）。系列ごとにXが違っても共通グリッドへ補間して積む。"""
+    prepared = []
+    for sr in series:
+        y = _num(sr["y"])
+        x_raw = sr.get("x")
+        if x_raw is None:
+            x = np.arange(len(y), dtype=float)
+        else:
+            x = _num(x_raw)
+            if not np.isfinite(x).any():
+                x = np.arange(len(y), dtype=float)
+        m = np.isfinite(x) & np.isfinite(y)
+        if m.sum() >= 1:
+            prepared.append((x[m], y[m], sr))
+    if not prepared:
+        raise ValueError("積み上げ面に使える数値データがありません。")
+    gx = np.unique(np.concatenate([p[0] for p in prepared]))
+    ys, labels, colors = [], [], []
+    for x, y, sr in prepared:
+        order = np.argsort(x)
+        ys.append(np.interp(gx, x[order], y[order]))   # 範囲外は端値で補間
+        labels.append(sr["label"]); colors.append(style_for(sr)["color"])
+    colors = colors if all(colors) else None
+    ax.stackplot(gx, ys, labels=labels, colors=colors, alpha=0.8)
+
+
+def _draw_violin(ax, series):
+    """バイオリン図（分布の密度）。系列ごとに1本ずつ並べる。"""
+    data, labels, colors = [], [], []
+    for sr in series:
+        y = _num(sr["y"]); y = y[np.isfinite(y)]
+        if len(y):
+            data.append(y); labels.append(sr["label"])
+            colors.append(style_for(sr)["color"])
+    if not data:
+        raise ValueError("バイオリン図に使える数値データがありません。")
+    parts = ax.violinplot(data, showmeans=True, showmedians=True)
+    for body, col in zip(parts["bodies"], colors):
+        if col:
+            body.set_facecolor(col); body.set_alpha(0.55)
+    ax.set_xticks(range(1, len(labels) + 1))
+    ax.set_xticklabels(labels, rotation=45 if len(labels) > 6 else 0,
+                       ha="right" if len(labels) > 6 else "center")
+
+
+def _draw_hist2d(ax, series, bins):
+    """2次元ヒストグラム（XとYの同時分布）。先頭系列の x, y を使う。"""
+    x, y = _prep_xy_numeric(series[0], need_x=True)
+    if len(x) < 2:
+        raise ValueError("2Dヒストグラムに使える数値データが足りません。")
+    b = max(2, int(bins))
+    h = ax.hist2d(x, y, bins=b, cmap="viridis")
+    _add_colorbar(ax, h[3], label="頻度")
+
+
+def _draw_hexbin(ax, series, bins):
+    """六角ビンによる密度プロット。先頭系列の x, y を使う。"""
+    x, y = _prep_xy_numeric(series[0], need_x=True)
+    if len(x) < 2:
+        raise ValueError("hexbin に使える数値データが足りません。")
+    grid = max(6, int(bins) * 2)
+    hb = ax.hexbin(x, y, gridsize=grid, cmap="viridis", mincnt=1)
+    _add_colorbar(ax, hb, label="件数")
+
+
+def _draw_heatmap(ax, series):
+    """ヒートマップ。選択した各Y列を1行として濃淡で表示する。"""
+    rows, labels = [], []
+    for sr in series:
+        y = _num(sr["y"])
+        rows.append(y); labels.append(sr["label"])
+    if not rows:
+        raise ValueError("ヒートマップに使える数値データがありません。")
+    n = min(len(r) for r in rows)
+    if n < 1:
+        raise ValueError("ヒートマップに使える数値データが足りません。")
+    mat = np.array([np.asarray(r[:n], dtype=float) for r in rows])
+    im = ax.imshow(mat, aspect="auto", cmap="viridis", interpolation="nearest")
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels)
+    _add_colorbar(ax, im, label="値")
 
 
 def _is_dark(color):
@@ -985,19 +1137,36 @@ GUI から独立しているので単体でも利用・テストできる。
 
 CHART_TYPES = [
     "折れ線",
+    "面",
+    "積み上げ面",
+    "ステップ",
+    "ステム",
     "棒",
     "横棒",
     "積み上げ棒",
     "散布図",
     "ヒストグラム",
+    "2Dヒストグラム",
+    "hexbin",
     "箱ひげ",
+    "バイオリン",
+    "ヒートマップ",
     "円",
+    "ドーナツ",
 ]
 
 
 CHART_INFO = {
     "折れ線": {"use_x": True, "multi_y": True, "multi_file": True,
               "hint": "X軸に1列、Y軸に1列以上。複数ファイルの重ね描き可"},
+    "面": {"use_x": True, "multi_y": True, "multi_file": True,
+          "hint": "X軸に1列、Y軸に1列以上を塗り面で重ね描き。複数ファイル可"},
+    "積み上げ面": {"use_x": True, "multi_y": True, "multi_file": True,
+                "hint": "X軸に1列、Y軸に複数列を積み上げ（共通Xへ補間）。複数ファイル可"},
+    "ステップ": {"use_x": True, "multi_y": True, "multi_file": True,
+              "hint": "X軸に1列、Y軸に1列以上を階段状に。複数ファイル可"},
+    "ステム": {"use_x": True, "multi_y": True, "multi_file": True,
+            "hint": "X軸に1列、Y軸に1列以上を棒（幹）＋点で表示。複数ファイル可"},
     "棒": {"use_x": True, "multi_y": True, "multi_file": False,
           "hint": "X軸にカテゴリ列、Y軸に1列以上（単一ファイル）"},
     "横棒": {"use_x": True, "multi_y": True, "multi_file": False,
@@ -1008,11 +1177,32 @@ CHART_INFO = {
             "hint": "X軸に1列、Y軸に1列以上。複数ファイル可"},
     "ヒストグラム": {"use_x": False, "multi_y": True, "multi_file": True,
                 "hint": "Y軸に値の列を1列以上（分布を表示）。複数ファイル可"},
+    "2Dヒストグラム": {"use_x": True, "multi_y": False, "multi_file": False,
+                  "hint": "X軸・Y軸に数値列を1つずつ（2次元の頻度を色で表示）"},
+    "hexbin": {"use_x": True, "multi_y": False, "multi_file": False,
+               "hint": "X軸・Y軸に数値列を1つずつ（六角ビンで密度を表示）"},
     "箱ひげ": {"use_x": False, "multi_y": True, "multi_file": True,
             "hint": "Y軸に値の列を1列以上。複数ファイル可"},
+    "バイオリン": {"use_x": False, "multi_y": True, "multi_file": True,
+              "hint": "Y軸に値の列を1列以上（分布の密度を表示）。複数ファイル可"},
+    "ヒートマップ": {"use_x": False, "multi_y": True, "multi_file": True,
+                "hint": "選んだ各Y列を1行として濃淡で表示。複数ファイル可"},
     "円": {"use_x": True, "multi_y": False, "multi_file": False,
           "hint": "X軸にラベル列、Y軸に値の列を1つ（単一ファイル）"},
+    "ドーナツ": {"use_x": True, "multi_y": False, "multi_file": False,
+              "hint": "X軸にラベル列、Y軸に値の列を1つ（中央が空いた円）"},
 }
+
+
+# 円系（軸ラベル・凡例・グリッド・軸範囲を持たない）
+_PIE_TYPES = ("円", "ドーナツ")
+# XY 折れ線系（第2軸・近似曲線に対応、_draw_xy を通す）
+_XY_TYPES = ("折れ線", "散布図", "面", "ステップ", "ステム")
+# XY 種別ごとの既定系列 kind（per-series 指定があればそちらを優先）
+_XY_DEFAULT_KIND = {"折れ線": "line", "散布図": "scatter", "面": "area",
+                    "ステップ": "step", "ステム": "stem"}
+# オシロ格子・カーソルを許可する種別
+_SCOPE_TYPES = ("折れ線", "散布図")
 
 
 LINESTYLES = {"実線": "-", "破線": "--", "一点鎖線": "-.", "点線": ":", "なし": "None"}
@@ -1116,24 +1306,36 @@ def plot_series(
 
     ax.clear()
     _remove_twin(ax)               # 前回の第2軸を掃除
+    _remove_aux_axes(ax)           # 前回のカラーバー等を掃除
     ax.set_aspect("auto")          # 円グラフの equal を持ち越さない
     ax.set_facecolor(bg_color or "white")   # 背景色（空=白）。オシロは下で上書き
     ax.tick_params(colors="black")  # オシロ表示の目盛り色を既定へ戻す
 
     ax2 = None
-    if chart_type in ("折れ線", "散布図"):
-        if any((sr.get("axis") == "secondary") for sr in series):
+    if chart_type in _XY_TYPES:
+        if chart_type != "積み上げ面" and any((sr.get("axis") == "secondary") for sr in series):
             ax2 = ax.twinx()
             ax._twin_secondary = ax2
             if secondary_label:
                 ax2.set_ylabel(secondary_label, fontsize=(fonts or {}).get("label", 10))
         _draw_xy(ax, series, line=(chart_type == "折れ線"),
                  max_points=max_points, ax2=ax2, data_labels=data_labels,
-                 trendline=trendline, fonts=fonts)
+                 trendline=trendline, fonts=fonts,
+                 default_skind=_XY_DEFAULT_KIND.get(chart_type))
+    elif chart_type == "積み上げ面":
+        _draw_stack(ax, series)
     elif chart_type == "ヒストグラム":
         _draw_hist(ax, series, bins)
+    elif chart_type == "2Dヒストグラム":
+        _draw_hist2d(ax, series, bins)
+    elif chart_type == "hexbin":
+        _draw_hexbin(ax, series, bins)
     elif chart_type == "箱ひげ":
         _draw_box(ax, series)
+    elif chart_type == "バイオリン":
+        _draw_violin(ax, series)
+    elif chart_type == "ヒートマップ":
+        _draw_heatmap(ax, series)
     elif chart_type in ("棒", "横棒", "積み上げ棒"):
         if categories is None:
             raise ValueError("X軸（カテゴリ）の列を選択してください。")
@@ -1141,15 +1343,16 @@ def plot_series(
                   horizontal=(chart_type == "横棒"),
                   stacked=(chart_type == "積み上げ棒"),
                   data_labels=data_labels, fonts=fonts)
-    elif chart_type == "円":
+    elif chart_type in _PIE_TYPES:
         if categories is None:
             raise ValueError("X軸（ラベル）の列を選択してください。")
-        _draw_pie(ax, series[0], categories, pct=pct)
+        _draw_pie(ax, series[0], categories, pct=pct,
+                  donut=(chart_type == "ドーナツ"))
 
     # --- タイトル・ラベル ---
     if title:
         ax.set_title(title, fontsize=fonts.get("title", 12))
-    if chart_type != "円":
+    if chart_type not in _PIE_TYPES:
         xl = (f"{xlabel} [{xunit}]".strip() if xunit else xlabel)
         yl_base = ylabel or ("頻度" if chart_type == "ヒストグラム" else "")
         yl = (f"{yl_base} [{yunit}]".strip() if yunit else yl_base)
@@ -1160,7 +1363,7 @@ def plot_series(
     # --- 対数軸・軸範囲 ---
     # min/max は片側だけの指定でも反映する（例: min=0 のみ → 左端を0に詰め、
     # 自動の5%余白を消す。両方そろわないと無視する旧仕様が「0でも余白が残る」原因だった）。
-    if chart_type != "円":
+    if chart_type not in _PIE_TYPES:
         if xlog:
             ax.set_xscale("log")
         if ylog:
@@ -1177,12 +1380,12 @@ def plot_series(
                 ax.set_ylim(top=ylim[1])
 
     # --- オシロスコープ表示（折れ線/散布図のみ）---
-    if scope and scope.get("enabled") and chart_type in ("折れ線", "散布図"):
+    if scope and scope.get("enabled") and chart_type in _SCOPE_TYPES:
         _apply_scope(ax, scope, bg_color=bg_color)
         grid = True
 
     # --- 凡例・グリッド ---
-    if legend and chart_type != "円":
+    if legend and chart_type not in _PIE_TYPES:
         handles, labels = ax.get_legend_handles_labels()
         if ax2 is not None:                       # 第2軸の系列も凡例に統合
             h2, l2 = ax2.get_legend_handles_labels()
@@ -1191,7 +1394,7 @@ def plot_series(
         if handles:
             ax.legend(handles, labels, loc=legend_loc,
                       fontsize=(fonts.get("legend") or fonts.get("tick", 9)))
-    if grid and chart_type != "円":
+    if grid and chart_type not in _PIE_TYPES:
         # grid_width=None は「既定の太さ」。matplotlib は linewidth=None を float(None) に
         # 渡してしまうため、指定があるときだけ linewidth を渡す。
         gkw = {} if grid_width is None else {"linewidth": grid_width}
@@ -1219,7 +1422,7 @@ def plot_series(
                             fontsize=fonts.get("tick", 9))
 
     # --- 軸の向き反転（最後に適用。範囲指定・オシロ表示の後でも効く）---
-    if chart_type != "円":
+    if chart_type not in _PIE_TYPES:
         if xinvert and not ax.xaxis_inverted():
             ax.invert_xaxis()
         if yinvert and not ax.yaxis_inverted():
@@ -4860,9 +5063,10 @@ class PlotMixin:
         info = CHART_INFO.get(ctype, {})
         self.hint_label.setText("➤ " + info.get("hint", ""))
         self._update_x_combo_enabled()
-        self.bins_spin.setEnabled(ctype == "ヒストグラム")
-        self.bins_caption.setEnabled(ctype == "ヒストグラム")
-        self.pct_check.setEnabled(ctype == "円")
+        uses_bins = ctype in ("ヒストグラム", "2Dヒストグラム", "hexbin")
+        self.bins_spin.setEnabled(uses_bins)
+        self.bins_caption.setEnabled(uses_bins)
+        self.pct_check.setEnabled(ctype in ("円", "ドーナツ"))
         if hasattr(self, "series_bar"):
             self._rebuild_series_bar(ctype)   # 折れ線/散布図でのみ上部バーを出す
 
@@ -4879,7 +5083,7 @@ class PlotMixin:
             st = self.series_styles.get(self._style_key(fl, col)) or {}
             return st.get("label") or default
 
-        if chart_type in ("棒", "横棒", "積み上げ棒", "円"):
+        if chart_type in ("棒", "横棒", "積み上げ棒", "円", "ドーナツ"):
             # 単一ファイル（最初に選んだ系列のファイル）を使う
             src = items[0][0]
             df = self.datasets[src]
@@ -4891,7 +5095,8 @@ class PlotMixin:
                     continue
                 series.append({"label": lbl(fl, col, disp, col), "y": self.datasets[fl][col].to_numpy(),
                                "style": self.series_styles.get(self._style_key(fl, col))})
-        elif chart_type in ("折れ線", "散布図"):
+        elif chart_type in ("折れ線", "散布図", "面", "積み上げ面",
+                            "ステップ", "ステム", "2Dヒストグラム", "hexbin"):
             for fl, col, disp in items:
                 df = self.datasets[fl]
                 xv = self._x_values(df)
@@ -6542,12 +6747,13 @@ class BatchMixin:
         leftmost = self._use_leftmost_x()
         xv = (df.iloc[:, 0].to_numpy() if leftmost
               else (df[x_name].to_numpy() if x_name in df.columns else df.iloc[:, 0].to_numpy()))
-        if chart_type in ("棒", "横棒", "積み上げ棒", "円"):
+        if chart_type in ("棒", "横棒", "積み上げ棒", "円", "ドーナツ"):
             categories = xv
             for c in y_names:
                 series.append({"label": c, "y": df[c].to_numpy(),
                                "style": style_by_col.get(c)})
-        elif chart_type in ("折れ線", "散布図"):
+        elif chart_type in ("折れ線", "散布図", "面", "積み上げ面",
+                            "ステップ", "ステム", "2Dヒストグラム", "hexbin"):
             for c in y_names:
                 st = style_by_col.get(c) or {}
                 errcol = st.get("errcol")

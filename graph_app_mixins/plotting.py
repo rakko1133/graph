@@ -22,9 +22,10 @@ class PlotMixin:
         info = plotter.CHART_INFO.get(ctype, {})
         self.hint_label.setText("➤ " + info.get("hint", ""))
         self._update_x_combo_enabled()
-        self.bins_spin.setEnabled(ctype == "ヒストグラム")
-        self.bins_caption.setEnabled(ctype == "ヒストグラム")
-        self.pct_check.setEnabled(ctype == "円")
+        uses_bins = ctype in ("ヒストグラム", "2Dヒストグラム", "hexbin")
+        self.bins_spin.setEnabled(uses_bins)
+        self.bins_caption.setEnabled(uses_bins)
+        self.pct_check.setEnabled(ctype in ("円", "ドーナツ"))
         if hasattr(self, "series_bar"):
             self._rebuild_series_bar(ctype)   # 折れ線/散布図でのみ上部バーを出す
 
@@ -41,7 +42,7 @@ class PlotMixin:
             st = self.series_styles.get(self._style_key(fl, col)) or {}
             return st.get("label") or default
 
-        if chart_type in ("棒", "横棒", "積み上げ棒", "円"):
+        if chart_type in ("棒", "横棒", "積み上げ棒", "円", "ドーナツ"):
             # 単一ファイル（最初に選んだ系列のファイル）を使う
             src = items[0][0]
             df = self.datasets[src]
@@ -53,7 +54,8 @@ class PlotMixin:
                     continue
                 series.append({"label": lbl(fl, col, disp, col), "y": self.datasets[fl][col].to_numpy(),
                                "style": self.series_styles.get(self._style_key(fl, col))})
-        elif chart_type in ("折れ線", "散布図"):
+        elif chart_type in ("折れ線", "散布図", "面", "積み上げ面",
+                            "ステップ", "ステム", "2Dヒストグラム", "hexbin"):
             for fl, col, disp in items:
                 df = self.datasets[fl]
                 xv = self._x_values(df)
