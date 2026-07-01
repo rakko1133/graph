@@ -106,7 +106,8 @@ def axis_scale(x, spec):
         except (ValueError, OverflowError, ZeroDivisionError):
             return x
     try:
-        return np.asarray(eval_expr(s, {"x": x}), dtype=float)   # 'x' を含む式
+        r = np.asarray(eval_expr(s, {"x": x}), dtype=float)      # 'x' を含む式
+        return np.where(np.isfinite(r), r, np.nan)               # inf は nan にして自動スケールを壊さない
     except Exception:                # noqa: BLE001  不正な式は無変換で返す
         return x
 

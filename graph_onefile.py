@@ -2463,7 +2463,8 @@ def axis_scale(x, spec):
         except (ValueError, OverflowError, ZeroDivisionError):
             return x
     try:
-        return np.asarray(eval_expr(s, {"x": x}), dtype=float)   # 'x' を含む式
+        r = np.asarray(eval_expr(s, {"x": x}), dtype=float)      # 'x' を含む式
+        return np.where(np.isfinite(r), r, np.nan)               # inf は nan にして自動スケールを壊さない
     except Exception:                # noqa: BLE001  不正な式は無変換で返す
         return x
 
@@ -5576,6 +5577,8 @@ class ScopeCursorMixin:
             QtWidgets.QMessageBox.information(self, "情報", "データタブでY系列を選択してください。")
             return
         xname = self.x_combo.currentText()
+        xspec = self.xscale_edit.text()   # 表示と同じ単位変換（倍率/式）を反映して範囲を求める
+        yspec = self.yscale_edit.text()
         tmins, tmaxs, ymins, ymaxs = [], [], [], []
         for fl, col, _ in items:
             df = self.datasets[fl]
@@ -5584,6 +5587,8 @@ class ScopeCursorMixin:
             if np.isnan(tt).mean() > 0.5:
                 tt = np.arange(len(tt), dtype=float)
             yy = pd.to_numeric(pd.Series(df[col].to_numpy()), errors="coerce").to_numpy(dtype=float)
+            tt = axis_scale(tt, xspec)
+            yy = axis_scale(yy, yspec)
             tt, yy = tt[np.isfinite(tt)], yy[np.isfinite(yy)]
             if tt.size:
                 tmins.append(tt.min()); tmaxs.append(tt.max())
