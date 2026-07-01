@@ -365,10 +365,14 @@ def load_table(path, encoding=None, delimiter=None):
         raise FileNotFoundError(f"ファイルが見つかりません: {path}")
 
     # --- Excel（先頭シート）---
-    if os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm", ".xls"):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx", ".xlsm", ".xls"):
         try:
             df = pd.read_excel(path)
         except ImportError as e:
+            if ext == ".xls":   # 旧形式 .xls は openpyxl では読めず xlrd が必要
+                raise ValueError('.xls の読み込みには xlrd が必要です'
+                                 '（pip install "xlrd>=2.0.1"）。') from e
             raise ValueError("Excel(.xlsx) の読み込みには openpyxl が必要です"
                              "（pip install openpyxl）。") from e
         if df.shape[1] == 0:
@@ -706,6 +710,7 @@ def _draw_xy(ax, series, line=True, max_points=0, ax2=None, data_labels=False,
             xx = np.array([cat_pos[lab] for lab in x], dtype=float)
         else:
             xx = np.asarray(x, dtype=float)
+        xx_full = xx        # 間引き前のフル解像度X（近似曲線・R²はこちらでフィットする）
         # 大容量データの間引き（カテゴリ以外・誤差バー無し・線/散布のみ）
         decim = (max_points and kind != "category" and yerr is None
                  and skind in ("line", "scatter") and len(y) > max_points)
@@ -755,7 +760,8 @@ def _draw_xy(ax, series, line=True, max_points=0, ax2=None, data_labels=False,
         # --- 近似曲線（線/散布/面のみ。数値X限定）---
         if (trendline and trendline.get("type") not in (None, "なし")
                 and kind in ("numeric", "index") and skind != "bar"):
-            fit = fit_trendline(xx, yv, trendline["type"],
+            # 近似・R² は間引き後ではなくフルデータでフィット（間引きで統計がズレるのを防ぐ）
+            fit = fit_trendline(xx_full, y, trendline["type"],
                                 degree=trendline.get("degree", 2),
                                 window=trendline.get("window", 5))
             if fit is not None:
@@ -1096,12 +1102,15 @@ def plot_series(
             if _needs(xscale) and sr.get("x") is not None:
                 sr["x"] = axis_scale(sr["x"], xscale)
             if _needs(yscale) and sr.get("axis") != "secondary" and sr.get("y") is not None:
-                sr["y"] = axis_scale(sr["y"], yscale)
+                yb = np.asarray(sr["y"], dtype=float)
+                sr["y"] = axis_scale(yb, yscale)
                 if sr.get("yerr") is not None:
-                    try:                                  # 誤差は数値倍率のときだけスケール
-                        sr["yerr"] = np.asarray(sr["yerr"], dtype=float) * float(str(yscale))
-                    except (ValueError, TypeError):
-                        pass
+                    # 誤差も y と同じ変換にかける（変換後の y±誤差 の幅の半分）。
+                    # 数値/累乗/式のいずれでも整合し、生スケールのまま残らない。
+                    e = np.asarray(sr["yerr"], dtype=float)
+                    hi = axis_scale(yb + e, yscale)
+                    lo = axis_scale(yb - e, yscale)
+                    sr["yerr"] = np.abs(hi - lo) / 2.0
             scaled.append(sr)
         series = scaled
 
@@ -5190,6 +5199,10 @@ class PlotMixin:
             b = dispmap.get(bname)
             if b is None or b.get("x") is None:
                 return
+            if (b.get("axis") or "primary") != (a.get("axis") or "primary"):
+                # A と B が別軸だと座標系が混ざり塗り位置がズレる。同一軸のときだけ塗る。
+                self._set_status("塗りつぶし: A と B は同じ軸の系列にしてください。")
+                return
             xb, ybv = sxy(b)
             order = np.argsort(xb)
             yb = np.interp(xa, xb[order], ybv[order])
@@ -5634,7 +5647,10 @@ class AnalysisMixin:
             x0, x1 = self.ax.get_xlim()
             if x1 < x0:
                 x0, x1 = x1, x0
-            mask = (t >= x0) & (t <= x1)
+            # 画面のX範囲は「単位変換後」の座標。生の t を同じ変換にかけてから絞る
+            # （倍率/式を使うと生 t と表示座標がズレるため）。値は生のまま解析する。
+            t_disp = axis_scale(t, self.xscale_edit.text())
+            mask = (t_disp >= x0) & (t_disp <= x1)
             if int(mask.sum()) >= 3:
                 t, y = t[mask], y[mask]
         return t, y
@@ -5659,8 +5675,16 @@ class AnalysisMixin:
                                                smooth=self.smooth_spin.value())
         except Exception:
             return None
-        return [{"x": p["time"], "y": p["value"], "text": f"第{p['rank']}",
-                 "color": "#ff3030"} for p in peaks if p["time"] is not None]
+        # マーカーは表示座標（単位変換後）に合わせる。生座標のままだと倍率/式で線とズレる。
+        xspec, yspec = self.xscale_edit.text(), self.yscale_edit.text()
+        out = []
+        for p in peaks:
+            if p["time"] is None:
+                continue
+            out.append({"x": float(axis_scale([p["time"]], xspec)[0]),
+                        "y": float(axis_scale([p["value"]], yspec)[0]),
+                        "text": f"第{p['rank']}", "color": "#ff3030"})
+        return out
 
     def run_analysis(self):
         t, y, label = self._analysis_xy()
@@ -7032,10 +7056,14 @@ class PersistenceMixin:
             if tc:
                 self.trend_color = tc; self.trend_color_btn.setText("色: " + tc)
                 self.trend_color_btn.setStyleSheet(f"background:{tc};")
+            else:
+                self._reset_trend_color()   # プリセットが自動色なら自動へ戻す
             bgc = d.get("bg_color", "")
             if bgc:
                 self.bg_color = bgc; self.bg_btn.setText("背景色: " + bgc)
                 self.bg_btn.setStyleSheet(f"background:{bgc};")
+            else:
+                self._reset_bg_color()
             if "aspect" in d:
                 self.aspect_w.setValue(int(d.get("aspect_w", 16)))
                 self.aspect_h.setValue(int(d.get("aspect_h", 9)))

@@ -231,6 +231,7 @@ def _draw_xy(ax, series, line=True, max_points=0, ax2=None, data_labels=False,
             xx = np.array([cat_pos[lab] for lab in x], dtype=float)
         else:
             xx = np.asarray(x, dtype=float)
+        xx_full = xx        # 間引き前のフル解像度X（近似曲線・R²はこちらでフィットする）
         # 大容量データの間引き（カテゴリ以外・誤差バー無し・線/散布のみ）
         decim = (max_points and kind != "category" and yerr is None
                  and skind in ("line", "scatter") and len(y) > max_points)
@@ -280,7 +281,8 @@ def _draw_xy(ax, series, line=True, max_points=0, ax2=None, data_labels=False,
         # --- 近似曲線（線/散布/面のみ。数値X限定）---
         if (trendline and trendline.get("type") not in (None, "なし")
                 and kind in ("numeric", "index") and skind != "bar"):
-            fit = fit_trendline(xx, yv, trendline["type"],
+            # 近似・R² は間引き後ではなくフルデータでフィット（間引きで統計がズレるのを防ぐ）
+            fit = fit_trendline(xx_full, y, trendline["type"],
                                 degree=trendline.get("degree", 2),
                                 window=trendline.get("window", 5))
             if fit is not None:

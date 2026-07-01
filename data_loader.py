@@ -155,10 +155,14 @@ def load_table(path, encoding=None, delimiter=None):
         raise FileNotFoundError(f"ファイルが見つかりません: {path}")
 
     # --- Excel（先頭シート）---
-    if os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm", ".xls"):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx", ".xlsm", ".xls"):
         try:
             df = pd.read_excel(path)
         except ImportError as e:
+            if ext == ".xls":   # 旧形式 .xls は openpyxl では読めず xlrd が必要
+                raise ValueError('.xls の読み込みには xlrd が必要です'
+                                 '（pip install "xlrd>=2.0.1"）。') from e
             raise ValueError("Excel(.xlsx) の読み込みには openpyxl が必要です"
                              "（pip install openpyxl）。") from e
         if df.shape[1] == 0:

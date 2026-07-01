@@ -312,10 +312,14 @@ class PersistenceMixin:
             if tc:
                 self.trend_color = tc; self.trend_color_btn.setText("色: " + tc)
                 self.trend_color_btn.setStyleSheet(f"background:{tc};")
+            else:
+                self._reset_trend_color()   # プリセットが自動色なら自動へ戻す
             bgc = d.get("bg_color", "")
             if bgc:
                 self.bg_color = bgc; self.bg_btn.setText("背景色: " + bgc)
                 self.bg_btn.setStyleSheet(f"background:{bgc};")
+            else:
+                self._reset_bg_color()
             if "aspect" in d:
                 self.aspect_w.setValue(int(d.get("aspect_w", 16)))
                 self.aspect_h.setValue(int(d.get("aspect_h", 9)))

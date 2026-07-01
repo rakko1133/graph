@@ -361,6 +361,10 @@ class PlotMixin:
             b = dispmap.get(bname)
             if b is None or b.get("x") is None:
                 return
+            if (b.get("axis") or "primary") != (a.get("axis") or "primary"):
+                # A と B が別軸だと座標系が混ざり塗り位置がズレる。同一軸のときだけ塗る。
+                self._set_status("塗りつぶし: A と B は同じ軸の系列にしてください。")
+                return
             xb, ybv = sxy(b)
             order = np.argsort(xb)
             yb = np.interp(xa, xb[order], ybv[order])

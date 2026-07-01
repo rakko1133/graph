@@ -140,12 +140,15 @@ def plot_series(
             if _needs(xscale) and sr.get("x") is not None:
                 sr["x"] = axis_scale(sr["x"], xscale)
             if _needs(yscale) and sr.get("axis") != "secondary" and sr.get("y") is not None:
-                sr["y"] = axis_scale(sr["y"], yscale)
+                yb = np.asarray(sr["y"], dtype=float)
+                sr["y"] = axis_scale(yb, yscale)
                 if sr.get("yerr") is not None:
-                    try:                                  # 誤差は数値倍率のときだけスケール
-                        sr["yerr"] = np.asarray(sr["yerr"], dtype=float) * float(str(yscale))
-                    except (ValueError, TypeError):
-                        pass
+                    # 誤差も y と同じ変換にかける（変換後の y±誤差 の幅の半分）。
+                    # 数値/累乗/式のいずれでも整合し、生スケールのまま残らない。
+                    e = np.asarray(sr["yerr"], dtype=float)
+                    hi = axis_scale(yb + e, yscale)
+                    lo = axis_scale(yb - e, yscale)
+                    sr["yerr"] = np.abs(hi - lo) / 2.0
             scaled.append(sr)
         series = scaled
 

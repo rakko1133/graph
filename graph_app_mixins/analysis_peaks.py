@@ -21,7 +21,10 @@ class AnalysisMixin:
             x0, x1 = self.ax.get_xlim()
             if x1 < x0:
                 x0, x1 = x1, x0
-            mask = (t >= x0) & (t <= x1)
+            # 画面のX範囲は「単位変換後」の座標。生の t を同じ変換にかけてから絞る
+            # （倍率/式を使うと生 t と表示座標がズレるため）。値は生のまま解析する。
+            t_disp = mathchan.axis_scale(t, self.xscale_edit.text())
+            mask = (t_disp >= x0) & (t_disp <= x1)
             if int(mask.sum()) >= 3:
                 t, y = t[mask], y[mask]
         return t, y
@@ -46,8 +49,16 @@ class AnalysisMixin:
                                                smooth=self.smooth_spin.value())
         except Exception:
             return None
-        return [{"x": p["time"], "y": p["value"], "text": f"第{p['rank']}",
-                 "color": "#ff3030"} for p in peaks if p["time"] is not None]
+        # マーカーは表示座標（単位変換後）に合わせる。生座標のままだと倍率/式で線とズレる。
+        xspec, yspec = self.xscale_edit.text(), self.yscale_edit.text()
+        out = []
+        for p in peaks:
+            if p["time"] is None:
+                continue
+            out.append({"x": float(mathchan.axis_scale([p["time"]], xspec)[0]),
+                        "y": float(mathchan.axis_scale([p["value"]], yspec)[0]),
+                        "text": f"第{p['rank']}", "color": "#ff3030"})
+        return out
 
     def run_analysis(self):
         t, y, label = self._analysis_xy()
