@@ -52,6 +52,9 @@ class PersistenceMixin:
             "trend_window": self.trend_window.value(),
             "trend_eq": self.trend_eq.isChecked(),
             "trend_color": getattr(self, "trend_color", ""),
+            "fill_enabled": self.fill_check.isChecked(),
+            "fill_a": self.fill_a.currentText(), "fill_b": self.fill_b.currentText(),
+            "fill_color": getattr(self, "fill_color", ""), "fill_alpha": self.fill_alpha.value(),
             "data_labels": self.data_labels_check.isChecked(),
             "aspect": self.aspect_combo.currentText(),
             "aspect_w": self.aspect_w.value(), "aspect_h": self.aspect_h.value(),
@@ -130,6 +133,19 @@ class PersistenceMixin:
             self.trend_color_btn.setStyleSheet(f"background:{tc};")
         else:
             self._reset_trend_color()
+        # 系列間の塗りつぶし（系列コンボを先に更新してから選択・色を復元）
+        self._update_analysis_targets()
+        self.fill_check.setChecked(cfg.get("fill_enabled", False))
+        self.fill_a.setCurrentText(cfg.get("fill_a", ""))
+        self.fill_b.setCurrentText(cfg.get("fill_b", "0（X軸）"))
+        self.fill_alpha.setValue(cfg.get("fill_alpha", 0.3))
+        fc = cfg.get("fill_color", "")
+        if fc:
+            self.fill_color = fc
+            self.fill_color_btn.setText("色: " + fc)
+            self.fill_color_btn.setStyleSheet(f"background:{fc};")
+        else:
+            self._reset_fill_color()
         self.data_labels_check.setChecked(cfg.get("data_labels", False))
         self.aspect_w.setValue(int(cfg.get("aspect_w", 16)))
         self.aspect_h.setValue(int(cfg.get("aspect_h", 9)))

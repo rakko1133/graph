@@ -3383,6 +3383,29 @@ class UIBuildMixin:
         tl.addStretch(1)
         v.addLayout(tl)
 
+        # 系列間の塗りつぶし（2系列の間、または系列とX軸(0)の間を帯で塗る）※折れ線/散布図
+        fl_ = QtWidgets.QHBoxLayout()
+        self.fill_check = QtWidgets.QCheckBox("系列間を塗りつぶし")
+        self.fill_check.setToolTip("2つの系列の間（または系列とX軸=0の間）を色で塗ります。折れ線/散布図で有効。")
+        fl_.addWidget(self.fill_check)
+        fl_.addWidget(QtWidgets.QLabel("A"))
+        self.fill_a = QtWidgets.QComboBox(); fl_.addWidget(self.fill_a, 1)
+        fl_.addWidget(QtWidgets.QLabel("B"))
+        self.fill_b = QtWidgets.QComboBox(); fl_.addWidget(self.fill_b, 1)
+        self.fill_color = ""
+        self.fill_color_btn = QtWidgets.QPushButton("色: 自動")
+        self.fill_color_btn.setToolTip("塗りつぶしの色。クリックで選択／右クリックで自動（系列Aの色）に戻す。")
+        self.fill_color_btn.clicked.connect(self._pick_fill_color)
+        self.fill_color_btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.fill_color_btn.customContextMenuRequested.connect(lambda *_: self._reset_fill_color())
+        fl_.addWidget(self.fill_color_btn)
+        fl_.addWidget(QtWidgets.QLabel("濃さ"))
+        self.fill_alpha = QtWidgets.QDoubleSpinBox()
+        self.fill_alpha.setRange(0.05, 1.0); self.fill_alpha.setSingleStep(0.05); self.fill_alpha.setValue(0.3)
+        self.fill_alpha.setToolTip("塗りつぶしの不透明度（0.05〜1.0）")
+        fl_.addWidget(self.fill_alpha)
+        v.addLayout(fl_)
+
         # ビン数・パーセント
         extra = QtWidgets.QHBoxLayout()
         self.bins_caption = QtWidgets.QLabel("ビン数:")
@@ -3859,8 +3882,11 @@ class UIBuildMixin:
         self.trend_combo.currentTextChanged.connect(r)
         for s in (self.trend_degree, self.trend_window):
             s.valueChanged.connect(r)
-        for c in (self.trend_eq, self.data_labels_check):
+        for c in (self.trend_eq, self.data_labels_check, self.fill_check):
             c.toggled.connect(r)
+        self.fill_a.currentTextChanged.connect(r)
+        self.fill_b.currentTextChanged.connect(r)
+        self.fill_alpha.valueChanged.connect(r)
         # 縦横比（コンボは _on_aspect_changed 経由で再描画。W/H は直接）
         for s in (self.aspect_w, self.aspect_h):
             s.valueChanged.connect(r)
@@ -4483,8 +4509,8 @@ class StyleTableMixin:
     def _update_analysis_targets(self):
         names = [d for _, _, d in self._selected_series_items()]
         combos = [self.analysis_target]
-        # 高度解析・データサイエンスタブの系列コンボも更新（構築済みなら）
-        for attr in ("phase_target2", "math_a", "math_b", "ds_target"):
+        # 高度解析・データサイエンス・塗りつぶしの系列コンボも更新（構築済みなら）
+        for attr in ("phase_target2", "math_a", "math_b", "ds_target", "fill_a"):
             if hasattr(self, attr):
                 combos.append(getattr(self, attr))
         if hasattr(self, "proto_ch"):
@@ -4498,6 +4524,17 @@ class StyleTableMixin:
             if idx >= 0:
                 cb.setCurrentIndex(idx)
             cb.blockSignals(False)
+        # 塗りつぶしB は先頭に「0（X軸）」を入れる
+        if hasattr(self, "fill_b"):
+            cur = self.fill_b.currentText()
+            self.fill_b.blockSignals(True)
+            self.fill_b.clear()
+            self.fill_b.addItem("0（X軸）")
+            self.fill_b.addItems(names)
+            idx = self.fill_b.findText(cur)
+            if idx >= 0:
+                self.fill_b.setCurrentIndex(idx)
+            self.fill_b.blockSignals(False)
 
     @staticmethod
     def _style_key(fl, col):
@@ -4628,6 +4665,22 @@ class StyleTableMixin:
         self.trend_color = ""
         self.trend_color_btn.setText("色: 自動")
         self.trend_color_btn.setStyleSheet("")
+        self._request_redraw()
+
+    def _pick_fill_color(self):
+        """系列間塗りつぶしの色を選ぶ（空=自動: 系列Aの色）。"""
+        col = QtWidgets.QColorDialog.getColor(parent=self)
+        if col.isValid():
+            self.fill_color = col.name()
+            self.fill_color_btn.setText("色: " + self.fill_color)
+            self.fill_color_btn.setStyleSheet(f"background:{self.fill_color};")
+            self._request_redraw()
+
+    def _reset_fill_color(self):
+        """塗りつぶしの色を自動（系列Aの色）に戻す。"""
+        self.fill_color = ""
+        self.fill_color_btn.setText("色: 自動")
+        self.fill_color_btn.setStyleSheet("")
         self._request_redraw()
 
     # 純視覚スタイル（全再描画せず該当アーティストへ直接反映できるもの）
@@ -4990,6 +5043,7 @@ class PlotMixin:
                 )
                 self._apply_aspect()   # 縦横比の固定（自動なら解除）
                 self._apply_tick_spacing(ctype, scope)   # 目盛り間隔（指定時）
+                self._apply_fill_between(ctype, series)   # 系列間の塗りつぶし（選択時）
                 self._draw_ds_annotations()              # データサイエンス注記（選択時）
                 try:
                     self.fig.tight_layout()
@@ -5056,6 +5110,52 @@ class PlotMixin:
                     self.ax.yaxis.set_major_locator(MultipleLocator(dy))
                 except Exception:
                     pass
+
+    def _apply_fill_between(self, ctype, series):
+        """系列A と 系列B（または X軸=0）の間を塗りつぶす。折れ線/散布図のみ。
+        描画は単位換算後の座標に合わせる（B が異なるXでも A の X に補間）。"""
+        if not getattr(self, "fill_check", None) or not self.fill_check.isChecked():
+            return
+        if ctype not in ("折れ線", "散布図") or not series:
+            return
+        import numpy as np
+        import pandas as pd
+        items = self._selected_series_items()
+        dispmap = {it[2]: s for it, s in zip(items, series)}
+        a = dispmap.get(self.fill_a.currentText())
+        if a is None or a.get("x") is None:
+            return
+        xs = _parse_float(self.xscale_edit.text(), 1.0) or 1.0
+        ys = _parse_float(self.yscale_edit.text(), 1.0) or 1.0
+
+        def sxy(s):
+            x = pd.to_numeric(pd.Series(s["x"]), errors="coerce").to_numpy(float) * xs
+            y = pd.to_numeric(pd.Series(s["y"]), errors="coerce").to_numpy(float)
+            if s.get("axis") != "secondary":
+                y = y * ys
+            return x, y
+
+        xa, ya = sxy(a)
+        bname = self.fill_b.currentText()
+        if bname == "0（X軸）":
+            yb = np.zeros_like(ya)
+        else:
+            b = dispmap.get(bname)
+            if b is None or b.get("x") is None:
+                return
+            xb, ybv = sxy(b)
+            order = np.argsort(xb)
+            yb = np.interp(xa, xb[order], ybv[order])
+        color = self.fill_color or (a.get("style") or {}).get("color") or None
+        target = self.ax
+        if a.get("axis") == "secondary":
+            target = getattr(self.ax, "_twin_secondary", None) or self.ax
+        try:
+            m = np.isfinite(xa) & np.isfinite(ya) & np.isfinite(yb)
+            target.fill_between(xa, ya, yb, where=m, color=color,
+                                alpha=self.fill_alpha.value(), zorder=0, linewidth=0)
+        except Exception:
+            pass
 
     def _draw_ds_annotations(self):
         """『表示』にチェックした指標をグラフへ注記する。
@@ -6598,6 +6698,9 @@ class PersistenceMixin:
             "trend_window": self.trend_window.value(),
             "trend_eq": self.trend_eq.isChecked(),
             "trend_color": getattr(self, "trend_color", ""),
+            "fill_enabled": self.fill_check.isChecked(),
+            "fill_a": self.fill_a.currentText(), "fill_b": self.fill_b.currentText(),
+            "fill_color": getattr(self, "fill_color", ""), "fill_alpha": self.fill_alpha.value(),
             "data_labels": self.data_labels_check.isChecked(),
             "aspect": self.aspect_combo.currentText(),
             "aspect_w": self.aspect_w.value(), "aspect_h": self.aspect_h.value(),
@@ -6676,6 +6779,19 @@ class PersistenceMixin:
             self.trend_color_btn.setStyleSheet(f"background:{tc};")
         else:
             self._reset_trend_color()
+        # 系列間の塗りつぶし（系列コンボを先に更新してから選択・色を復元）
+        self._update_analysis_targets()
+        self.fill_check.setChecked(cfg.get("fill_enabled", False))
+        self.fill_a.setCurrentText(cfg.get("fill_a", ""))
+        self.fill_b.setCurrentText(cfg.get("fill_b", "0（X軸）"))
+        self.fill_alpha.setValue(cfg.get("fill_alpha", 0.3))
+        fc = cfg.get("fill_color", "")
+        if fc:
+            self.fill_color = fc
+            self.fill_color_btn.setText("色: " + fc)
+            self.fill_color_btn.setStyleSheet(f"background:{fc};")
+        else:
+            self._reset_fill_color()
         self.data_labels_check.setChecked(cfg.get("data_labels", False))
         self.aspect_w.setValue(int(cfg.get("aspect_w", 16)))
         self.aspect_h.setValue(int(cfg.get("aspect_h", 9)))

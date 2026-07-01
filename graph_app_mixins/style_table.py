@@ -190,8 +190,8 @@ class StyleTableMixin:
     def _update_analysis_targets(self):
         names = [d for _, _, d in self._selected_series_items()]
         combos = [self.analysis_target]
-        # 高度解析・データサイエンスタブの系列コンボも更新（構築済みなら）
-        for attr in ("phase_target2", "math_a", "math_b", "ds_target"):
+        # 高度解析・データサイエンス・塗りつぶしの系列コンボも更新（構築済みなら）
+        for attr in ("phase_target2", "math_a", "math_b", "ds_target", "fill_a"):
             if hasattr(self, attr):
                 combos.append(getattr(self, attr))
         if hasattr(self, "proto_ch"):
@@ -205,6 +205,17 @@ class StyleTableMixin:
             if idx >= 0:
                 cb.setCurrentIndex(idx)
             cb.blockSignals(False)
+        # 塗りつぶしB は先頭に「0（X軸）」を入れる
+        if hasattr(self, "fill_b"):
+            cur = self.fill_b.currentText()
+            self.fill_b.blockSignals(True)
+            self.fill_b.clear()
+            self.fill_b.addItem("0（X軸）")
+            self.fill_b.addItems(names)
+            idx = self.fill_b.findText(cur)
+            if idx >= 0:
+                self.fill_b.setCurrentIndex(idx)
+            self.fill_b.blockSignals(False)
 
     @staticmethod
     def _style_key(fl, col):
@@ -335,6 +346,22 @@ class StyleTableMixin:
         self.trend_color = ""
         self.trend_color_btn.setText("色: 自動")
         self.trend_color_btn.setStyleSheet("")
+        self._request_redraw()
+
+    def _pick_fill_color(self):
+        """系列間塗りつぶしの色を選ぶ（空=自動: 系列Aの色）。"""
+        col = QtWidgets.QColorDialog.getColor(parent=self)
+        if col.isValid():
+            self.fill_color = col.name()
+            self.fill_color_btn.setText("色: " + self.fill_color)
+            self.fill_color_btn.setStyleSheet(f"background:{self.fill_color};")
+            self._request_redraw()
+
+    def _reset_fill_color(self):
+        """塗りつぶしの色を自動（系列Aの色）に戻す。"""
+        self.fill_color = ""
+        self.fill_color_btn.setText("色: 自動")
+        self.fill_color_btn.setStyleSheet("")
         self._request_redraw()
 
     # 純視覚スタイル（全再描画せず該当アーティストへ直接反映できるもの）

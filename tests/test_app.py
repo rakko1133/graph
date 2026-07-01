@@ -155,6 +155,18 @@ def test_format_preset_roundtrip():
     w.delete_preset()
 
 
+def test_fill_between():
+    from matplotlib.collections import PolyCollection
+    w = _make_app(_wave())
+    w.chart_combo.setCurrentText("折れ線")
+    w.fill_check.setChecked(True)
+    w.fill_a.setCurrentText("電圧"); w.fill_b.setCurrentText("電流")
+    w.draw_graph()
+    assert any(isinstance(c, PolyCollection) for c in w.ax.collections)
+    w.fill_b.setCurrentText("0（X軸）"); w.draw_graph()
+    assert any(isinstance(c, PolyCollection) for c in w.ax.collections)
+
+
 def test_undo_redo():
     w = _make_app(_wave())
     for s in ("A", "B", "C"):

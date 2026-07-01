@@ -439,6 +439,29 @@ class UIBuildMixin:
         tl.addStretch(1)
         v.addLayout(tl)
 
+        # 系列間の塗りつぶし（2系列の間、または系列とX軸(0)の間を帯で塗る）※折れ線/散布図
+        fl_ = QtWidgets.QHBoxLayout()
+        self.fill_check = QtWidgets.QCheckBox("系列間を塗りつぶし")
+        self.fill_check.setToolTip("2つの系列の間（または系列とX軸=0の間）を色で塗ります。折れ線/散布図で有効。")
+        fl_.addWidget(self.fill_check)
+        fl_.addWidget(QtWidgets.QLabel("A"))
+        self.fill_a = QtWidgets.QComboBox(); fl_.addWidget(self.fill_a, 1)
+        fl_.addWidget(QtWidgets.QLabel("B"))
+        self.fill_b = QtWidgets.QComboBox(); fl_.addWidget(self.fill_b, 1)
+        self.fill_color = ""
+        self.fill_color_btn = QtWidgets.QPushButton("色: 自動")
+        self.fill_color_btn.setToolTip("塗りつぶしの色。クリックで選択／右クリックで自動（系列Aの色）に戻す。")
+        self.fill_color_btn.clicked.connect(self._pick_fill_color)
+        self.fill_color_btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.fill_color_btn.customContextMenuRequested.connect(lambda *_: self._reset_fill_color())
+        fl_.addWidget(self.fill_color_btn)
+        fl_.addWidget(QtWidgets.QLabel("濃さ"))
+        self.fill_alpha = QtWidgets.QDoubleSpinBox()
+        self.fill_alpha.setRange(0.05, 1.0); self.fill_alpha.setSingleStep(0.05); self.fill_alpha.setValue(0.3)
+        self.fill_alpha.setToolTip("塗りつぶしの不透明度（0.05〜1.0）")
+        fl_.addWidget(self.fill_alpha)
+        v.addLayout(fl_)
+
         # ビン数・パーセント
         extra = QtWidgets.QHBoxLayout()
         self.bins_caption = QtWidgets.QLabel("ビン数:")
@@ -915,8 +938,11 @@ class UIBuildMixin:
         self.trend_combo.currentTextChanged.connect(r)
         for s in (self.trend_degree, self.trend_window):
             s.valueChanged.connect(r)
-        for c in (self.trend_eq, self.data_labels_check):
+        for c in (self.trend_eq, self.data_labels_check, self.fill_check):
             c.toggled.connect(r)
+        self.fill_a.currentTextChanged.connect(r)
+        self.fill_b.currentTextChanged.connect(r)
+        self.fill_alpha.valueChanged.connect(r)
         # 縦横比（コンボは _on_aspect_changed 経由で再描画。W/H は直接）
         for s in (self.aspect_w, self.aspect_h):
             s.valueChanged.connect(r)

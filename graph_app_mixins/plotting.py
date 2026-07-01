@@ -261,6 +261,7 @@ class PlotMixin:
                 )
                 self._apply_aspect()   # 縦横比の固定（自動なら解除）
                 self._apply_tick_spacing(ctype, scope)   # 目盛り間隔（指定時）
+                self._apply_fill_between(ctype, series)   # 系列間の塗りつぶし（選択時）
                 self._draw_ds_annotations()              # データサイエンス注記（選択時）
                 try:
                     self.fig.tight_layout()
@@ -327,6 +328,52 @@ class PlotMixin:
                     self.ax.yaxis.set_major_locator(MultipleLocator(dy))
                 except Exception:
                     pass
+
+    def _apply_fill_between(self, ctype, series):
+        """系列A と 系列B（または X軸=0）の間を塗りつぶす。折れ線/散布図のみ。
+        描画は単位換算後の座標に合わせる（B が異なるXでも A の X に補間）。"""
+        if not getattr(self, "fill_check", None) or not self.fill_check.isChecked():
+            return
+        if ctype not in ("折れ線", "散布図") or not series:
+            return
+        import numpy as np
+        import pandas as pd
+        items = self._selected_series_items()
+        dispmap = {it[2]: s for it, s in zip(items, series)}
+        a = dispmap.get(self.fill_a.currentText())
+        if a is None or a.get("x") is None:
+            return
+        xs = _parse_float(self.xscale_edit.text(), 1.0) or 1.0
+        ys = _parse_float(self.yscale_edit.text(), 1.0) or 1.0
+
+        def sxy(s):
+            x = pd.to_numeric(pd.Series(s["x"]), errors="coerce").to_numpy(float) * xs
+            y = pd.to_numeric(pd.Series(s["y"]), errors="coerce").to_numpy(float)
+            if s.get("axis") != "secondary":
+                y = y * ys
+            return x, y
+
+        xa, ya = sxy(a)
+        bname = self.fill_b.currentText()
+        if bname == "0（X軸）":
+            yb = np.zeros_like(ya)
+        else:
+            b = dispmap.get(bname)
+            if b is None or b.get("x") is None:
+                return
+            xb, ybv = sxy(b)
+            order = np.argsort(xb)
+            yb = np.interp(xa, xb[order], ybv[order])
+        color = self.fill_color or (a.get("style") or {}).get("color") or None
+        target = self.ax
+        if a.get("axis") == "secondary":
+            target = getattr(self.ax, "_twin_secondary", None) or self.ax
+        try:
+            m = np.isfinite(xa) & np.isfinite(ya) & np.isfinite(yb)
+            target.fill_between(xa, ya, yb, where=m, color=color,
+                                alpha=self.fill_alpha.value(), zorder=0, linewidth=0)
+        except Exception:
+            pass
 
     def _draw_ds_annotations(self):
         """『表示』にチェックした指標をグラフへ注記する。
