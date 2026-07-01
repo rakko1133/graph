@@ -40,16 +40,13 @@ CHART_TYPES = [
     "ヒートマップ",
     "円",
     "ドーナツ",
-    "3D散布図",
-    "3D折れ線",
-    "3D曲面",
-    "3D棒",
+    "曲面",
 ]
 
 
 CHART_INFO = {
-    "折れ線": {"use_x": True, "multi_y": True, "multi_file": True,
-              "hint": "X軸に1列、Y軸に1列以上。複数ファイルの重ね描き可"},
+    "折れ線": {"use_x": True, "multi_y": True, "multi_file": True, "dim3": "optional",
+              "hint": "X軸に1列、Y軸に1列以上。複数ファイルの重ね描き可（『3D表示』でZ軸を使う3D線に）"},
     "面": {"use_x": True, "multi_y": True, "multi_file": True,
           "hint": "X軸に1列、Y軸に1列以上を塗り面で重ね描き。複数ファイル可"},
     "積み上げ面": {"use_x": True, "multi_y": True, "multi_file": True,
@@ -58,14 +55,14 @@ CHART_INFO = {
               "hint": "X軸に1列、Y軸に1列以上を階段状に。複数ファイル可"},
     "ステム": {"use_x": True, "multi_y": True, "multi_file": True,
             "hint": "X軸に1列、Y軸に1列以上を棒（幹）＋点で表示。複数ファイル可"},
-    "棒": {"use_x": True, "multi_y": True, "multi_file": False,
-          "hint": "X軸にカテゴリ列、Y軸に1列以上（単一ファイル）"},
+    "棒": {"use_x": True, "multi_y": True, "multi_file": False, "dim3": "optional",
+          "hint": "X軸にカテゴリ列、Y軸に1列以上（単一ファイル）。『3D表示』で(X,Y)にZ高さの3D棒に"},
     "横棒": {"use_x": True, "multi_y": True, "multi_file": False,
             "hint": "X軸にカテゴリ列、Y軸に1列以上（単一ファイル）"},
     "積み上げ棒": {"use_x": True, "multi_y": True, "multi_file": False,
                 "hint": "X軸にカテゴリ列、Y軸に2列以上（単一ファイル）"},
-    "散布図": {"use_x": True, "multi_y": True, "multi_file": True,
-            "hint": "X軸に1列、Y軸に1列以上。複数ファイル可"},
+    "散布図": {"use_x": True, "multi_y": True, "multi_file": True, "dim3": "optional",
+            "hint": "X軸に1列、Y軸に1列以上。複数ファイル可（『3D表示』でZ軸を使う3D散布図に）"},
     "ヒストグラム": {"use_x": False, "multi_y": True, "multi_file": True,
                 "hint": "Y軸に値の列を1列以上（分布を表示）。複数ファイル可"},
     "2Dヒストグラム": {"use_x": True, "multi_y": False, "multi_file": False,
@@ -82,14 +79,8 @@ CHART_INFO = {
           "hint": "X軸にラベル列、Y軸に値の列を1つ（単一ファイル）"},
     "ドーナツ": {"use_x": True, "multi_y": False, "multi_file": False,
               "hint": "X軸にラベル列、Y軸に値の列を1つ（中央が空いた円）"},
-    "3D散布図": {"use_x": True, "use_z": True, "multi_y": True, "multi_file": True,
-              "hint": "X軸・Z軸に1列ずつ、Y軸に1列以上（点を3Dにプロット。ドラッグで回転）"},
-    "3D折れ線": {"use_x": True, "use_z": True, "multi_y": True, "multi_file": True,
-              "hint": "X軸・Z軸に1列ずつ、Y軸に1列以上（線を3Dに描く。ドラッグで回転）"},
-    "3D曲面": {"use_x": True, "use_z": True, "multi_y": False, "multi_file": False,
-             "hint": "X軸・Y軸・Z軸に1列ずつ（散らばった点から曲面を生成。ドラッグで回転）"},
-    "3D棒": {"use_x": True, "use_z": True, "multi_y": True, "multi_file": True,
-           "hint": "X軸・Z軸に1列ずつ、Y軸に1列以上（(X,Y)位置にZの高さで棒を立てる）"},
+    "曲面": {"use_x": True, "multi_y": False, "multi_file": False, "dim3": "always",
+           "hint": "X軸・Y軸・Z軸に1列ずつ（散らばった点から曲面を生成・常に3D。ドラッグで回転）"},
 }
 
 
@@ -102,13 +93,30 @@ _XY_DEFAULT_KIND = {"折れ線": "line", "散布図": "scatter", "面": "area",
                     "ステップ": "step", "ステム": "stem"}
 # オシロ格子・カーソルを許可する種別
 _SCOPE_TYPES = ("折れ線", "散布図")
-# 3D 種別（projection='3d' の軸で描く。2D専用処理はすべて無効化する）
-_3D_TYPES = ("3D散布図", "3D折れ線", "3D曲面", "3D棒")
+# 3D で描くとき、種別名 → 3D描画の種類（_draw_3d が使う）
+_THREED_KIND = {"散布図": "scatter", "折れ線": "line", "棒": "bar", "曲面": "surface"}
+# 旧バージョンの『3D…』種別名 → 新しい2D種別名（3Dフラグは別途ON）
+_OLD_3D_ALIASES = {"3D散布図": "散布図", "3D折れ線": "折れ線",
+                   "3D棒": "棒", "3D曲面": "曲面"}
 
 
-def is_3d_type(chart_type):
-    """3D グラフ種別かどうか（GUI 側の軸切替判定に使う）。"""
-    return chart_type in _3D_TYPES
+def can_be_3d(chart_type):
+    """『3D表示』チェックが効く種別か（3D描画に対応するか）。"""
+    return CHART_INFO.get(chart_type, {}).get("dim3") in ("optional", "always")
+
+
+def always_3d(chart_type):
+    """常に3Dで描く種別か（曲面など。チェックに関わらず3D）。"""
+    return CHART_INFO.get(chart_type, {}).get("dim3") == "always"
+
+
+def migrate_chart_type(name):
+    """旧『3D…』種別名を (新種別名, 3Dフラグ) に変換する。
+
+    旧名なら (2D種別名, True)。それ以外は (そのまま, None＝3Dフラグは触らない)。"""
+    if name in _OLD_3D_ALIASES:
+        return _OLD_3D_ALIASES[name], True
+    return name, None
 
 
 LINESTYLES = {"実線": "-", "破線": "--", "一点鎖線": "-.", "点線": ":", "なし": "None"}
@@ -170,6 +178,7 @@ def plot_series(
     yinvert=False,
     zlabel="",
     view_init=None,
+    threed=False,
 ):
     """ax に系列群を描画する。
 
@@ -213,7 +222,9 @@ def plot_series(
             scaled.append(sr)
         series = scaled
 
-    is3d = chart_type in _3D_TYPES
+    # 3Dで描くかは呼び出し側の明示フラグで決める（表示名では判断しない）。
+    # 曲面など『常に3D』の種別はフラグが無くても3Dにする。
+    is3d = bool(threed) or always_3d(chart_type)
 
     ax.clear()
     _remove_twin(ax)               # 前回の第2軸を掃除

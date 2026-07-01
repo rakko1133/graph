@@ -32,6 +32,7 @@ class PersistenceMixin:
             "x_leftmost": self.xleft_check.isChecked(),
             "selected_y": [[fl, col] for fl, col, _ in self._selected_series_items()],
             "chart_type": self.chart_combo.currentText(),
+            "threed": self.threed_check.isChecked() if hasattr(self, "threed_check") else False,
             "view_elev": self.elev_spin.value() if hasattr(self, "elev_spin") else 30,
             "view_azim": self.azim_spin.value() if hasattr(self, "azim_spin") else -60,
             "title": self.title_edit.text(),
@@ -112,7 +113,14 @@ class PersistenceMixin:
                              else QtCore.Qt.CheckState.Unchecked)
         self.y_list.blockSignals(False)
         self.series_styles.update(cfg.get("styles", {}) or {})
-        self.chart_combo.setCurrentText(cfg.get("chart_type", "折れ線"))
+        # 旧『3D…』種別名は 2D名＋3Dフラグへ移行してから復元する
+        ct, mig3d = plotter.migrate_chart_type(cfg.get("chart_type", "折れ線"))
+        self.chart_combo.setCurrentText(ct)   # ここで _sync_3d_checkbox が走る
+        if hasattr(self, "threed_check"):
+            if "threed" in cfg:
+                self.threed_check.setChecked(bool(cfg["threed"]))
+            elif mig3d is not None:
+                self.threed_check.setChecked(mig3d)
         self.title_edit.setText(cfg.get("title", ""))
         self.xlabel_edit.setText(cfg.get("xlabel", "")); self.ylabel_edit.setText(cfg.get("ylabel", ""))
         f = cfg.get("fonts", {})
@@ -218,7 +226,7 @@ class PersistenceMixin:
 
     # ------------------------------------------------------------ 書式プリセット
     # 「データ/ファイル選択」に依存しない“見た目”だけを名前付きで保存・呼び出す。
-    _PRESET_KEYS = ("chart_type", "fonts", "grid", "legend", "legend_loc",
+    _PRESET_KEYS = ("chart_type", "threed", "fonts", "grid", "legend", "legend_loc",
                     "show_filename", "show_ext", "frame_width", "grid_width",
                     "xlog", "ylog", "xinvert", "yinvert", "bins", "pct", "data_labels",
                     "trend", "trend_degree", "trend_window", "trend_eq", "trend_color",
@@ -293,7 +301,13 @@ class PersistenceMixin:
         self._suspend_redraw = True
         try:
             if "chart_type" in d:
-                self.chart_combo.setCurrentText(d["chart_type"])
+                ct, mig3d = plotter.migrate_chart_type(d["chart_type"])
+                self.chart_combo.setCurrentText(ct)   # _sync_3d_checkbox が走る
+                if hasattr(self, "threed_check"):
+                    if "threed" in d:
+                        self.threed_check.setChecked(bool(d["threed"]))
+                    elif mig3d is not None:
+                        self.threed_check.setChecked(mig3d)
             f = d.get("fonts") or {}
             if f:
                 self.fs_title.setValue(f.get("title", 12)); self.fs_label.setValue(f.get("label", 10))

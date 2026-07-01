@@ -586,13 +586,14 @@ def _data_labels_3d(ax, x, y, z, color, fs):
 def _draw_3d(ax, series, chart_type, fonts=None, data_labels=False, zlabel=""):
     """3D 描画。各系列は x（X列）・y（Y列）・z（Z列）を持つ。
 
-    3D散布図 / 3D折れ線: 選んだ各Y列を1系列として (x,y,z) を描く。
-    3D曲面: 先頭系列の散らばった (x,y,z) を三角形分割して曲面にする。
-    3D棒:   各系列の (x,y) を底面位置、z を高さとして立てる。
+    散布図 / 折れ線: 選んだ各Y列を1系列として (x,y,z) を描く。
+    曲面: 先頭系列の散らばった (x,y,z) を三角形分割して曲面にする。
+    棒:   各系列の (x,y) を底面位置、z を高さとして立てる。
+    （種別名は2Dと共通。3Dで描くかは呼び出し側が threed で指定する）
     """
     fonts = fonts or {}
     fs = fonts.get("tick", 9)
-    if chart_type == "3D曲面":
+    if chart_type == "曲面":
         x, y, z = _xyz_finite(series[0])
         if len(x) < 3:
             raise ValueError("3D曲面には有効な (X, Y, Z) が3点以上必要です。")
@@ -613,15 +614,15 @@ def _draw_3d(ax, series, chart_type, fonts=None, data_labels=False, zlabel=""):
         if len(x) == 0:
             continue
         st = style_for(sr)
-        if chart_type == "3D散布図":
+        if chart_type == "散布図":
             ax.scatter(x, y, z, label=sr["label"], color=st["color"],
                        s=st["markersize"] ** 2, marker=st["marker"] or "o",
                        alpha=st["alpha"])
-        elif chart_type == "3D折れ線":
+        elif chart_type == "折れ線":
             ax.plot(x, y, z, label=sr["label"], color=st["color"],
                     linestyle=st["linestyle"], linewidth=st["linewidth"],
                     marker=st["marker"], markersize=st["markersize"], alpha=st["alpha"])
-        elif chart_type == "3D棒":
+        elif chart_type == "棒":
             dx = _bar3d_size(x); dy = _bar3d_size(y)
             ax.bar3d(x - dx / 2, y - dy / 2, np.zeros(len(z)), dx, dy, z,
                      color=st["color"], alpha=min(st["alpha"], 0.85), shade=True,

@@ -303,6 +303,15 @@ class UIBuildMixin:
         self.hint_label.setStyleSheet("color:#0a7a55;")
         v.addWidget(self.hint_label)
 
+        # 3D 表示の指定（表示名ではなく、このチェックで2D/3Dを切り替える）
+        self.threed_check = QtWidgets.QCheckBox("3D表示（Z軸を使う・ドラッグで回転）")
+        self.threed_check.setToolTip(
+            "散布図・折れ線・棒でONにするとZ軸を使った3D描画になります。\n"
+            "曲面は常に3Dです。3D対応でない種別では選べません。")
+        self.threed_check.setEnabled(False)
+        self.threed_check.toggled.connect(self._on_3d_toggled)
+        v.addWidget(self.threed_check)
+
         # 3D の視点角度（マウスドラッグでも回転可。ここで数値指定もできる）
         view = QtWidgets.QHBoxLayout()
         view.addWidget(QtWidgets.QLabel("3D視点 仰角"))

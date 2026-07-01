@@ -72,7 +72,7 @@ class BatchMixin:
         return re.sub(r'[\\/:*?"<>|]+', "_", str(name)).strip() or "graph"
 
     def _build_series_for_file(self, label, x_name, y_names, chart_type, style_by_col,
-                               z_name=""):
+                               z_name="", threed=False):
         """1ファイルから、指定した列名テンプレートで系列を作る（一括出力用）。
         『一番左の列をX軸』ONなら、各ファイルの先頭列を位置でX軸に使う。"""
         df = self.datasets[label]
@@ -80,17 +80,17 @@ class BatchMixin:
         leftmost = self._use_leftmost_x()
         xv = (df.iloc[:, 0].to_numpy() if leftmost
               else (df[x_name].to_numpy() if x_name in df.columns else df.iloc[:, 0].to_numpy()))
-        if chart_type in ("棒", "横棒", "積み上げ棒", "円", "ドーナツ"):
-            categories = xv
-            for c in y_names:
-                series.append({"label": c, "y": df[c].to_numpy(),
-                               "style": style_by_col.get(c)})
-        elif plotter.is_3d_type(chart_type):
+        if threed:
             zv = (df[z_name].to_numpy() if z_name in df.columns else df.iloc[:, -1].to_numpy())
             for c in y_names:
                 st = style_by_col.get(c) or {}
                 series.append({"label": c, "x": xv, "y": df[c].to_numpy(), "z": zv,
                                "style": st, "kind": st.get("kind", "")})
+        elif chart_type in ("棒", "横棒", "積み上げ棒", "円", "ドーナツ"):
+            categories = xv
+            for c in y_names:
+                series.append({"label": c, "y": df[c].to_numpy(),
+                               "style": style_by_col.get(c)})
         elif chart_type in ("折れ線", "散布図", "面", "積み上げ面",
                             "ステップ", "ステム", "2Dヒストグラム", "hexbin"):
             for c in y_names:
@@ -160,7 +160,7 @@ class BatchMixin:
             return
         x_name = self.x_combo.currentText()
         z_name = self.z_combo.currentText() if hasattr(self, "z_combo") else ""
-        is3d = plotter.is_3d_type(ctype)
+        is3d = self._want_3d()
         view_init = self._view_angles() if is3d else None
         zlabel = z_name if is3d else ""
         opts = self._batch_options_dialog()   # タイトル・形式・DPI・透過を調整
@@ -200,7 +200,7 @@ class BatchMixin:
                 continue
             try:
                 series, categories = self._build_series_for_file(
-                    label, x_name, cols, ctype, style_by_col, z_name=z_name)
+                    label, x_name, cols, ctype, style_by_col, z_name=z_name, threed=is3d)
             except Exception as e:  # noqa: BLE001
                 skipped.append(f"{label}（{e}）")
                 continue
@@ -220,7 +220,7 @@ class BatchMixin:
                 "xlabel": xlab, "ylabel": auto_ylabel,
                 "xlim": xlim, "ylim": ylim, "sec_label": sec_label,
                 "max_points": max_points, "fmt": fmt, "ratio": None,
-                "zlabel": zlabel, "view_init": view_init,
+                "zlabel": zlabel, "view_init": view_init, "threed": is3d,
                 "figsize": tuple(figsize), "tight": tight,
                 "dpi": dpi, "transparent": transparent,
                 "path": os.path.join(out_dir, f"{name}.{ext}"),

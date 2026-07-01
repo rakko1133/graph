@@ -21,17 +21,42 @@ class PlotMixin:
         ctype = self.chart_combo.currentText()
         info = plotter.CHART_INFO.get(ctype, {})
         self.hint_label.setText("➤ " + info.get("hint", ""))
+        self._sync_3d_checkbox(info)     # 『3D表示』チェックの有効/固定を種別に合わせる
         self._update_x_combo_enabled()
-        self._update_z_combo_enabled()   # Z軸コンボは3D種別のみ有効
+        self._update_z_combo_enabled()   # Z軸コンボは3D表示中のみ有効
         uses_bins = ctype in ("ヒストグラム", "2Dヒストグラム", "hexbin")
         self.bins_spin.setEnabled(uses_bins)
         self.bins_caption.setEnabled(uses_bins)
         self.pct_check.setEnabled(ctype in ("円", "ドーナツ"))
-        is3d = plotter.is_3d_type(ctype)
-        if hasattr(self, "elev_spin"):   # 視点角度は3Dのみ操作可
-            self.elev_spin.setEnabled(is3d); self.azim_spin.setEnabled(is3d)
+        want3d = self._want_3d()
+        if hasattr(self, "elev_spin"):   # 視点角度は3D表示中のみ操作可
+            self.elev_spin.setEnabled(want3d); self.azim_spin.setEnabled(want3d)
         if hasattr(self, "series_bar"):
             self._rebuild_series_bar(ctype)   # 折れ線/散布図でのみ上部バーを出す
+
+    def _sync_3d_checkbox(self, info):
+        """『3D表示』チェックの有効状態を種別に合わせる（このメソッドは再描画しない）。
+        optional(散布図/折れ線/棒): 有効・ユーザーのON/OFFを保持／
+        always(曲面): ON固定で無効／非対応: OFF固定で無効。"""
+        if not hasattr(self, "threed_check"):
+            return
+        d3 = info.get("dim3")
+        self.threed_check.blockSignals(True)
+        if d3 == "always":
+            self.threed_check.setChecked(True); self.threed_check.setEnabled(False)
+        elif d3 == "optional":
+            self.threed_check.setEnabled(True)     # 現在のチェック状態を保持
+        else:
+            self.threed_check.setChecked(False); self.threed_check.setEnabled(False)
+        self.threed_check.blockSignals(False)
+
+    def _on_3d_toggled(self, *_):
+        """『3D表示』チェックの切替: Z軸・視点角度の有効状態を更新して再描画する。"""
+        want3d = self._want_3d()
+        self._update_z_combo_enabled()
+        if hasattr(self, "elev_spin"):
+            self.elev_spin.setEnabled(want3d); self.azim_spin.setEnabled(want3d)
+        self._request_redraw()
 
     def _build_series(self, chart_type):
         info = plotter.CHART_INFO[chart_type]
@@ -46,7 +71,17 @@ class PlotMixin:
             st = self.series_styles.get(self._style_key(fl, col)) or {}
             return st.get("label") or default
 
-        if chart_type in ("棒", "横棒", "積み上げ棒", "円", "ドーナツ"):
+        if self._want_3d():
+            # 3D表示中: 種別（散布図/折れ線/棒/曲面）に関わらず (x, y, z) 系列を作る。
+            # X（x_combo）と Z（z_combo）は共有座標。チェックした各Y列を1系列にする。
+            for fl, col, disp in items:
+                df = self.datasets[fl]
+                stmap = self.series_styles.get(self._style_key(fl, col)) or {}
+                series.append({"label": self._series_label(fl, col),
+                               "x": self._x_values(df), "y": df[col].to_numpy(),
+                               "z": self._z_values(df), "style": stmap,
+                               "kind": stmap.get("kind", "")})
+        elif chart_type in ("棒", "横棒", "積み上げ棒", "円", "ドーナツ"):
             # 単一ファイル（最初に選んだ系列のファイル）を使う
             src = items[0][0]
             df = self.datasets[src]
@@ -58,16 +93,6 @@ class PlotMixin:
                     continue
                 series.append({"label": lbl(fl, col, disp, col), "y": self.datasets[fl][col].to_numpy(),
                                "style": self.series_styles.get(self._style_key(fl, col))})
-        elif plotter.is_3d_type(chart_type):
-            # X（x_combo）と Z（z_combo）は共有座標。チェックした各Y列を
-            # それぞれ (x, y, z) の3D系列にする（多Y選択の直感を保つ）。
-            for fl, col, disp in items:
-                df = self.datasets[fl]
-                stmap = self.series_styles.get(self._style_key(fl, col)) or {}
-                series.append({"label": self._series_label(fl, col),
-                               "x": self._x_values(df), "y": df[col].to_numpy(),
-                               "z": self._z_values(df), "style": stmap,
-                               "kind": stmap.get("kind", "")})
         elif chart_type in ("折れ線", "散布図", "面", "積み上げ面",
                             "ステップ", "ステム", "2Dヒストグラム", "hexbin"):
             for fl, col, disp in items:
@@ -258,7 +283,7 @@ class PlotMixin:
                 issues.append("time/div・V/div は正の値が必要（オシロ表示を無効化）")
                 scope = dict(scope, enabled=False)
 
-        self._ensure_axes_projection(plotter.is_3d_type(ctype))  # 3D⇔2D 軸を用意
+        self._ensure_axes_projection(self._want_3d())  # 3D⇔2D 軸を用意
         self._clear_dynamic_resample()
         self._reset_figure_axes()   # スペクトログラム等のカラーバー軸を除去
         self._cursor_pts = []; self._cursor_artists = []  # 再描画で軸がクリアされる
@@ -292,8 +317,9 @@ class PlotMixin:
                     xlim=xlim, ylim=ylim,
                     scope=scope, markers=markers, max_points=max_points,
                     secondary_label=sec_label,
-                    zlabel=(self.z_combo.currentText() if plotter.is_3d_type(ctype) else ""),
-                    view_init=(self._view_angles() if plotter.is_3d_type(ctype) else None),
+                    zlabel=(self.z_combo.currentText() if self._want_3d() else ""),
+                    view_init=(self._view_angles() if self._want_3d() else None),
+                    threed=self._want_3d(),
                     **self._plot_format_kwargs(),
                 )
                 self._apply_aspect()   # 縦横比の固定（自動なら解除）
@@ -450,8 +476,22 @@ class PlotMixin:
         # 系列選択バーの表示/非表示は _rebuild_series_bar が管理する（ここでは触らない）
 
     def _is_3d(self):
-        """現在のメイン軸が 3D（projection='3d'）かどうか。"""
+        """現在のメイン軸が 3D（projection='3d'）かどうか（軸の実状態）。"""
         return getattr(getattr(self, "ax", None), "name", None) == "3d"
+
+    def _want_3d(self):
+        """いま3Dで描くべきか（GUIの明示指定）。表示名の文字列一致では判断しない。
+
+        『常に3D』の種別（曲面）は常に True、『3D対応』の種別（散布図/折れ線/棒）は
+        『3D表示』チェックの状態、それ以外は False。"""
+        info = plotter.CHART_INFO.get(self.chart_combo.currentText(), {})
+        d3 = info.get("dim3")
+        if d3 == "always":
+            return True
+        if d3 == "optional":
+            return bool(getattr(self, "threed_check", None)
+                        and self.threed_check.isChecked())
+        return False
 
     def _ensure_axes_projection(self, want_3d):
         """メイン軸を 2D↔3D で必要なときだけ差し替える。

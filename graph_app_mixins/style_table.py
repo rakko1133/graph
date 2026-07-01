@@ -18,11 +18,10 @@ class StyleTableMixin:
         self.x_combo.setEnabled(info.get("use_x", True) and not self._use_leftmost_x())
 
     def _update_z_combo_enabled(self):
-        """Z名コンボ（3Dの奥行き軸）の有効状態を種別から決める。3D種別のみ有効。"""
+        """Z名コンボ（3Dの奥行き軸）の有効状態を決める。3D表示中のみ有効。"""
         if not hasattr(self, "z_combo"):
             return
-        info = plotter.CHART_INFO.get(self.chart_combo.currentText(), {})
-        self.z_combo.setEnabled(bool(info.get("use_z", False)))
+        self.z_combo.setEnabled(self._want_3d())
 
     def _use_leftmost_x(self):
         return bool(getattr(self, "xleft_check", None) and self.xleft_check.isChecked())
