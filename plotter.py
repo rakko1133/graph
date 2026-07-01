@@ -125,18 +125,27 @@ def plot_series(
         raise ValueError("Y軸（値）の系列を選択してください。")
     fonts = fonts or {}
 
-    # --- 単位換算: 軸の数値を倍率でスケール（X=全系列の共有軸、Y=主軸の系列のみ）。
-    #     系列dictは描画ごとに作り直されるが、念のためコピーしてから掛ける。
-    if xscale != 1.0 or yscale != 1.0:
+    # --- 単位換算: 軸の数値を変換（数値=倍率／x を使った式も可。X=全系列、Y=主軸のみ）。
+    #     系列dictは描画ごとに作り直されるが、念のためコピーしてから変換する。
+    from mathchan import axis_scale
+
+    def _needs(spec):
+        return not (spec is None or spec == 1.0
+                    or (isinstance(spec, str) and spec.strip() in ("", "1")))
+
+    if _needs(xscale) or _needs(yscale):
         scaled = []
         for sr in series:
             sr = dict(sr)
-            if xscale != 1.0 and sr.get("x") is not None:
-                sr["x"] = np.asarray(sr["x"], dtype=float) * xscale
-            if yscale != 1.0 and sr.get("axis") != "secondary" and sr.get("y") is not None:
-                sr["y"] = np.asarray(sr["y"], dtype=float) * yscale
+            if _needs(xscale) and sr.get("x") is not None:
+                sr["x"] = axis_scale(sr["x"], xscale)
+            if _needs(yscale) and sr.get("axis") != "secondary" and sr.get("y") is not None:
+                sr["y"] = axis_scale(sr["y"], yscale)
                 if sr.get("yerr") is not None:
-                    sr["yerr"] = np.asarray(sr["yerr"], dtype=float) * yscale
+                    try:                                  # 誤差は数値倍率のときだけスケール
+                        sr["yerr"] = np.asarray(sr["yerr"], dtype=float) * float(str(yscale))
+                    except (ValueError, TypeError):
+                        pass
             scaled.append(sr)
         series = scaled
 

@@ -180,8 +180,8 @@ class PlotMixin:
                        "show_eq": self.trend_eq.isChecked(),
                        "color": getattr(self, "trend_color", "") or ""},
             data_labels=self.data_labels_check.isChecked(),
-            xscale=_parse_float(self.xscale_edit.text(), 1.0) or 1.0,
-            yscale=_parse_float(self.yscale_edit.text(), 1.0) or 1.0,
+            xscale=self.xscale_edit.text(),   # 数値=倍率／x を使った式も可
+            yscale=self.yscale_edit.text(),
             xunit=self.xunit_edit.text().strip(),
             yunit=self.yunit_edit.text().strip(),
             bg_color=getattr(self, "bg_color", "") or "",
@@ -343,14 +343,14 @@ class PlotMixin:
         a = dispmap.get(self.fill_a.currentText())
         if a is None or a.get("x") is None:
             return
-        xs = _parse_float(self.xscale_edit.text(), 1.0) or 1.0
-        ys = _parse_float(self.yscale_edit.text(), 1.0) or 1.0
+        xspec = self.xscale_edit.text()
+        yspec = self.yscale_edit.text()
 
         def sxy(s):
-            x = pd.to_numeric(pd.Series(s["x"]), errors="coerce").to_numpy(float) * xs
+            x = mathchan.axis_scale(pd.to_numeric(pd.Series(s["x"]), errors="coerce").to_numpy(float), xspec)
             y = pd.to_numeric(pd.Series(s["y"]), errors="coerce").to_numpy(float)
             if s.get("axis") != "secondary":
-                y = y * ys
+                y = mathchan.axis_scale(y, yspec)
             return x, y
 
         xa, ya = sxy(a)
@@ -423,10 +423,10 @@ class PlotMixin:
             return
         import numpy as np
         import pandas as pd
-        # 描画線は単位換算後（x×xscale, 主軸yは×yscale）の座標を持つ。再サンプル元データにも
-        # 同じ倍率を掛けておかないと、ズーム時に未換算座標へ戻り曲線が誤った位置/大きさに飛ぶ。
-        xscale = _parse_float(self.xscale_edit.text(), 1.0) or 1.0
-        yscale = _parse_float(self.yscale_edit.text(), 1.0) or 1.0
+        # 描画線は単位換算後の座標を持つ。再サンプル元データにも同じ変換を掛けておかないと、
+        # ズーム時に未換算座標へ戻り曲線が誤った位置/大きさに飛ぶ。
+        xspec = self.xscale_edit.text()
+        yspec = self.yscale_edit.text()
         lines = self.ax.get_lines()
         for i, s in enumerate(series):
             if i >= len(lines) or s.get("x") is None:
@@ -435,10 +435,9 @@ class PlotMixin:
             if np.isfinite(fx).mean() < 0.8:    # 数値Xのみ対象
                 continue
             fy = pd.to_numeric(pd.Series(s["y"]), errors="coerce").to_numpy(dtype=float)
-            if xscale != 1.0:
-                fx = fx * xscale
-            if yscale != 1.0 and s.get("axis") != "secondary":   # Y換算は主軸のみ（描画と同じ）
-                fy = fy * yscale
+            fx = mathchan.axis_scale(fx, xspec)
+            if s.get("axis") != "secondary":    # Y換算は主軸のみ（描画と同じ）
+                fy = mathchan.axis_scale(fy, yspec)
             order = np.argsort(fx)
             self._dyn.append((lines[i], fx[order], fy[order], max_points))
         if self._dyn:

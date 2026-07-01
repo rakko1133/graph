@@ -29,7 +29,6 @@ class AdvancedMixin:
         self.math_param.setEnabled(needs_param); self.math_param_label.setEnabled(needs_param)
 
     def create_math_channel(self):
-        import numpy as np
         op = self.math_op.currentText()
         ta, ya = self._xy_by_disp(self.math_a.currentText())
         if ta is None:

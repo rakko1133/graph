@@ -216,37 +216,63 @@ class BatchMixin:
 
         import batch_render
         saved = []
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        total = len(tasks)
+        # 進捗ダイアログ（キャンセル可）。何が今出力中かが見える。
+        prog = QtWidgets.QProgressDialog("画像を出力中…", "キャンセル", 0, total, self)
+        prog.setWindowTitle("一括画像出力")
+        prog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+        canceled = False
         try:
             # ファイル数が多いときだけ別プロセス並列（spawn/ピクル/フォント設定の
             # 固定費があるので少数では逆効果）。失敗時は必ず逐次へフォールバックする。
-            use_pool = len(tasks) >= BATCH_PARALLEL_THRESHOLD
+            use_pool = total >= BATCH_PARALLEL_THRESHOLD
             if use_pool:
                 try:
                     import concurrent.futures as _cf
                     workers = min(8, (os.cpu_count() or 1))
                     with _cf.ProcessPoolExecutor(max_workers=workers) as ex:
                         futs = {ex.submit(batch_render.render_one, t): t for t in tasks}
+                        done = 0
                         for fut in _cf.as_completed(futs):
+                            if prog.wasCanceled():
+                                canceled = True
+                                for f in futs:
+                                    f.cancel()
+                                break
                             try:
                                 saved.append(fut.result())
                             except Exception as e:  # noqa: BLE001
                                 skipped.append(
                                     f"{os.path.basename(futs[fut]['path'])}（{e}）")
+                            done += 1
+                            prog.setLabelText(f"出力中… {done}/{total}")
+                            prog.setValue(done)
                             QtWidgets.QApplication.processEvents()
                 except Exception as e:  # noqa: BLE001  プール作成失敗/壊れ→逐次へ
                     self._set_status(f"並列出力に失敗、逐次に切替: {e}")
                     use_pool = False
                     saved = []        # 部分結果は破棄し、逐次で全件作り直す
             if not use_pool:
-                saved, seq_skipped = batch_render.render_sequential(tasks)
-                skipped.extend(seq_skipped)
-                QtWidgets.QApplication.processEvents()
+                for idx, t in enumerate(tasks, 1):
+                    if prog.wasCanceled():
+                        canceled = True
+                        break
+                    prog.setLabelText(f"出力中… {idx}/{total}: {os.path.basename(t['path'])}")
+                    QtWidgets.QApplication.processEvents()
+                    try:
+                        saved.append(batch_render.render_one(t))
+                    except Exception as e:  # noqa: BLE001
+                        skipped.append(f"{os.path.basename(t['path'])}（{e}）")
+                    prog.setValue(idx)
         finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
+            prog.close()
 
         self.last_dir = out_dir
         msg = f"一括出力: {len(saved)} 件を保存しました。\n{out_dir}"
+        if canceled:
+            msg += "\n（途中でキャンセルしました）"
         if skipped:
             head = " / ".join(str(s) for s in skipped[:5])
             msg += f"\n\nスキップ {len(skipped)} 件: {head}" + (" ほか" if len(skipped) > 5 else "")

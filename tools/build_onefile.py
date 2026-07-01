@@ -70,12 +70,15 @@ def build():
             if stripped.startswith("# -*- coding"):
                 i += 1
                 continue
-            if (not indented) and re.match(r"^(import|from)\s", stripped):
-                if is_internal_import(stripped):
-                    if line.count("(") > line.count(")"):
-                        paren_skip = True
-                    i += 1
-                    continue                               # 内部import → 除去
+            is_import = bool(re.match(r"^(import|from)\s", stripped))
+            if is_import and is_internal_import(stripped):
+                # 内部モジュールの import はインデントの有無に関わらず除去
+                # （結合後は同一名前空間なので不要。関数内の import jp_font 等も剪定）
+                if line.count("(") > line.count(")"):
+                    paren_skip = True
+                i += 1
+                continue
+            if is_import and (not indented):
                 buf = [line]                               # 外部import（複数行括弧も結合）
                 while (sum(b.count("(") for b in buf) - sum(b.count(")") for b in buf)) > 0 and i + 1 < len(lines):
                     i += 1

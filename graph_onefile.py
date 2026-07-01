@@ -1082,18 +1082,26 @@ def plot_series(
         raise ValueError("Y軸（値）の系列を選択してください。")
     fonts = fonts or {}
 
-    # --- 単位換算: 軸の数値を倍率でスケール（X=全系列の共有軸、Y=主軸の系列のみ）。
-    #     系列dictは描画ごとに作り直されるが、念のためコピーしてから掛ける。
-    if xscale != 1.0 or yscale != 1.0:
+    # --- 単位換算: 軸の数値を変換（数値=倍率／x を使った式も可。X=全系列、Y=主軸のみ）。
+    #     系列dictは描画ごとに作り直されるが、念のためコピーしてから変換する。
+
+    def _needs(spec):
+        return not (spec is None or spec == 1.0
+                    or (isinstance(spec, str) and spec.strip() in ("", "1")))
+
+    if _needs(xscale) or _needs(yscale):
         scaled = []
         for sr in series:
             sr = dict(sr)
-            if xscale != 1.0 and sr.get("x") is not None:
-                sr["x"] = np.asarray(sr["x"], dtype=float) * xscale
-            if yscale != 1.0 and sr.get("axis") != "secondary" and sr.get("y") is not None:
-                sr["y"] = np.asarray(sr["y"], dtype=float) * yscale
+            if _needs(xscale) and sr.get("x") is not None:
+                sr["x"] = axis_scale(sr["x"], xscale)
+            if _needs(yscale) and sr.get("axis") != "secondary" and sr.get("y") is not None:
+                sr["y"] = axis_scale(sr["y"], yscale)
                 if sr.get("yerr") is not None:
-                    sr["yerr"] = np.asarray(sr["yerr"], dtype=float) * yscale
+                    try:                                  # 誤差は数値倍率のときだけスケール
+                        sr["yerr"] = np.asarray(sr["yerr"], dtype=float) * float(str(yscale))
+                    except (ValueError, TypeError):
+                        pass
             scaled.append(sr)
         series = scaled
 
@@ -2428,6 +2436,43 @@ def eval_expr(expr, variables):
         raise ValueError("この式は評価できません")
 
     return ev(node)
+
+
+def axis_scale(x, spec):
+    """軸の値を変換する。spec が数値なら倍率、x を使った式なら eval_expr で変換。
+
+    例: "1000"（×1000）、"x*9/5+32"（℃→℉）、"20*log10(x)"（dB）。
+    空/"1"/1.0 は無変換。評価できない式はそのまま返す。
+    """
+    x = np.asarray(x, dtype=float)
+    if spec is None:
+        return x
+    if isinstance(spec, (int, float)):
+        return x if spec == 1 else x * float(spec)
+    s = str(spec).strip()
+    if s in ("", "1"):
+        return x
+    try:
+        return x * float(s)          # 数値 → 倍率
+    except ValueError:
+        pass
+    m = _ast_re().fullmatch(s)       # 10^-6 のような累乗定数（^ は累乗）→ 倍率
+    if m:
+        try:
+            return x * (float(m.group(1)) ** float(m.group(2)))
+        except (ValueError, OverflowError, ZeroDivisionError):
+            return x
+    try:
+        return np.asarray(eval_expr(s, {"x": x}), dtype=float)   # 'x' を含む式
+    except Exception:                # noqa: BLE001  不正な式は無変換で返す
+        return x
+
+
+def _ast_re():
+    import re
+    return re.compile(r"([+-]?[\d.]+)\s*\^\s*([+-]?[\d.]+)")
+
+
 UNARY_OPS = ["積分 ∫A dt", "微分 dA/dt", "絶対値 |A|", "二乗 A²",
              "移動平均", "ローパス(RC)", "ローパス(Butterworth)",
              "ハイパス(Butterworth)", "包絡線(Hilbert)", "自己相関"]
@@ -2752,7 +2797,6 @@ def _ensure_font(font_name):
     global _FONT_DONE
     if not _FONT_DONE:
         try:
-            import jp_font
             setup_japanese_font(font_name)
         except Exception:        # noqa: BLE001  フォント未検出でも既定で続行
             pass
@@ -3011,7 +3055,7 @@ class UIBuildMixin:
         tabs.addTab(self._build_tab_data(), "1. データ")
         tabs.addTab(self._build_tab_scope(), "2. オシロ/解析")
         tabs.addTab(self._build_tab_advanced(), "3. 高度解析")
-        tabs.addTab(self._build_tab_datasci(), "4. データサイエンス")
+        tabs.addTab(self._build_tab_datasci(), "4. 統計解析")
         splitter.addWidget(tabs)
 
         # 中央：グラフ表示＋データ編集
@@ -3260,24 +3304,26 @@ class UIBuildMixin:
         self.fs_legend = QtWidgets.QSpinBox(); self.fs_legend.setRange(6, 40); self.fs_legend.setValue(9)
         self.fs_legend.setToolTip("凡例の文字サイズ")
         self.fs_annot = QtWidgets.QSpinBox(); self.fs_annot.setRange(6, 40); self.fs_annot.setValue(9)
-        self.fs_annot.setToolTip("グラフ上に表示する注記（データサイエンス・測定値のチェック表示）の文字サイズ")
+        self.fs_annot.setToolTip("グラフ上に表示する注記（統計解析・測定値のチェック表示）の文字サイズ")
         form.addWidget(self.fs_legend, 5, 1); form.addWidget(self.fs_annot, 5, 2)
         # 軸の単位と倍率（単位を変える＝数値も換算）。倍率1・単位空なら無効。
         form.addWidget(QtWidgets.QLabel("X単位"), 3, 0)
         self.xunit_edit = QtWidgets.QLineEdit(); self.xunit_edit.setPlaceholderText("例: ms")
         self.xunit_edit.setToolTip("X軸ラベルに付ける単位。右の倍率で軸の数値も換算されます。")
         form.addWidget(self.xunit_edit, 3, 1)
-        form.addWidget(QtWidgets.QLabel("X倍率"), 3, 2)
+        form.addWidget(QtWidgets.QLabel("X倍率/式"), 3, 2)
         self.xscale_edit = QtWidgets.QLineEdit("1")
-        self.xscale_edit.setToolTip("X軸の数値に掛ける倍率。例: 秒→ミリ秒は 1000。")
+        self.xscale_edit.setToolTip("X軸の数値変換。数値なら倍率（例: 1000）。\n"
+                                    "x を使った式も可: x*9/5+32（℃→℉）, 20*log10(x), (x-273.15) など。")
         form.addWidget(self.xscale_edit, 3, 3)
         form.addWidget(QtWidgets.QLabel("Y単位"), 4, 0)
         self.yunit_edit = QtWidgets.QLineEdit(); self.yunit_edit.setPlaceholderText("例: mV")
         self.yunit_edit.setToolTip("Y軸ラベルに付ける単位。右の倍率で軸の数値も換算されます（主軸）。")
         form.addWidget(self.yunit_edit, 4, 1)
-        form.addWidget(QtWidgets.QLabel("Y倍率"), 4, 2)
+        form.addWidget(QtWidgets.QLabel("Y倍率/式"), 4, 2)
         self.yscale_edit = QtWidgets.QLineEdit("1")
-        self.yscale_edit.setToolTip("Y軸の数値に掛ける倍率。例: V→mV は 1000。")
+        self.yscale_edit.setToolTip("Y軸の数値変換（主軸）。数値なら倍率（例: 1000）。\n"
+                                    "y の代わりに x を使った式も可: 20*log10(x), x**2, abs(x) など。")
         form.addWidget(self.yscale_edit, 4, 3)
         v.addLayout(form)
 
@@ -3688,7 +3734,7 @@ class UIBuildMixin:
         w = QtWidgets.QWidget(); outer.setWidget(w)
         v = QtWidgets.QVBoxLayout(w)
 
-        v.addWidget(self._bold("データサイエンス（回帰・統計・相関）"))
+        v.addWidget(self._bold("統計解析（回帰・記述統計・相関・正規性）"))
         info = QtWidgets.QLabel("選択中のY系列を、現在のX軸列に対して解析します。"
                                 "データタブでX軸とY系列を選んでから実行してください。")
         info.setWordWrap(True); info.setStyleSheet("color:#555;")
@@ -4962,8 +5008,8 @@ class PlotMixin:
                        "show_eq": self.trend_eq.isChecked(),
                        "color": getattr(self, "trend_color", "") or ""},
             data_labels=self.data_labels_check.isChecked(),
-            xscale=_parse_float(self.xscale_edit.text(), 1.0) or 1.0,
-            yscale=_parse_float(self.yscale_edit.text(), 1.0) or 1.0,
+            xscale=self.xscale_edit.text(),   # 数値=倍率／x を使った式も可
+            yscale=self.yscale_edit.text(),
             xunit=self.xunit_edit.text().strip(),
             yunit=self.yunit_edit.text().strip(),
             bg_color=getattr(self, "bg_color", "") or "",
@@ -5125,14 +5171,14 @@ class PlotMixin:
         a = dispmap.get(self.fill_a.currentText())
         if a is None or a.get("x") is None:
             return
-        xs = _parse_float(self.xscale_edit.text(), 1.0) or 1.0
-        ys = _parse_float(self.yscale_edit.text(), 1.0) or 1.0
+        xspec = self.xscale_edit.text()
+        yspec = self.yscale_edit.text()
 
         def sxy(s):
-            x = pd.to_numeric(pd.Series(s["x"]), errors="coerce").to_numpy(float) * xs
+            x = axis_scale(pd.to_numeric(pd.Series(s["x"]), errors="coerce").to_numpy(float), xspec)
             y = pd.to_numeric(pd.Series(s["y"]), errors="coerce").to_numpy(float)
             if s.get("axis") != "secondary":
-                y = y * ys
+                y = axis_scale(y, yspec)
             return x, y
 
         xa, ya = sxy(a)
@@ -5205,10 +5251,10 @@ class PlotMixin:
             return
         import numpy as np
         import pandas as pd
-        # 描画線は単位換算後（x×xscale, 主軸yは×yscale）の座標を持つ。再サンプル元データにも
-        # 同じ倍率を掛けておかないと、ズーム時に未換算座標へ戻り曲線が誤った位置/大きさに飛ぶ。
-        xscale = _parse_float(self.xscale_edit.text(), 1.0) or 1.0
-        yscale = _parse_float(self.yscale_edit.text(), 1.0) or 1.0
+        # 描画線は単位換算後の座標を持つ。再サンプル元データにも同じ変換を掛けておかないと、
+        # ズーム時に未換算座標へ戻り曲線が誤った位置/大きさに飛ぶ。
+        xspec = self.xscale_edit.text()
+        yspec = self.yscale_edit.text()
         lines = self.ax.get_lines()
         for i, s in enumerate(series):
             if i >= len(lines) or s.get("x") is None:
@@ -5217,10 +5263,9 @@ class PlotMixin:
             if np.isfinite(fx).mean() < 0.8:    # 数値Xのみ対象
                 continue
             fy = pd.to_numeric(pd.Series(s["y"]), errors="coerce").to_numpy(dtype=float)
-            if xscale != 1.0:
-                fx = fx * xscale
-            if yscale != 1.0 and s.get("axis") != "secondary":   # Y換算は主軸のみ（描画と同じ）
-                fy = fy * yscale
+            fx = axis_scale(fx, xspec)
+            if s.get("axis") != "secondary":    # Y換算は主軸のみ（描画と同じ）
+                fy = axis_scale(fy, yspec)
             order = np.argsort(fx)
             self._dyn.append((lines[i], fx[order], fy[order], max_points))
         if self._dyn:
@@ -5827,7 +5872,6 @@ class AdvancedMixin:
         self.math_param.setEnabled(needs_param); self.math_param_label.setEnabled(needs_param)
 
     def create_math_channel(self):
-        import numpy as np
         op = self.math_op.currentText()
         ta, ya = self._xy_by_disp(self.math_a.currentText())
         if ta is None:
@@ -6604,39 +6648,64 @@ class BatchMixin:
                 "font_name": getattr(self, "font_name", None),
             })
 
-        import batch_render
         saved = []
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        total = len(tasks)
+        # 進捗ダイアログ（キャンセル可）。何が今出力中かが見える。
+        prog = QtWidgets.QProgressDialog("画像を出力中…", "キャンセル", 0, total, self)
+        prog.setWindowTitle("一括画像出力")
+        prog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+        canceled = False
         try:
             # ファイル数が多いときだけ別プロセス並列（spawn/ピクル/フォント設定の
             # 固定費があるので少数では逆効果）。失敗時は必ず逐次へフォールバックする。
-            use_pool = len(tasks) >= BATCH_PARALLEL_THRESHOLD
+            use_pool = total >= BATCH_PARALLEL_THRESHOLD
             if use_pool:
                 try:
                     import concurrent.futures as _cf
                     workers = min(8, (os.cpu_count() or 1))
                     with _cf.ProcessPoolExecutor(max_workers=workers) as ex:
                         futs = {ex.submit(render_one, t): t for t in tasks}
+                        done = 0
                         for fut in _cf.as_completed(futs):
+                            if prog.wasCanceled():
+                                canceled = True
+                                for f in futs:
+                                    f.cancel()
+                                break
                             try:
                                 saved.append(fut.result())
                             except Exception as e:  # noqa: BLE001
                                 skipped.append(
                                     f"{os.path.basename(futs[fut]['path'])}（{e}）")
+                            done += 1
+                            prog.setLabelText(f"出力中… {done}/{total}")
+                            prog.setValue(done)
                             QtWidgets.QApplication.processEvents()
                 except Exception as e:  # noqa: BLE001  プール作成失敗/壊れ→逐次へ
                     self._set_status(f"並列出力に失敗、逐次に切替: {e}")
                     use_pool = False
                     saved = []        # 部分結果は破棄し、逐次で全件作り直す
             if not use_pool:
-                saved, seq_skipped = render_sequential(tasks)
-                skipped.extend(seq_skipped)
-                QtWidgets.QApplication.processEvents()
+                for idx, t in enumerate(tasks, 1):
+                    if prog.wasCanceled():
+                        canceled = True
+                        break
+                    prog.setLabelText(f"出力中… {idx}/{total}: {os.path.basename(t['path'])}")
+                    QtWidgets.QApplication.processEvents()
+                    try:
+                        saved.append(render_one(t))
+                    except Exception as e:  # noqa: BLE001
+                        skipped.append(f"{os.path.basename(t['path'])}（{e}）")
+                    prog.setValue(idx)
         finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
+            prog.close()
 
         self.last_dir = out_dir
         msg = f"一括出力: {len(saved)} 件を保存しました。\n{out_dir}"
+        if canceled:
+            msg += "\n（途中でキャンセルしました）"
         if skipped:
             head = " / ".join(str(s) for s in skipped[:5])
             msg += f"\n\nスキップ {len(skipped)} 件: {head}" + (" ほか" if len(skipped) > 5 else "")

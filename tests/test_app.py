@@ -83,8 +83,10 @@ def test_axis_invert_and_power_notation():
     w.xinvert_check.setChecked(True); w.draw_graph()
     x0, x1 = w.ax.get_xlim()
     assert w.ax.xaxis_inverted() and x0 > x1
-    w.xscale_edit.setText("10^-6")
-    assert abs(w._plot_format_kwargs()["xscale"] - 1e-6) < 1e-18
+    import mathchan
+    w.xscale_edit.setText("10^-6")   # 倍率欄は式/累乗表記も可
+    assert abs(float(mathchan.axis_scale([1.0], "10^-6")[0]) - 1e-6) < 1e-18
+    assert list(mathchan.axis_scale([0.0, 100.0], "x*9/5+32")) == [32.0, 212.0]
 
 
 def test_config_roundtrip():

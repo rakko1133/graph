@@ -67,7 +67,7 @@ class UIBuildMixin:
         tabs.addTab(self._build_tab_data(), "1. データ")
         tabs.addTab(self._build_tab_scope(), "2. オシロ/解析")
         tabs.addTab(self._build_tab_advanced(), "3. 高度解析")
-        tabs.addTab(self._build_tab_datasci(), "4. データサイエンス")
+        tabs.addTab(self._build_tab_datasci(), "4. 統計解析")
         splitter.addWidget(tabs)
 
         # 中央：グラフ表示＋データ編集
@@ -316,24 +316,26 @@ class UIBuildMixin:
         self.fs_legend = QtWidgets.QSpinBox(); self.fs_legend.setRange(6, 40); self.fs_legend.setValue(9)
         self.fs_legend.setToolTip("凡例の文字サイズ")
         self.fs_annot = QtWidgets.QSpinBox(); self.fs_annot.setRange(6, 40); self.fs_annot.setValue(9)
-        self.fs_annot.setToolTip("グラフ上に表示する注記（データサイエンス・測定値のチェック表示）の文字サイズ")
+        self.fs_annot.setToolTip("グラフ上に表示する注記（統計解析・測定値のチェック表示）の文字サイズ")
         form.addWidget(self.fs_legend, 5, 1); form.addWidget(self.fs_annot, 5, 2)
         # 軸の単位と倍率（単位を変える＝数値も換算）。倍率1・単位空なら無効。
         form.addWidget(QtWidgets.QLabel("X単位"), 3, 0)
         self.xunit_edit = QtWidgets.QLineEdit(); self.xunit_edit.setPlaceholderText("例: ms")
         self.xunit_edit.setToolTip("X軸ラベルに付ける単位。右の倍率で軸の数値も換算されます。")
         form.addWidget(self.xunit_edit, 3, 1)
-        form.addWidget(QtWidgets.QLabel("X倍率"), 3, 2)
+        form.addWidget(QtWidgets.QLabel("X倍率/式"), 3, 2)
         self.xscale_edit = QtWidgets.QLineEdit("1")
-        self.xscale_edit.setToolTip("X軸の数値に掛ける倍率。例: 秒→ミリ秒は 1000。")
+        self.xscale_edit.setToolTip("X軸の数値変換。数値なら倍率（例: 1000）。\n"
+                                    "x を使った式も可: x*9/5+32（℃→℉）, 20*log10(x), (x-273.15) など。")
         form.addWidget(self.xscale_edit, 3, 3)
         form.addWidget(QtWidgets.QLabel("Y単位"), 4, 0)
         self.yunit_edit = QtWidgets.QLineEdit(); self.yunit_edit.setPlaceholderText("例: mV")
         self.yunit_edit.setToolTip("Y軸ラベルに付ける単位。右の倍率で軸の数値も換算されます（主軸）。")
         form.addWidget(self.yunit_edit, 4, 1)
-        form.addWidget(QtWidgets.QLabel("Y倍率"), 4, 2)
+        form.addWidget(QtWidgets.QLabel("Y倍率/式"), 4, 2)
         self.yscale_edit = QtWidgets.QLineEdit("1")
-        self.yscale_edit.setToolTip("Y軸の数値に掛ける倍率。例: V→mV は 1000。")
+        self.yscale_edit.setToolTip("Y軸の数値変換（主軸）。数値なら倍率（例: 1000）。\n"
+                                    "y の代わりに x を使った式も可: 20*log10(x), x**2, abs(x) など。")
         form.addWidget(self.yscale_edit, 4, 3)
         v.addLayout(form)
 
@@ -744,7 +746,7 @@ class UIBuildMixin:
         w = QtWidgets.QWidget(); outer.setWidget(w)
         v = QtWidgets.QVBoxLayout(w)
 
-        v.addWidget(self._bold("データサイエンス（回帰・統計・相関）"))
+        v.addWidget(self._bold("統計解析（回帰・記述統計・相関・正規性）"))
         info = QtWidgets.QLabel("選択中のY系列を、現在のX軸列に対して解析します。"
                                 "データタブでX軸とY系列を選んでから実行してください。")
         info.setWordWrap(True); info.setStyleSheet("color:#555;")

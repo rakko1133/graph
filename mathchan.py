@@ -79,6 +79,43 @@ def eval_expr(expr, variables):
         raise ValueError("この式は評価できません")
 
     return ev(node)
+
+
+def axis_scale(x, spec):
+    """軸の値を変換する。spec が数値なら倍率、x を使った式なら eval_expr で変換。
+
+    例: "1000"（×1000）、"x*9/5+32"（℃→℉）、"20*log10(x)"（dB）。
+    空/"1"/1.0 は無変換。評価できない式はそのまま返す。
+    """
+    x = np.asarray(x, dtype=float)
+    if spec is None:
+        return x
+    if isinstance(spec, (int, float)):
+        return x if spec == 1 else x * float(spec)
+    s = str(spec).strip()
+    if s in ("", "1"):
+        return x
+    try:
+        return x * float(s)          # 数値 → 倍率
+    except ValueError:
+        pass
+    m = _ast_re().fullmatch(s)       # 10^-6 のような累乗定数（^ は累乗）→ 倍率
+    if m:
+        try:
+            return x * (float(m.group(1)) ** float(m.group(2)))
+        except (ValueError, OverflowError, ZeroDivisionError):
+            return x
+    try:
+        return np.asarray(eval_expr(s, {"x": x}), dtype=float)   # 'x' を含む式
+    except Exception:                # noqa: BLE001  不正な式は無変換で返す
+        return x
+
+
+def _ast_re():
+    import re
+    return re.compile(r"([+-]?[\d.]+)\s*\^\s*([+-]?[\d.]+)")
+
+
 UNARY_OPS = ["積分 ∫A dt", "微分 dA/dt", "絶対値 |A|", "二乗 A²",
              "移動平均", "ローパス(RC)", "ローパス(Butterworth)",
              "ハイパス(Butterworth)", "包絡線(Hilbert)", "自己相関"]
