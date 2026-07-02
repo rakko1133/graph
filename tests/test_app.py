@@ -166,6 +166,74 @@ def test_3d_via_checkbox_and_axis_swap():
     assert plotter.migrate_chart_type("散布図")[1] is None
 
 
+def test_pca_creates_3d_ready_dataset():
+    """PCA 計算（sklearn/numpy 両対応）と、GUI で PC 列を作り3D散布図で描けること。"""
+    import builtins
+    import datasci
+
+    rng = np.random.default_rng(0)
+    base = rng.normal(0, 1, 200)
+    feats = [("f0", base + rng.normal(0, 0.1, 200)),
+             ("f1", rng.normal(0, 1, 200)),
+             ("f2", base * 0.8 + rng.normal(0, 0.2, 200)),
+             ("f3", rng.normal(0, 1, 200))]
+
+    r = datasci.pca(feats, n_components=3, standardize=True)
+    assert r is not None and len(r["scores"]) == 3
+    # 寄与率は降順、scores 長さ = サンプル数
+    assert r["explained_ratio"] == sorted(r["explained_ratio"], reverse=True)
+    assert all(len(a) == r["n_samples"] for _, a in r["scores"])
+
+    # NaN を含む行は除外される
+    f2 = [(n, a.copy()) for n, a in feats]
+    f2[0][1][:10] = np.nan
+    assert datasci.pca(f2, n_components=3)["n_samples"] == 190
+
+    # sklearn を隠すと numpy フォールバックで計算できる
+    real_import = builtins.__import__
+
+    def _no_sklearn(name, *a, **k):
+        if name.startswith("sklearn"):
+            raise ImportError("blocked for test")
+        return real_import(name, *a, **k)
+    builtins.__import__ = _no_sklearn
+    try:
+        rf = datasci.pca(feats, n_components=3)
+    finally:
+        builtins.__import__ = real_import
+    assert rf["backend"] == "numpy" and len(rf["scores"]) == 3
+
+    # GUI: 選択系列に run_pca → PCA データセット作成 → 3D散布図で描画
+    df = pd.DataFrame({n: a for n, a in feats})
+    w = graph_app.GraphApp()
+    w.datasets.clear(); w.file_list.clear(); w.y_list.clear()
+    w.datasets["d.csv"] = df; w.meta["d.csv"] = {"path": "d.csv", "enc": "utf-8", "delim": ","}
+    w._add_file_item("d.csv"); w.file_list.setCurrentRow(0); w._refresh_columns()
+    for r0 in range(w.y_list.count()):
+        w.y_list.item(r0).setCheckState(QtCore.Qt.CheckState.Checked)
+    w._on_y_selection_changed()
+    n_before = len(w.datasets)
+    w.run_pca()
+    new = [k for k in w.datasets if k.startswith("PCA:")]
+    assert len(w.datasets) == n_before + 1 and new
+    assert list(w.datasets[new[0]].columns) == ["PC1", "PC2", "PC3"]
+
+    # 作成した PCA を 3D 散布図で描画（X=PC1, Z=PC3, Y=PC2）
+    lbl = new[0]
+    labels = [w.file_list.item(i).text() for i in range(w.file_list.count())]
+    w.file_list.setCurrentRow(labels.index(lbl)); w._refresh_columns()
+    w.x_combo.setCurrentText("PC1"); w.z_combo.setCurrentText("PC3")
+    for r0 in range(w.y_list.count()):
+        it = w.y_list.item(r0)
+        it.setCheckState(QtCore.Qt.CheckState.Checked
+                         if it.data(graph_app.UserRole) == (lbl, "PC2")
+                         else QtCore.Qt.CheckState.Unchecked)
+    w._on_y_selection_changed()
+    w.chart_combo.setCurrentText("散布図"); w.threed_check.setChecked(True)
+    w.draw_graph()
+    assert getattr(w.ax, "name", None) == "3d"
+
+
 def test_oscilloscope_and_fft():
     w = _make_app(_wave())
     w.chart_combo.setCurrentText("折れ線")

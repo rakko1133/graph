@@ -175,3 +175,54 @@ class DataSciMixin:
         btn.clicked.connect(dlg.accept)
         lay.addWidget(btn)
         dlg.exec()
+
+    # ---- 主成分分析（PCA） ----
+    def run_pca(self):
+        """選択中の系列（特徴量）に PCA をかけ、PC1..PCk を新データセットとして作る。
+        作成後は『データ』タブで選び、3D表示（散布図/折れ線）で確認できる。"""
+        items = self._selected_series_items()
+        if len(items) < 2:
+            QtWidgets.QMessageBox.information(
+                self, "情報",
+                "主成分分析には特徴量として2系列以上をデータタブで選択してください。\n"
+                "（例: 複数のセンサ列や測定列。PC1〜3 を作れば3D散布図で確認できます）")
+            return
+        named = []
+        for fl, col, disp in items:
+            _t, y = self._xy_by_disp(disp)
+            if y is not None:
+                named.append((disp, y))
+        if len(named) < 2:
+            QtWidgets.QMessageBox.information(self, "情報", "有効な数値系列が不足しています。")
+            return
+        res = datasci.pca(named, n_components=self.pca_ncomp.value(),
+                          standardize=self.pca_std.isChecked())
+        if not res:
+            QtWidgets.QMessageBox.information(
+                self, "情報",
+                "主成分分析を計算できませんでした（系列数・点数・数値を確認してください）。")
+            return
+        import pandas as pd
+        df = pd.DataFrame({name: arr for name, arr in res["scores"]})
+        src = items[0][0]
+        base = f"PCA: {os.path.splitext(os.path.basename(str(src)))[0]}"
+        label, i = base, 2
+        while label in self.datasets:
+            label = f"{base} ({i})"; i += 1
+        self.datasets[label] = df
+        self.meta[label] = {"path": label, "enc": "-", "delim": "-"}
+        self._add_file_item(label)
+        self._refresh_columns()
+
+        f = self._fmt
+        rows = [("使用した特徴量", ", ".join(res["features"])),
+                ("サンプル数", res["n_samples"]),
+                ("標準化", self.pca_std.isChecked()),
+                ("計算エンジン", res["backend"])]
+        for j, r in enumerate(res["explained_ratio"]):
+            rows.append((f"PC{j + 1} 寄与率", f"{r * 100:.1f}%"))
+        rows.append(("累積寄与率", f"{sum(res['explained_ratio']) * 100:.1f}%"))
+        self._ds_show(f"主成分分析 (PCA) → 『{label}』を作成", rows)
+        self._set_status(
+            f"主成分分析を作成: {label}（PC1〜{res['n_components']}, {res['backend']}）。"
+            "『データ』タブで選び、3D表示で確認できます。")

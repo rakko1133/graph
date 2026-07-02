@@ -72,11 +72,19 @@ def pca_3d():
     x = np.vstack(pts)
     labels = np.concatenate(labels)
 
-    # PCA: 中心化して SVD、上位3主成分へ射影
+    # PCA: 上位3主成分へ。scikit-learn があれば使い、無ければ numpy の SVD で計算。
     xc = x - x.mean(axis=0)
-    _u, s, vt = np.linalg.svd(xc, full_matrices=False)
-    scores = xc @ vt[:3].T                    # (N, 3) = PC1, PC2, PC3
-    var_ratio = (s[:3] ** 2) / np.sum(s ** 2)
+    try:
+        from sklearn.decomposition import PCA
+        model = PCA(n_components=3)
+        scores = model.fit_transform(xc)
+        var_ratio = model.explained_variance_ratio_
+        backend = "scikit-learn"
+    except Exception:
+        _u, s, vt = np.linalg.svd(xc, full_matrices=False)
+        scores = xc @ vt[:3].T                # (N, 3) = PC1, PC2, PC3
+        var_ratio = (s[:3] ** 2) / np.sum(s ** 2)
+        backend = "numpy"
     pc1, pc2, pc3 = scores[:, 0], scores[:, 1], scores[:, 2]
 
     header = ["PC1", "PC2", "PC3"]

@@ -815,6 +815,30 @@ class UIBuildMixin:
         brow.addWidget(b_desc); brow.addWidget(b_norm); brow.addWidget(b_corr)
         v.addLayout(brow)
 
+        # 主成分分析（PCA）: 選択系列を特徴量として次元圧縮 → 3D表示で確認できる
+        v.addWidget(self._bold("主成分分析 (PCA)"))
+        pca_hint = QtWidgets.QLabel(
+            "選択中のY系列を特徴量として主成分分析し、PC1〜PCk を新しいデータとして作成します。"
+            "PC1〜3 を作れば『データ』タブで選び 3D 散布図で確認できます。")
+        pca_hint.setWordWrap(True); pca_hint.setStyleSheet("color:#555;")
+        v.addWidget(pca_hint)
+        prow = QtWidgets.QHBoxLayout()
+        prow.addWidget(QtWidgets.QLabel("主成分数"))
+        self.pca_ncomp = QtWidgets.QSpinBox(); self.pca_ncomp.setRange(1, 20)
+        self.pca_ncomp.setValue(3)
+        self.pca_ncomp.setToolTip("取り出す主成分の数。3D散布図で見るなら3を推奨。")
+        prow.addWidget(self.pca_ncomp)
+        self.pca_std = QtWidgets.QCheckBox("標準化")
+        self.pca_std.setChecked(True)
+        self.pca_std.setToolTip("各特徴量を平均0・分散1にそろえてから分析（単位が違う列の混在に有効）。")
+        prow.addWidget(self.pca_std)
+        b_pca = QtWidgets.QPushButton("PCA を実行（選択系列）")
+        b_pca.setToolTip("選択中のY系列を特徴量にPCAを実行し、PC列を新データとして作成します。"
+                         "scikit-learn があればそれを使用（無ければ numpy で計算）。")
+        b_pca.clicked.connect(self.run_pca)
+        prow.addWidget(b_pca); prow.addStretch(1)
+        v.addLayout(prow)
+
         self.ds_title = self._bold("結果")
         v.addWidget(self.ds_title)
         hint = QtWidgets.QLabel("右端の「表示」にチェックした項目は、その値をグラフに注記表示します。")

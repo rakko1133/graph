@@ -3104,6 +3104,64 @@ def correlation_matrix(named_series, method="pearson"):
     return names, np.asarray(mat, dtype=float)
 
 
+def pca(named_series, n_components=3, standardize=True):
+    """複数系列（特徴量）に主成分分析（PCA）を行う。
+
+    named_series : [(名前, y配列), ...]  各系列を1つの特徴量、行=サンプルとして扱う。
+    n_components : 取り出す主成分の数（特徴量数・サンプル数で自動的に上限を丸める）。
+    standardize  : True なら各特徴量を平均0・分散1に標準化してから分析（単位が違う
+                   特徴量の混在に有効）。False は中心化のみ（sklearn 既定と同じ）。
+
+    scikit-learn があればそれを使い、無ければ numpy の SVD で同等の結果を返す。
+    戻り dict:
+      n_components, n_samples, features(名前list), backend("scikit-learn"/"numpy"),
+      scores([(name, array)], PC1.. の各列), explained_ratio(各PCの寄与率list)
+    計算できないときは None。
+    """
+    names = [str(nm) for nm, _ in named_series]
+    arrs = [np.asarray(a, dtype=float) for _, a in named_series]
+    if len(arrs) < 2:
+        return None
+    length = min(a.size for a in arrs)
+    if length < 3:
+        return None
+    x = np.column_stack([a[:length] for a in arrs])       # (サンプル, 特徴量)
+    x = x[np.all(np.isfinite(x), axis=1)]                  # 欠測を含む行は除外
+    n_samples, n_features = x.shape
+    if n_samples < 2 or n_features < 2:
+        return None
+    k = int(max(1, min(int(n_components), n_features, n_samples)))
+
+    xc = x - x.mean(axis=0)                                # 中心化
+    if standardize:
+        std = xc.std(axis=0, ddof=0)
+        std[std == 0] = 1.0                                # 定数列は割らない
+        xc = xc / std
+
+    backend = "numpy"
+    try:
+        from sklearn.decomposition import PCA as _PCA      # あれば scikit-learn を使う
+        model = _PCA(n_components=k)
+        scores = model.fit_transform(xc)
+        ratio = np.asarray(model.explained_variance_ratio_, dtype=float)
+        backend = "scikit-learn"
+    except Exception:
+        # フォールバック: numpy の SVD（sklearn の PCA と数学的に同等）
+        _u, s, _vt = np.linalg.svd(xc, full_matrices=False)
+        scores = _u[:, :k] * s[:k]
+        total = float(np.sum(s ** 2))
+        ratio = (s[:k] ** 2 / total) if total else np.zeros(k)
+
+    return {
+        "n_components": k,
+        "n_samples": int(n_samples),
+        "features": names,
+        "backend": backend,
+        "scores": [(f"PC{i + 1}", scores[:, i]) for i in range(k)],
+        "explained_ratio": [float(r) for r in np.asarray(ratio).ravel()[:k]],
+    }
+
+
 def normality(y):
     """Shapiro-Wilk 正規性検定（scipy 必須）。W 統計量・p 値・5%有意で正規かを返す。
     scipy が無ければ空 dict。"""
@@ -4151,6 +4209,30 @@ class UIBuildMixin:
         b_corr.setToolTip("選択中の全Y系列どうしのピアソン相関を行列で表示")
         brow.addWidget(b_desc); brow.addWidget(b_norm); brow.addWidget(b_corr)
         v.addLayout(brow)
+
+        # 主成分分析（PCA）: 選択系列を特徴量として次元圧縮 → 3D表示で確認できる
+        v.addWidget(self._bold("主成分分析 (PCA)"))
+        pca_hint = QtWidgets.QLabel(
+            "選択中のY系列を特徴量として主成分分析し、PC1〜PCk を新しいデータとして作成します。"
+            "PC1〜3 を作れば『データ』タブで選び 3D 散布図で確認できます。")
+        pca_hint.setWordWrap(True); pca_hint.setStyleSheet("color:#555;")
+        v.addWidget(pca_hint)
+        prow = QtWidgets.QHBoxLayout()
+        prow.addWidget(QtWidgets.QLabel("主成分数"))
+        self.pca_ncomp = QtWidgets.QSpinBox(); self.pca_ncomp.setRange(1, 20)
+        self.pca_ncomp.setValue(3)
+        self.pca_ncomp.setToolTip("取り出す主成分の数。3D散布図で見るなら3を推奨。")
+        prow.addWidget(self.pca_ncomp)
+        self.pca_std = QtWidgets.QCheckBox("標準化")
+        self.pca_std.setChecked(True)
+        self.pca_std.setToolTip("各特徴量を平均0・分散1にそろえてから分析（単位が違う列の混在に有効）。")
+        prow.addWidget(self.pca_std)
+        b_pca = QtWidgets.QPushButton("PCA を実行（選択系列）")
+        b_pca.setToolTip("選択中のY系列を特徴量にPCAを実行し、PC列を新データとして作成します。"
+                         "scikit-learn があればそれを使用（無ければ numpy で計算）。")
+        b_pca.clicked.connect(self.run_pca)
+        prow.addWidget(b_pca); prow.addStretch(1)
+        v.addLayout(prow)
 
         self.ds_title = self._bold("結果")
         v.addWidget(self.ds_title)
@@ -6975,6 +7057,57 @@ class DataSciMixin:
         btn.clicked.connect(dlg.accept)
         lay.addWidget(btn)
         dlg.exec()
+
+    # ---- 主成分分析（PCA） ----
+    def run_pca(self):
+        """選択中の系列（特徴量）に PCA をかけ、PC1..PCk を新データセットとして作る。
+        作成後は『データ』タブで選び、3D表示（散布図/折れ線）で確認できる。"""
+        items = self._selected_series_items()
+        if len(items) < 2:
+            QtWidgets.QMessageBox.information(
+                self, "情報",
+                "主成分分析には特徴量として2系列以上をデータタブで選択してください。\n"
+                "（例: 複数のセンサ列や測定列。PC1〜3 を作れば3D散布図で確認できます）")
+            return
+        named = []
+        for fl, col, disp in items:
+            _t, y = self._xy_by_disp(disp)
+            if y is not None:
+                named.append((disp, y))
+        if len(named) < 2:
+            QtWidgets.QMessageBox.information(self, "情報", "有効な数値系列が不足しています。")
+            return
+        res = pca(named, n_components=self.pca_ncomp.value(),
+                          standardize=self.pca_std.isChecked())
+        if not res:
+            QtWidgets.QMessageBox.information(
+                self, "情報",
+                "主成分分析を計算できませんでした（系列数・点数・数値を確認してください）。")
+            return
+        import pandas as pd
+        df = pd.DataFrame({name: arr for name, arr in res["scores"]})
+        src = items[0][0]
+        base = f"PCA: {os.path.splitext(os.path.basename(str(src)))[0]}"
+        label, i = base, 2
+        while label in self.datasets:
+            label = f"{base} ({i})"; i += 1
+        self.datasets[label] = df
+        self.meta[label] = {"path": label, "enc": "-", "delim": "-"}
+        self._add_file_item(label)
+        self._refresh_columns()
+
+        f = self._fmt
+        rows = [("使用した特徴量", ", ".join(res["features"])),
+                ("サンプル数", res["n_samples"]),
+                ("標準化", self.pca_std.isChecked()),
+                ("計算エンジン", res["backend"])]
+        for j, r in enumerate(res["explained_ratio"]):
+            rows.append((f"PC{j + 1} 寄与率", f"{r * 100:.1f}%"))
+        rows.append(("累積寄与率", f"{sum(res['explained_ratio']) * 100:.1f}%"))
+        self._ds_show(f"主成分分析 (PCA) → 『{label}』を作成", rows)
+        self._set_status(
+            f"主成分分析を作成: {label}（PC1〜{res['n_components']}, {res['backend']}）。"
+            "『データ』タブで選び、3D表示で確認できます。")
 
 # ======================================================================
 # ↑ graph_app_mixins/datasci_tools.py

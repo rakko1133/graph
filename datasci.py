@@ -144,6 +144,64 @@ def correlation_matrix(named_series, method="pearson"):
     return names, np.asarray(mat, dtype=float)
 
 
+def pca(named_series, n_components=3, standardize=True):
+    """複数系列（特徴量）に主成分分析（PCA）を行う。
+
+    named_series : [(名前, y配列), ...]  各系列を1つの特徴量、行=サンプルとして扱う。
+    n_components : 取り出す主成分の数（特徴量数・サンプル数で自動的に上限を丸める）。
+    standardize  : True なら各特徴量を平均0・分散1に標準化してから分析（単位が違う
+                   特徴量の混在に有効）。False は中心化のみ（sklearn 既定と同じ）。
+
+    scikit-learn があればそれを使い、無ければ numpy の SVD で同等の結果を返す。
+    戻り dict:
+      n_components, n_samples, features(名前list), backend("scikit-learn"/"numpy"),
+      scores([(name, array)], PC1.. の各列), explained_ratio(各PCの寄与率list)
+    計算できないときは None。
+    """
+    names = [str(nm) for nm, _ in named_series]
+    arrs = [np.asarray(a, dtype=float) for _, a in named_series]
+    if len(arrs) < 2:
+        return None
+    length = min(a.size for a in arrs)
+    if length < 3:
+        return None
+    x = np.column_stack([a[:length] for a in arrs])       # (サンプル, 特徴量)
+    x = x[np.all(np.isfinite(x), axis=1)]                  # 欠測を含む行は除外
+    n_samples, n_features = x.shape
+    if n_samples < 2 or n_features < 2:
+        return None
+    k = int(max(1, min(int(n_components), n_features, n_samples)))
+
+    xc = x - x.mean(axis=0)                                # 中心化
+    if standardize:
+        std = xc.std(axis=0, ddof=0)
+        std[std == 0] = 1.0                                # 定数列は割らない
+        xc = xc / std
+
+    backend = "numpy"
+    try:
+        from sklearn.decomposition import PCA as _PCA      # あれば scikit-learn を使う
+        model = _PCA(n_components=k)
+        scores = model.fit_transform(xc)
+        ratio = np.asarray(model.explained_variance_ratio_, dtype=float)
+        backend = "scikit-learn"
+    except Exception:
+        # フォールバック: numpy の SVD（sklearn の PCA と数学的に同等）
+        _u, s, _vt = np.linalg.svd(xc, full_matrices=False)
+        scores = _u[:, :k] * s[:k]
+        total = float(np.sum(s ** 2))
+        ratio = (s[:k] ** 2 / total) if total else np.zeros(k)
+
+    return {
+        "n_components": k,
+        "n_samples": int(n_samples),
+        "features": names,
+        "backend": backend,
+        "scores": [(f"PC{i + 1}", scores[:, i]) for i in range(k)],
+        "explained_ratio": [float(r) for r in np.asarray(ratio).ravel()[:k]],
+    }
+
+
 def normality(y):
     """Shapiro-Wilk 正規性検定（scipy 必須）。W 統計量・p 値・5%有意で正規かを返す。
     scipy が無ければ空 dict。"""
