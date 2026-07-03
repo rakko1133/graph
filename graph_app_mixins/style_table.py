@@ -11,6 +11,7 @@ class StyleTableMixin:
         """『一番左の列をX軸』ON時は名前コンボを無効化し、先頭列をY候補から除外/復帰。"""
         self._refresh_columns()        # Y軸候補を作り直し（先頭列の除外/復帰）＋再描画予約
         self._update_x_combo_enabled()  # 有効/無効は最後に確定
+        self._update_x_multi_enabled()  # 一番左X ON なら複数X不可
 
     def _update_x_combo_enabled(self):
         """X名コンボの有効状態を、グラフ種別と『一番左の列をX軸』から決める。"""
@@ -26,12 +27,41 @@ class StyleTableMixin:
     def _use_leftmost_x(self):
         return bool(getattr(self, "xleft_check", None) and self.xleft_check.isChecked())
 
-    def _x_values(self, df):
-        """X軸データ列。『一番左の列』ONなら位置0、OFFなら選択名（無ければ先頭列）。"""
-        if self._use_leftmost_x():
+    def _x_values(self, df, xname=None):
+        """X軸データ列。xname 指定時はその列。None は『一番左の列』ONなら位置0、
+        OFFなら x_combo の選択名（無ければ先頭列）。"""
+        if xname is None and self._use_leftmost_x():
             return df.iloc[:, 0].to_numpy()
-        xname = self.x_combo.currentText()
-        return df[xname].to_numpy() if xname in df.columns else df.iloc[:, 0].to_numpy()
+        name = xname if xname is not None else self.x_combo.currentText()
+        return df[name].to_numpy() if name in df.columns else df.iloc[:, 0].to_numpy()
+
+    def _selected_x_columns(self):
+        """描画に使うX列の一覧。『X軸を複数選択』ONでチェックがあればそれら、
+        無ければ単一（None＝一番左 or x_combo の1列）。"""
+        if (getattr(self, "multix_check", None) and self.multix_check.isChecked()
+                and not self._use_leftmost_x()):
+            cols = [self.x_list.item(i).data(UserRole)
+                    for i in range(self.x_list.count())
+                    if self.x_list.item(i).checkState() == QtCore.Qt.CheckState.Checked]
+            if cols:
+                return cols
+        return [None if self._use_leftmost_x() else self.x_combo.currentText()]
+
+    def _update_x_multi_enabled(self):
+        """『X軸を複数選択』チェックと複数Xリストの有効状態を種別・設定から決める。"""
+        if not hasattr(self, "multix_check"):
+            return
+        info = plotter.CHART_INFO.get(self.chart_combo.currentText(), {})
+        # 複数Xが効くのは 2D の xy 種別かつ『一番左の列』OFF・3D以外
+        ok = (self.chart_combo.currentText() in plotter._SWAP_TYPES
+              and not self._use_leftmost_x() and not self._want_3d())
+        if not ok and self.multix_check.isChecked():
+            # 非対応状態になったら複数Xは解除する（後で勝手に復活しないように）
+            self.multix_check.blockSignals(True)
+            self.multix_check.setChecked(False)
+            self.multix_check.blockSignals(False)
+        self.multix_check.setEnabled(ok)
+        self.x_list.setEnabled(ok and self.multix_check.isChecked())
 
     def _z_values(self, df):
         """Z軸データ列（3D用）。選択名が無ければ最終列で代用する。"""
@@ -39,7 +69,8 @@ class StyleTableMixin:
         return df[zname].to_numpy() if zname in df.columns else df.iloc[:, -1].to_numpy()
 
     def _effective_x_label(self):
-        """既定のX軸ラベル（『一番左の列』ONなら先頭列名、OFFなら選択名）。"""
+        """既定のX軸ラベル（『一番左の列』ONなら先頭列名、複数XならX名を連結、
+        それ以外は選択名）。"""
         if self._use_leftmost_x():
             items = self._selected_series_items()
             if items:
@@ -47,6 +78,9 @@ class StyleTableMixin:
                 if df is not None and len(df.columns):
                     return str(df.columns[0])
             return ""
+        xcols = self._selected_x_columns()
+        if len(xcols) > 1:
+            return " / ".join(str(c) for c in xcols)
         return self.x_combo.currentText()
 
     @staticmethod

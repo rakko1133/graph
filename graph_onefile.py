@@ -1281,6 +1281,9 @@ _XY_DEFAULT_KIND = {"折れ線": "line", "散布図": "scatter", "面": "area",
                     "ステップ": "step", "ステム": "stem"}
 # オシロ格子・カーソルを許可する種別
 _SCOPE_TYPES = ("折れ線", "散布図")
+# X↔Y 入れ替えが意味を持つ種別（2Dで x,y 両方を持つもの）
+_SWAP_TYPES = ("折れ線", "散布図", "面", "積み上げ面", "ステップ", "ステム",
+               "2Dヒストグラム", "hexbin")
 # 3D で描くとき、種別名 → 3D描画の種類（_draw_3d が使う）
 _THREED_KIND = {"散布図": "scatter", "折れ線": "line", "棒": "bar", "曲面": "surface"}
 # 旧バージョンの『3D…』種別名 → 新しい2D種別名（3Dフラグは別途ON）
@@ -1367,6 +1370,7 @@ def plot_series(
     zlabel="",
     view_init=None,
     threed=False,
+    swap_xy=False,
 ):
     """ax に系列群を描画する。
 
@@ -1382,6 +1386,25 @@ def plot_series(
     if not series:
         raise ValueError("Y軸（値）の系列を選択してください。")
     fonts = fonts or {}
+
+    # --- X↔Y 入れ替え（2Dの xy 種別のみ）---
+    # データと、X/Y に紐づく設定（ラベル・単位・範囲・対数・倍率・向き反転）を丸ごと交換。
+    # ＝ユーザーが「X」に設定した内容は、その列と一緒にY軸側へ移る（直感的な転置）。
+    if swap_xy and chart_type in _SWAP_TYPES:
+        xlabel, ylabel = ylabel, xlabel
+        xunit, yunit = yunit, xunit
+        xlim, ylim = ylim, xlim
+        xlog, ylog = ylog, xlog
+        xscale, yscale = yscale, xscale
+        xinvert, yinvert = yinvert, xinvert
+        swapped = []
+        for sr in series:
+            if sr.get("x") is not None and sr.get("y") is not None:
+                sr = dict(sr)
+                sr["x"], sr["y"] = sr["y"], sr["x"]
+                sr.pop("yerr", None)      # 入れ替え後は縦誤差の意味が変わるため落とす
+            swapped.append(sr)
+        series = swapped
 
     # --- 単位換算: 軸の数値を変換（数値=倍率／x を使った式も可。X=全系列、Y=主軸のみ）。
     #     系列dictは描画ごとに作り直されるが、念のためコピーしてから変換する。
@@ -3573,6 +3596,29 @@ class UIBuildMixin:
         self.x_combo.currentTextChanged.connect(self._on_x_changed)
         v.addWidget(self.x_combo)
 
+        # X↔Y 入れ替え／X軸を複数選択（散布図などの 2D xy 種別で有効）
+        xrow = QtWidgets.QHBoxLayout()
+        self.swap_xy_check = QtWidgets.QCheckBox("X↔Y 入れ替え")
+        self.swap_xy_check.setToolTip("XとYを入れ替えて描く（軸の“向き反転”0→1↔1→0 とは別）。"
+                                      "散布図・折れ線などの2D種別で有効。")
+        self.swap_xy_check.toggled.connect(self._request_redraw)
+        xrow.addWidget(self.swap_xy_check)
+        self.multix_check = QtWidgets.QCheckBox("X軸を複数選択")
+        self.multix_check.setToolTip("ONにすると下のリストでチェックした複数の列をXにし、"
+                                     "各X×各Yの組み合わせを系列として描きます。")
+        self.multix_check.setEnabled(False)
+        self.multix_check.toggled.connect(self._on_multix_toggled)
+        xrow.addWidget(self.multix_check); xrow.addStretch(1)
+        v.addLayout(xrow)
+        self.x_list = CheckListWidget()
+        self.x_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.x_list.setToolTip("『X軸を複数選択』ON時に、Xに使う列をチェックします。")
+        self.x_list.setStyleSheet("QListWidget::indicator { width:16px; height:16px; }")
+        self.x_list.setMaximumHeight(90)
+        self.x_list.itemChanged.connect(self._request_redraw)
+        self.x_list.setEnabled(False)
+        v.addWidget(self.x_list)
+
         self.z_label = QtWidgets.QLabel("Z軸（3Dの奥行き）")
         v.addWidget(self.z_label)
         self.z_combo = QtWidgets.QComboBox()
@@ -4689,10 +4735,26 @@ class DataIOMixin:
                 self.z_combo.setCurrentText(xcols[-1])
             self.z_combo.blockSignals(False)
 
-        # Y軸候補（ファイル｜列）。選択状態は表示名ではなく安定した
-        # (ファイル, 列) 識別子で保持する（ファイル数で表示名が変わっても消えない）。
+        # 複数X候補（列名。チェック状態を維持）。X と同じ列集合。
         checked = QtCore.Qt.CheckState.Checked
         unchecked = QtCore.Qt.CheckState.Unchecked
+        if hasattr(self, "x_list"):
+            prev_x = {self.x_list.item(i).data(UserRole)
+                      for i in range(self.x_list.count())
+                      if self.x_list.item(i).checkState() == checked}
+            self.x_list.blockSignals(True)
+            self.x_list.clear()
+            for c in xcols:
+                it = QtWidgets.QListWidgetItem(str(c))
+                it.setData(UserRole, c)
+                it.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                            | QtCore.Qt.ItemFlag.ItemIsEnabled)
+                it.setCheckState(checked if c in prev_x else unchecked)
+                self.x_list.addItem(it)
+            self.x_list.blockSignals(False)
+
+        # Y軸候補（ファイル｜列）。選択状態は表示名ではなく安定した
+        # (ファイル, 列) 識別子で保持する（ファイル数で表示名が変わっても消えない）。
         prev = {self.y_list.item(i).data(UserRole)
                 for i in range(self.y_list.count())
                 if self.y_list.item(i).checkState() == checked}
@@ -4853,6 +4915,7 @@ class StyleTableMixin:
         """『一番左の列をX軸』ON時は名前コンボを無効化し、先頭列をY候補から除外/復帰。"""
         self._refresh_columns()        # Y軸候補を作り直し（先頭列の除外/復帰）＋再描画予約
         self._update_x_combo_enabled()  # 有効/無効は最後に確定
+        self._update_x_multi_enabled()  # 一番左X ON なら複数X不可
 
     def _update_x_combo_enabled(self):
         """X名コンボの有効状態を、グラフ種別と『一番左の列をX軸』から決める。"""
@@ -4868,12 +4931,41 @@ class StyleTableMixin:
     def _use_leftmost_x(self):
         return bool(getattr(self, "xleft_check", None) and self.xleft_check.isChecked())
 
-    def _x_values(self, df):
-        """X軸データ列。『一番左の列』ONなら位置0、OFFなら選択名（無ければ先頭列）。"""
-        if self._use_leftmost_x():
+    def _x_values(self, df, xname=None):
+        """X軸データ列。xname 指定時はその列。None は『一番左の列』ONなら位置0、
+        OFFなら x_combo の選択名（無ければ先頭列）。"""
+        if xname is None and self._use_leftmost_x():
             return df.iloc[:, 0].to_numpy()
-        xname = self.x_combo.currentText()
-        return df[xname].to_numpy() if xname in df.columns else df.iloc[:, 0].to_numpy()
+        name = xname if xname is not None else self.x_combo.currentText()
+        return df[name].to_numpy() if name in df.columns else df.iloc[:, 0].to_numpy()
+
+    def _selected_x_columns(self):
+        """描画に使うX列の一覧。『X軸を複数選択』ONでチェックがあればそれら、
+        無ければ単一（None＝一番左 or x_combo の1列）。"""
+        if (getattr(self, "multix_check", None) and self.multix_check.isChecked()
+                and not self._use_leftmost_x()):
+            cols = [self.x_list.item(i).data(UserRole)
+                    for i in range(self.x_list.count())
+                    if self.x_list.item(i).checkState() == QtCore.Qt.CheckState.Checked]
+            if cols:
+                return cols
+        return [None if self._use_leftmost_x() else self.x_combo.currentText()]
+
+    def _update_x_multi_enabled(self):
+        """『X軸を複数選択』チェックと複数Xリストの有効状態を種別・設定から決める。"""
+        if not hasattr(self, "multix_check"):
+            return
+        info = CHART_INFO.get(self.chart_combo.currentText(), {})
+        # 複数Xが効くのは 2D の xy 種別かつ『一番左の列』OFF・3D以外
+        ok = (self.chart_combo.currentText() in _SWAP_TYPES
+              and not self._use_leftmost_x() and not self._want_3d())
+        if not ok and self.multix_check.isChecked():
+            # 非対応状態になったら複数Xは解除する（後で勝手に復活しないように）
+            self.multix_check.blockSignals(True)
+            self.multix_check.setChecked(False)
+            self.multix_check.blockSignals(False)
+        self.multix_check.setEnabled(ok)
+        self.x_list.setEnabled(ok and self.multix_check.isChecked())
 
     def _z_values(self, df):
         """Z軸データ列（3D用）。選択名が無ければ最終列で代用する。"""
@@ -4881,7 +4973,8 @@ class StyleTableMixin:
         return df[zname].to_numpy() if zname in df.columns else df.iloc[:, -1].to_numpy()
 
     def _effective_x_label(self):
-        """既定のX軸ラベル（『一番左の列』ONなら先頭列名、OFFなら選択名）。"""
+        """既定のX軸ラベル（『一番左の列』ONなら先頭列名、複数XならX名を連結、
+        それ以外は選択名）。"""
         if self._use_leftmost_x():
             items = self._selected_series_items()
             if items:
@@ -4889,6 +4982,9 @@ class StyleTableMixin:
                 if df is not None and len(df.columns):
                     return str(df.columns[0])
             return ""
+        xcols = self._selected_x_columns()
+        if len(xcols) > 1:
+            return " / ".join(str(c) for c in xcols)
         return self.x_combo.currentText()
 
     @staticmethod
@@ -5340,6 +5436,9 @@ class PlotMixin:
         self._sync_3d_checkbox(info)     # 『3D表示』チェックの有効/固定を種別に合わせる
         self._update_x_combo_enabled()
         self._update_z_combo_enabled()   # Z軸コンボは3D表示中のみ有効
+        self._update_x_multi_enabled()   # 複数X は 2D xy 種別のみ
+        if hasattr(self, "swap_xy_check"):
+            self.swap_xy_check.setEnabled(ctype in _SWAP_TYPES)
         uses_bins = ctype in ("ヒストグラム", "2Dヒストグラム", "hexbin")
         self.bins_spin.setEnabled(uses_bins)
         self.bins_caption.setEnabled(uses_bins)
@@ -5370,8 +5469,14 @@ class PlotMixin:
         """『3D表示』チェックの切替: Z軸・視点角度の有効状態を更新して再描画する。"""
         want3d = self._want_3d()
         self._update_z_combo_enabled()
+        self._update_x_multi_enabled()   # 3D中は複数X不可
         if hasattr(self, "elev_spin"):
             self.elev_spin.setEnabled(want3d); self.azim_spin.setEnabled(want3d)
+        self._request_redraw()
+
+    def _on_multix_toggled(self, *_):
+        """『X軸を複数選択』の切替: 複数XリストのON/OFFを更新して再描画する。"""
+        self._update_x_multi_enabled()
         self._request_redraw()
 
     def _build_series(self, chart_type):
@@ -5411,17 +5516,26 @@ class PlotMixin:
                                "style": self.series_styles.get(self._style_key(fl, col))})
         elif chart_type in ("折れ線", "散布図", "面", "積み上げ面",
                             "ステップ", "ステム", "2Dヒストグラム", "hexbin"):
+            xcols = self._selected_x_columns()          # 複数Xなら各Xごとに系列を作る
+            multi_x = len(xcols) > 1
             for fl, col, disp in items:
                 df = self.datasets[fl]
-                xv = self._x_values(df)
                 stmap = self.series_styles.get(self._style_key(fl, col)) or {}
                 errcol = stmap.get("errcol")
                 yerr = df[errcol].to_numpy() if (errcol and errcol in df.columns) else None
-                series.append({"label": self._series_label(fl, col), "x": xv, "y": df[col].to_numpy(),
-                               "style": stmap,
-                               "axis": stmap.get("axis", "primary"),
-                               "kind": stmap.get("kind", ""),
-                               "yerr": yerr})
+                for xname_i in xcols:
+                    lab = self._series_label(fl, col)
+                    st_i = stmap
+                    if multi_x:                          # どのXかを凡例に付ける
+                        xdisp = str(df.columns[0]) if xname_i is None else xname_i
+                        lab = f"{lab} [X:{xdisp}]"
+                        if stmap.get("color"):           # 変種ごとに色を分ける（自動色に）
+                            st_i = dict(stmap); st_i.pop("color", None)
+                    series.append({"label": lab, "x": self._x_values(df, xname_i),
+                                   "y": df[col].to_numpy(), "style": st_i,
+                                   "axis": st_i.get("axis", "primary"),
+                                   "kind": st_i.get("kind", ""),
+                                   "yerr": yerr})
         else:  # ヒストグラム / 箱ひげ
             for fl, col, disp in items:
                 series.append({"label": self._series_label(fl, col), "y": self.datasets[fl][col].to_numpy(),
@@ -5564,6 +5678,8 @@ class PlotMixin:
             frame_width=self.frame_width.value(),
             xinvert=self.xinvert_check.isChecked(),
             yinvert=self.yinvert_check.isChecked(),
+            swap_xy=(self.swap_xy_check.isChecked()
+                     if hasattr(self, "swap_xy_check") else False),
         )
 
     def draw_graph(self):
@@ -5606,11 +5722,15 @@ class PlotMixin:
         self._cursors = []; self._cursor_drag = None; self._cursor_text = None
         try:
             series, categories = self._build_series(ctype)
+            swap_on = (getattr(self, "swap_xy_check", None) and self.swap_xy_check.isChecked()
+                       and ctype in _SWAP_TYPES)
+            # 入れ替え中は、その列が乗る軸名でメッセージを出す（元Yは横軸へ）
+            yn, xn = ("X", "Y") if swap_on else ("Y", "X")
             if self.ylog.isChecked() and self._has_nonpositive([s["y"] for s in series]):
-                issues.append("Y対数: 0以下の値は表示されません")
+                issues.append(f"{yn}対数: 0以下の値は表示されません")
             if (self.xlog.isChecked() and ctype in ("折れ線", "散布図")
                     and self._has_nonpositive([s.get("x") for s in series])):
-                issues.append("X対数: 0以下の値は表示されません")
+                issues.append(f"{xn}対数: 0以下の値は表示されません")
 
             # 大容量データの間引き（折れ線/散布図のみ）
             total = sum(len(s.get("y", [])) for s in series)
@@ -5651,7 +5771,8 @@ class PlotMixin:
                 if busy:
                     QtWidgets.QApplication.restoreOverrideCursor()
 
-            if max_points:
+            if max_points and not swap_on:
+                # 入れ替え中は series が転置前のためズーム再サンプルが不整合になる。無効化。
                 self._setup_dynamic_resample(series, ctype, max_points)
             self._rebuild_series_bar(ctype)   # グラフ上部の系列選択バー
             # カーソル追従用に、実際に描画されたデータ線を保持（近似曲線は除く）
@@ -5715,9 +5836,17 @@ class PlotMixin:
             return
         if ctype not in ("折れ線", "散布図") or not series:
             return
+        # X↔Y入れ替え中は座標が転置されるため塗りつぶしは無効（対応が取れない）
+        if getattr(self, "swap_xy_check", None) and self.swap_xy_check.isChecked():
+            self._set_status("塗りつぶし: X↔Y入れ替え中は無効です。")
+            return
         import numpy as np
         import pandas as pd
         items = self._selected_series_items()
+        # 複数X時は系列数(N_x×N_y)と選択数(N_y)がずれ、名前で系列を一意に選べないため無効
+        if len(series) != len(items):
+            self._set_status("塗りつぶし: X軸を複数選択中は無効です。")
+            return
         dispmap = {it[2]: s for it, s in zip(items, series)}
         a = dispmap.get(self.fill_a.currentText())
         if a is None or a.get("x") is None:
@@ -7183,35 +7312,45 @@ class BatchMixin:
         import re
         return re.sub(r'[\\/:*?"<>|]+', "_", str(name)).strip() or "graph"
 
-    def _build_series_for_file(self, label, x_name, y_names, chart_type, style_by_col,
+    def _build_series_for_file(self, label, x_names, y_names, chart_type, style_by_col,
                                z_name="", threed=False):
         """1ファイルから、指定した列名テンプレートで系列を作る（一括出力用）。
-        『一番左の列をX軸』ONなら、各ファイルの先頭列を位置でX軸に使う。"""
+        『一番左の列をX軸』ONなら、各ファイルの先頭列を位置でX軸に使う。
+        x_names は複数X対応のリスト（None は一番左/単一）。"""
         df = self.datasets[label]
         series, categories = [], None
         leftmost = self._use_leftmost_x()
-        xv = (df.iloc[:, 0].to_numpy() if leftmost
-              else (df[x_name].to_numpy() if x_name in df.columns else df.iloc[:, 0].to_numpy()))
+
+        def xvals(xn):
+            if xn is None or leftmost:
+                return df.iloc[:, 0].to_numpy()
+            return df[xn].to_numpy() if xn in df.columns else df.iloc[:, 0].to_numpy()
+
+        xcols = list(x_names) if (x_names and not leftmost) else [None]
+        primary = xvals(xcols[0])
         if threed:
             zv = (df[z_name].to_numpy() if z_name in df.columns else df.iloc[:, -1].to_numpy())
             for c in y_names:
                 st = style_by_col.get(c) or {}
-                series.append({"label": c, "x": xv, "y": df[c].to_numpy(), "z": zv,
+                series.append({"label": c, "x": primary, "y": df[c].to_numpy(), "z": zv,
                                "style": st, "kind": st.get("kind", "")})
         elif chart_type in ("棒", "横棒", "積み上げ棒", "円", "ドーナツ"):
-            categories = xv
+            categories = primary
             for c in y_names:
                 series.append({"label": c, "y": df[c].to_numpy(),
                                "style": style_by_col.get(c)})
         elif chart_type in ("折れ線", "散布図", "面", "積み上げ面",
                             "ステップ", "ステム", "2Dヒストグラム", "hexbin"):
+            multi = len(xcols) > 1
             for c in y_names:
                 st = style_by_col.get(c) or {}
                 errcol = st.get("errcol")
                 yerr = df[errcol].to_numpy() if (errcol and errcol in df.columns) else None
-                series.append({"label": c, "x": xv, "y": df[c].to_numpy(), "style": st,
-                               "axis": st.get("axis", "primary"),
-                               "kind": st.get("kind", ""), "yerr": yerr})
+                for xn in xcols:
+                    lab = c if not multi else f"{c} [X:{xn or str(df.columns[0])}]"
+                    series.append({"label": lab, "x": xvals(xn), "y": df[c].to_numpy(),
+                                   "style": st, "axis": st.get("axis", "primary"),
+                                   "kind": st.get("kind", ""), "yerr": yerr})
         else:  # ヒストグラム / 箱ひげ
             for c in y_names:
                 series.append({"label": c, "y": df[c].to_numpy(),
@@ -7271,6 +7410,7 @@ class BatchMixin:
                 "その列名を各ファイルに適用し、ファイルごとに1枚ずつ出力します。")
             return
         x_name = self.x_combo.currentText()
+        x_names = self._selected_x_columns()   # 複数X対応（[None]=一番左/単一）
         z_name = self.z_combo.currentText() if hasattr(self, "z_combo") else ""
         is3d = self._want_3d()
         view_init = self._view_angles() if is3d else None
@@ -7312,15 +7452,21 @@ class BatchMixin:
                 continue
             try:
                 series, categories = self._build_series_for_file(
-                    label, x_name, cols, ctype, style_by_col, z_name=z_name, threed=is3d)
+                    label, x_names, cols, ctype, style_by_col, z_name=z_name, threed=is3d)
             except Exception as e:  # noqa: BLE001
                 skipped.append(f"{label}（{e}）")
                 continue
             stem = os.path.splitext(label)[0]
             sec_label = " / ".join(s["label"] for s in series
                                    if s.get("axis") == "secondary")
-            xlab = self.xlabel_edit.text() or (
-                str(df.columns[0]) if self._use_leftmost_x() else x_name)
+            if self.xlabel_edit.text():
+                xlab = self.xlabel_edit.text()
+            elif self._use_leftmost_x():
+                xlab = str(df.columns[0])
+            elif len(x_names) > 1 and x_names[0] is not None:
+                xlab = " / ".join(str(c) for c in x_names)   # 複数XはX名を連結
+            else:
+                xlab = x_name
             base = self._safe_filename(stem)
             name, k = base, 2
             while name in used:
@@ -7439,6 +7585,12 @@ class PersistenceMixin:
             "selected_y": [[fl, col] for fl, col, _ in self._selected_series_items()],
             "chart_type": self.chart_combo.currentText(),
             "threed": self.threed_check.isChecked() if hasattr(self, "threed_check") else False,
+            "swap_xy": self.swap_xy_check.isChecked() if hasattr(self, "swap_xy_check") else False,
+            "multi_x": self.multix_check.isChecked() if hasattr(self, "multix_check") else False,
+            "x_cols": ([self.x_list.item(i).data(UserRole)
+                        for i in range(self.x_list.count())
+                        if self.x_list.item(i).checkState() == QtCore.Qt.CheckState.Checked]
+                       if hasattr(self, "x_list") else []),
             "view_elev": self.elev_spin.value() if hasattr(self, "elev_spin") else 30,
             "view_azim": self.azim_spin.value() if hasattr(self, "azim_spin") else -60,
             "title": self.title_edit.text(),
@@ -7527,6 +7679,18 @@ class PersistenceMixin:
                 self.threed_check.setChecked(bool(cfg["threed"]))
             elif mig3d is not None:
                 self.threed_check.setChecked(mig3d)
+        if hasattr(self, "swap_xy_check"):
+            self.swap_xy_check.setChecked(bool(cfg.get("swap_xy", False)))
+        if hasattr(self, "x_list"):            # 複数X（列名一致で復元）
+            want = set(cfg.get("x_cols", []) or [])
+            self.x_list.blockSignals(True)
+            for i in range(self.x_list.count()):
+                it = self.x_list.item(i)
+                it.setCheckState(QtCore.Qt.CheckState.Checked
+                                 if it.data(UserRole) in want
+                                 else QtCore.Qt.CheckState.Unchecked)
+            self.x_list.blockSignals(False)
+            self.multix_check.setChecked(bool(cfg.get("multi_x", False)))
         self.title_edit.setText(cfg.get("title", ""))
         self.xlabel_edit.setText(cfg.get("xlabel", "")); self.ylabel_edit.setText(cfg.get("ylabel", ""))
         f = cfg.get("fonts", {})
@@ -7632,7 +7796,7 @@ class PersistenceMixin:
 
     # ------------------------------------------------------------ 書式プリセット
     # 「データ/ファイル選択」に依存しない“見た目”だけを名前付きで保存・呼び出す。
-    _PRESET_KEYS = ("chart_type", "threed", "fonts", "grid", "legend", "legend_loc",
+    _PRESET_KEYS = ("chart_type", "threed", "swap_xy", "fonts", "grid", "legend", "legend_loc",
                     "show_filename", "show_ext", "frame_width", "grid_width",
                     "xlog", "ylog", "xinvert", "yinvert", "bins", "pct", "data_labels",
                     "trend", "trend_degree", "trend_window", "trend_eq", "trend_color",
@@ -7729,8 +7893,11 @@ class PersistenceMixin:
                     ("xinvert", self.xinvert_check, "chk"), ("yinvert", self.yinvert_check, "chk"),
                     ("bins", self.bins_spin, "val"), ("pct", self.pct_check, "chk"),
                     ("data_labels", self.data_labels_check, "chk"),
+                    ("swap_xy", getattr(self, "swap_xy_check", None), "chk"),
                     ("trend", self.trend_combo, "txt"), ("trend_degree", self.trend_degree, "val"),
                     ("trend_window", self.trend_window, "val"), ("trend_eq", self.trend_eq, "chk")):
+                if widget is None:
+                    continue
                 if key in d:
                     if kind == "chk":
                         widget.setChecked(bool(d[key]))

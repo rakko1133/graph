@@ -93,6 +93,9 @@ _XY_DEFAULT_KIND = {"折れ線": "line", "散布図": "scatter", "面": "area",
                     "ステップ": "step", "ステム": "stem"}
 # オシロ格子・カーソルを許可する種別
 _SCOPE_TYPES = ("折れ線", "散布図")
+# X↔Y 入れ替えが意味を持つ種別（2Dで x,y 両方を持つもの）
+_SWAP_TYPES = ("折れ線", "散布図", "面", "積み上げ面", "ステップ", "ステム",
+               "2Dヒストグラム", "hexbin")
 # 3D で描くとき、種別名 → 3D描画の種類（_draw_3d が使う）
 _THREED_KIND = {"散布図": "scatter", "折れ線": "line", "棒": "bar", "曲面": "surface"}
 # 旧バージョンの『3D…』種別名 → 新しい2D種別名（3Dフラグは別途ON）
@@ -179,6 +182,7 @@ def plot_series(
     zlabel="",
     view_init=None,
     threed=False,
+    swap_xy=False,
 ):
     """ax に系列群を描画する。
 
@@ -194,6 +198,25 @@ def plot_series(
     if not series:
         raise ValueError("Y軸（値）の系列を選択してください。")
     fonts = fonts or {}
+
+    # --- X↔Y 入れ替え（2Dの xy 種別のみ）---
+    # データと、X/Y に紐づく設定（ラベル・単位・範囲・対数・倍率・向き反転）を丸ごと交換。
+    # ＝ユーザーが「X」に設定した内容は、その列と一緒にY軸側へ移る（直感的な転置）。
+    if swap_xy and chart_type in _SWAP_TYPES:
+        xlabel, ylabel = ylabel, xlabel
+        xunit, yunit = yunit, xunit
+        xlim, ylim = ylim, xlim
+        xlog, ylog = ylog, xlog
+        xscale, yscale = yscale, xscale
+        xinvert, yinvert = yinvert, xinvert
+        swapped = []
+        for sr in series:
+            if sr.get("x") is not None and sr.get("y") is not None:
+                sr = dict(sr)
+                sr["x"], sr["y"] = sr["y"], sr["x"]
+                sr.pop("yerr", None)      # 入れ替え後は縦誤差の意味が変わるため落とす
+            swapped.append(sr)
+        series = swapped
 
     # --- 単位換算: 軸の数値を変換（数値=倍率／x を使った式も可。X=全系列、Y=主軸のみ）。
     #     系列dictは描画ごとに作り直されるが、念のためコピーしてから変換する。

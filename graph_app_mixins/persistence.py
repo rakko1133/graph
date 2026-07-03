@@ -33,6 +33,12 @@ class PersistenceMixin:
             "selected_y": [[fl, col] for fl, col, _ in self._selected_series_items()],
             "chart_type": self.chart_combo.currentText(),
             "threed": self.threed_check.isChecked() if hasattr(self, "threed_check") else False,
+            "swap_xy": self.swap_xy_check.isChecked() if hasattr(self, "swap_xy_check") else False,
+            "multi_x": self.multix_check.isChecked() if hasattr(self, "multix_check") else False,
+            "x_cols": ([self.x_list.item(i).data(UserRole)
+                        for i in range(self.x_list.count())
+                        if self.x_list.item(i).checkState() == QtCore.Qt.CheckState.Checked]
+                       if hasattr(self, "x_list") else []),
             "view_elev": self.elev_spin.value() if hasattr(self, "elev_spin") else 30,
             "view_azim": self.azim_spin.value() if hasattr(self, "azim_spin") else -60,
             "title": self.title_edit.text(),
@@ -121,6 +127,18 @@ class PersistenceMixin:
                 self.threed_check.setChecked(bool(cfg["threed"]))
             elif mig3d is not None:
                 self.threed_check.setChecked(mig3d)
+        if hasattr(self, "swap_xy_check"):
+            self.swap_xy_check.setChecked(bool(cfg.get("swap_xy", False)))
+        if hasattr(self, "x_list"):            # 複数X（列名一致で復元）
+            want = set(cfg.get("x_cols", []) or [])
+            self.x_list.blockSignals(True)
+            for i in range(self.x_list.count()):
+                it = self.x_list.item(i)
+                it.setCheckState(QtCore.Qt.CheckState.Checked
+                                 if it.data(UserRole) in want
+                                 else QtCore.Qt.CheckState.Unchecked)
+            self.x_list.blockSignals(False)
+            self.multix_check.setChecked(bool(cfg.get("multi_x", False)))
         self.title_edit.setText(cfg.get("title", ""))
         self.xlabel_edit.setText(cfg.get("xlabel", "")); self.ylabel_edit.setText(cfg.get("ylabel", ""))
         f = cfg.get("fonts", {})
@@ -226,7 +244,7 @@ class PersistenceMixin:
 
     # ------------------------------------------------------------ 書式プリセット
     # 「データ/ファイル選択」に依存しない“見た目”だけを名前付きで保存・呼び出す。
-    _PRESET_KEYS = ("chart_type", "threed", "fonts", "grid", "legend", "legend_loc",
+    _PRESET_KEYS = ("chart_type", "threed", "swap_xy", "fonts", "grid", "legend", "legend_loc",
                     "show_filename", "show_ext", "frame_width", "grid_width",
                     "xlog", "ylog", "xinvert", "yinvert", "bins", "pct", "data_labels",
                     "trend", "trend_degree", "trend_window", "trend_eq", "trend_color",
@@ -323,8 +341,11 @@ class PersistenceMixin:
                     ("xinvert", self.xinvert_check, "chk"), ("yinvert", self.yinvert_check, "chk"),
                     ("bins", self.bins_spin, "val"), ("pct", self.pct_check, "chk"),
                     ("data_labels", self.data_labels_check, "chk"),
+                    ("swap_xy", getattr(self, "swap_xy_check", None), "chk"),
                     ("trend", self.trend_combo, "txt"), ("trend_degree", self.trend_degree, "val"),
                     ("trend_window", self.trend_window, "val"), ("trend_eq", self.trend_eq, "chk")):
+                if widget is None:
+                    continue
                 if key in d:
                     if kind == "chk":
                         widget.setChecked(bool(d[key]))

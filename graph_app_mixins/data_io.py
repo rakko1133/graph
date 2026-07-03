@@ -246,10 +246,26 @@ class DataIOMixin:
                 self.z_combo.setCurrentText(xcols[-1])
             self.z_combo.blockSignals(False)
 
-        # Y軸候補（ファイル｜列）。選択状態は表示名ではなく安定した
-        # (ファイル, 列) 識別子で保持する（ファイル数で表示名が変わっても消えない）。
+        # 複数X候補（列名。チェック状態を維持）。X と同じ列集合。
         checked = QtCore.Qt.CheckState.Checked
         unchecked = QtCore.Qt.CheckState.Unchecked
+        if hasattr(self, "x_list"):
+            prev_x = {self.x_list.item(i).data(UserRole)
+                      for i in range(self.x_list.count())
+                      if self.x_list.item(i).checkState() == checked}
+            self.x_list.blockSignals(True)
+            self.x_list.clear()
+            for c in xcols:
+                it = QtWidgets.QListWidgetItem(str(c))
+                it.setData(UserRole, c)
+                it.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                            | QtCore.Qt.ItemFlag.ItemIsEnabled)
+                it.setCheckState(checked if c in prev_x else unchecked)
+                self.x_list.addItem(it)
+            self.x_list.blockSignals(False)
+
+        # Y軸候補（ファイル｜列）。選択状態は表示名ではなく安定した
+        # (ファイル, 列) 識別子で保持する（ファイル数で表示名が変わっても消えない）。
         prev = {self.y_list.item(i).data(UserRole)
                 for i in range(self.y_list.count())
                 if self.y_list.item(i).checkState() == checked}

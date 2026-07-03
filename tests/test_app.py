@@ -234,6 +234,48 @@ def test_pca_creates_3d_ready_dataset():
     assert getattr(w.ax, "name", None) == "3d"
 
 
+def test_swap_xy_and_multi_x():
+    """X↔Y入れ替え（データ・ラベルの転置）と、X軸複数選択（各X×各Yで系列化）。"""
+    df = pd.DataFrame({"時間": np.linspace(0, 10, 30),
+                       "A": np.linspace(0, 10, 30) * 2,
+                       "B": -np.linspace(0, 10, 30),
+                       "電圧": np.sin(np.linspace(0, 10, 30))})
+    w = _make_app(df, x="時間")
+    # Y=電圧 だけ
+    for r in range(w.y_list.count()):
+        it = w.y_list.item(r)
+        it.setCheckState(QtCore.Qt.CheckState.Checked
+                         if it.data(graph_app.UserRole)[1] == "電圧"
+                         else QtCore.Qt.CheckState.Unchecked)
+    w._on_y_selection_changed()
+    w.chart_combo.setCurrentText("折れ線")
+
+    # 通常: X=時間(0..10)
+    w.swap_xy_check.setChecked(False); w.draw_graph()
+    xd = np.asarray(w.ax.get_lines()[0].get_xdata())
+    assert xd.min() >= 0 and xd.max() <= 10.01
+
+    # 入れ替え: X が 電圧(sin, -1..1)、Y が 時間(0..10) に転置
+    w.swap_xy_check.setChecked(True); w.draw_graph()
+    ln = w.ax.get_lines()[0]
+    xs = np.asarray(ln.get_xdata()); ys = np.asarray(ln.get_ydata())
+    assert xs.min() < 0 and xs.max() <= 1.01 and ys.max() > 9
+    w.swap_xy_check.setChecked(False)
+
+    # 複数X: A と B をXに → 電圧×A, 電圧×B の2系列（凡例に [X:A] [X:B]）
+    w.chart_combo.setCurrentText("散布図")
+    w.multix_check.setChecked(True)
+    for r in range(w.x_list.count()):
+        it = w.x_list.item(r)
+        it.setCheckState(QtCore.Qt.CheckState.Checked
+                         if it.data(graph_app.UserRole) in ("A", "B")
+                         else QtCore.Qt.CheckState.Unchecked)
+    series, _ = w._build_series("散布図")
+    labels = [s["label"] for s in series]
+    assert len(series) == 2
+    assert any("[X:A]" in s for s in labels) and any("[X:B]" in s for s in labels)
+
+
 def test_oscilloscope_and_fft():
     w = _make_app(_wave())
     w.chart_combo.setCurrentText("折れ線")

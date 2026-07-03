@@ -178,6 +178,29 @@ class UIBuildMixin:
         self.x_combo.currentTextChanged.connect(self._on_x_changed)
         v.addWidget(self.x_combo)
 
+        # X↔Y 入れ替え／X軸を複数選択（散布図などの 2D xy 種別で有効）
+        xrow = QtWidgets.QHBoxLayout()
+        self.swap_xy_check = QtWidgets.QCheckBox("X↔Y 入れ替え")
+        self.swap_xy_check.setToolTip("XとYを入れ替えて描く（軸の“向き反転”0→1↔1→0 とは別）。"
+                                      "散布図・折れ線などの2D種別で有効。")
+        self.swap_xy_check.toggled.connect(self._request_redraw)
+        xrow.addWidget(self.swap_xy_check)
+        self.multix_check = QtWidgets.QCheckBox("X軸を複数選択")
+        self.multix_check.setToolTip("ONにすると下のリストでチェックした複数の列をXにし、"
+                                     "各X×各Yの組み合わせを系列として描きます。")
+        self.multix_check.setEnabled(False)
+        self.multix_check.toggled.connect(self._on_multix_toggled)
+        xrow.addWidget(self.multix_check); xrow.addStretch(1)
+        v.addLayout(xrow)
+        self.x_list = CheckListWidget()
+        self.x_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.x_list.setToolTip("『X軸を複数選択』ON時に、Xに使う列をチェックします。")
+        self.x_list.setStyleSheet("QListWidget::indicator { width:16px; height:16px; }")
+        self.x_list.setMaximumHeight(90)
+        self.x_list.itemChanged.connect(self._request_redraw)
+        self.x_list.setEnabled(False)
+        v.addWidget(self.x_list)
+
         self.z_label = QtWidgets.QLabel("Z軸（3Dの奥行き）")
         v.addWidget(self.z_label)
         self.z_combo = QtWidgets.QComboBox()

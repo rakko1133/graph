@@ -71,35 +71,45 @@ class BatchMixin:
         import re
         return re.sub(r'[\\/:*?"<>|]+', "_", str(name)).strip() or "graph"
 
-    def _build_series_for_file(self, label, x_name, y_names, chart_type, style_by_col,
+    def _build_series_for_file(self, label, x_names, y_names, chart_type, style_by_col,
                                z_name="", threed=False):
         """1ファイルから、指定した列名テンプレートで系列を作る（一括出力用）。
-        『一番左の列をX軸』ONなら、各ファイルの先頭列を位置でX軸に使う。"""
+        『一番左の列をX軸』ONなら、各ファイルの先頭列を位置でX軸に使う。
+        x_names は複数X対応のリスト（None は一番左/単一）。"""
         df = self.datasets[label]
         series, categories = [], None
         leftmost = self._use_leftmost_x()
-        xv = (df.iloc[:, 0].to_numpy() if leftmost
-              else (df[x_name].to_numpy() if x_name in df.columns else df.iloc[:, 0].to_numpy()))
+
+        def xvals(xn):
+            if xn is None or leftmost:
+                return df.iloc[:, 0].to_numpy()
+            return df[xn].to_numpy() if xn in df.columns else df.iloc[:, 0].to_numpy()
+
+        xcols = list(x_names) if (x_names and not leftmost) else [None]
+        primary = xvals(xcols[0])
         if threed:
             zv = (df[z_name].to_numpy() if z_name in df.columns else df.iloc[:, -1].to_numpy())
             for c in y_names:
                 st = style_by_col.get(c) or {}
-                series.append({"label": c, "x": xv, "y": df[c].to_numpy(), "z": zv,
+                series.append({"label": c, "x": primary, "y": df[c].to_numpy(), "z": zv,
                                "style": st, "kind": st.get("kind", "")})
         elif chart_type in ("棒", "横棒", "積み上げ棒", "円", "ドーナツ"):
-            categories = xv
+            categories = primary
             for c in y_names:
                 series.append({"label": c, "y": df[c].to_numpy(),
                                "style": style_by_col.get(c)})
         elif chart_type in ("折れ線", "散布図", "面", "積み上げ面",
                             "ステップ", "ステム", "2Dヒストグラム", "hexbin"):
+            multi = len(xcols) > 1
             for c in y_names:
                 st = style_by_col.get(c) or {}
                 errcol = st.get("errcol")
                 yerr = df[errcol].to_numpy() if (errcol and errcol in df.columns) else None
-                series.append({"label": c, "x": xv, "y": df[c].to_numpy(), "style": st,
-                               "axis": st.get("axis", "primary"),
-                               "kind": st.get("kind", ""), "yerr": yerr})
+                for xn in xcols:
+                    lab = c if not multi else f"{c} [X:{xn or str(df.columns[0])}]"
+                    series.append({"label": lab, "x": xvals(xn), "y": df[c].to_numpy(),
+                                   "style": st, "axis": st.get("axis", "primary"),
+                                   "kind": st.get("kind", ""), "yerr": yerr})
         else:  # ヒストグラム / 箱ひげ
             for c in y_names:
                 series.append({"label": c, "y": df[c].to_numpy(),
@@ -159,6 +169,7 @@ class BatchMixin:
                 "その列名を各ファイルに適用し、ファイルごとに1枚ずつ出力します。")
             return
         x_name = self.x_combo.currentText()
+        x_names = self._selected_x_columns()   # 複数X対応（[None]=一番左/単一）
         z_name = self.z_combo.currentText() if hasattr(self, "z_combo") else ""
         is3d = self._want_3d()
         view_init = self._view_angles() if is3d else None
@@ -200,15 +211,21 @@ class BatchMixin:
                 continue
             try:
                 series, categories = self._build_series_for_file(
-                    label, x_name, cols, ctype, style_by_col, z_name=z_name, threed=is3d)
+                    label, x_names, cols, ctype, style_by_col, z_name=z_name, threed=is3d)
             except Exception as e:  # noqa: BLE001
                 skipped.append(f"{label}（{e}）")
                 continue
             stem = os.path.splitext(label)[0]
             sec_label = " / ".join(s["label"] for s in series
                                    if s.get("axis") == "secondary")
-            xlab = self.xlabel_edit.text() or (
-                str(df.columns[0]) if self._use_leftmost_x() else x_name)
+            if self.xlabel_edit.text():
+                xlab = self.xlabel_edit.text()
+            elif self._use_leftmost_x():
+                xlab = str(df.columns[0])
+            elif len(x_names) > 1 and x_names[0] is not None:
+                xlab = " / ".join(str(c) for c in x_names)   # 複数XはX名を連結
+            else:
+                xlab = x_name
             base = self._safe_filename(stem)
             name, k = base, 2
             while name in used:

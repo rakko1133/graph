@@ -24,6 +24,9 @@ class PlotMixin:
         self._sync_3d_checkbox(info)     # 『3D表示』チェックの有効/固定を種別に合わせる
         self._update_x_combo_enabled()
         self._update_z_combo_enabled()   # Z軸コンボは3D表示中のみ有効
+        self._update_x_multi_enabled()   # 複数X は 2D xy 種別のみ
+        if hasattr(self, "swap_xy_check"):
+            self.swap_xy_check.setEnabled(ctype in plotter._SWAP_TYPES)
         uses_bins = ctype in ("ヒストグラム", "2Dヒストグラム", "hexbin")
         self.bins_spin.setEnabled(uses_bins)
         self.bins_caption.setEnabled(uses_bins)
@@ -54,8 +57,14 @@ class PlotMixin:
         """『3D表示』チェックの切替: Z軸・視点角度の有効状態を更新して再描画する。"""
         want3d = self._want_3d()
         self._update_z_combo_enabled()
+        self._update_x_multi_enabled()   # 3D中は複数X不可
         if hasattr(self, "elev_spin"):
             self.elev_spin.setEnabled(want3d); self.azim_spin.setEnabled(want3d)
+        self._request_redraw()
+
+    def _on_multix_toggled(self, *_):
+        """『X軸を複数選択』の切替: 複数XリストのON/OFFを更新して再描画する。"""
+        self._update_x_multi_enabled()
         self._request_redraw()
 
     def _build_series(self, chart_type):
@@ -95,17 +104,26 @@ class PlotMixin:
                                "style": self.series_styles.get(self._style_key(fl, col))})
         elif chart_type in ("折れ線", "散布図", "面", "積み上げ面",
                             "ステップ", "ステム", "2Dヒストグラム", "hexbin"):
+            xcols = self._selected_x_columns()          # 複数Xなら各Xごとに系列を作る
+            multi_x = len(xcols) > 1
             for fl, col, disp in items:
                 df = self.datasets[fl]
-                xv = self._x_values(df)
                 stmap = self.series_styles.get(self._style_key(fl, col)) or {}
                 errcol = stmap.get("errcol")
                 yerr = df[errcol].to_numpy() if (errcol and errcol in df.columns) else None
-                series.append({"label": self._series_label(fl, col), "x": xv, "y": df[col].to_numpy(),
-                               "style": stmap,
-                               "axis": stmap.get("axis", "primary"),
-                               "kind": stmap.get("kind", ""),
-                               "yerr": yerr})
+                for xname_i in xcols:
+                    lab = self._series_label(fl, col)
+                    st_i = stmap
+                    if multi_x:                          # どのXかを凡例に付ける
+                        xdisp = str(df.columns[0]) if xname_i is None else xname_i
+                        lab = f"{lab} [X:{xdisp}]"
+                        if stmap.get("color"):           # 変種ごとに色を分ける（自動色に）
+                            st_i = dict(stmap); st_i.pop("color", None)
+                    series.append({"label": lab, "x": self._x_values(df, xname_i),
+                                   "y": df[col].to_numpy(), "style": st_i,
+                                   "axis": st_i.get("axis", "primary"),
+                                   "kind": st_i.get("kind", ""),
+                                   "yerr": yerr})
         else:  # ヒストグラム / 箱ひげ
             for fl, col, disp in items:
                 series.append({"label": self._series_label(fl, col), "y": self.datasets[fl][col].to_numpy(),
@@ -248,6 +266,8 @@ class PlotMixin:
             frame_width=self.frame_width.value(),
             xinvert=self.xinvert_check.isChecked(),
             yinvert=self.yinvert_check.isChecked(),
+            swap_xy=(self.swap_xy_check.isChecked()
+                     if hasattr(self, "swap_xy_check") else False),
         )
 
     def draw_graph(self):
@@ -290,11 +310,15 @@ class PlotMixin:
         self._cursors = []; self._cursor_drag = None; self._cursor_text = None
         try:
             series, categories = self._build_series(ctype)
+            swap_on = (getattr(self, "swap_xy_check", None) and self.swap_xy_check.isChecked()
+                       and ctype in plotter._SWAP_TYPES)
+            # 入れ替え中は、その列が乗る軸名でメッセージを出す（元Yは横軸へ）
+            yn, xn = ("X", "Y") if swap_on else ("Y", "X")
             if self.ylog.isChecked() and self._has_nonpositive([s["y"] for s in series]):
-                issues.append("Y対数: 0以下の値は表示されません")
+                issues.append(f"{yn}対数: 0以下の値は表示されません")
             if (self.xlog.isChecked() and ctype in ("折れ線", "散布図")
                     and self._has_nonpositive([s.get("x") for s in series])):
-                issues.append("X対数: 0以下の値は表示されません")
+                issues.append(f"{xn}対数: 0以下の値は表示されません")
 
             # 大容量データの間引き（折れ線/散布図のみ）
             total = sum(len(s.get("y", [])) for s in series)
@@ -335,7 +359,8 @@ class PlotMixin:
                 if busy:
                     QtWidgets.QApplication.restoreOverrideCursor()
 
-            if max_points:
+            if max_points and not swap_on:
+                # 入れ替え中は series が転置前のためズーム再サンプルが不整合になる。無効化。
                 self._setup_dynamic_resample(series, ctype, max_points)
             self._rebuild_series_bar(ctype)   # グラフ上部の系列選択バー
             # カーソル追従用に、実際に描画されたデータ線を保持（近似曲線は除く）
@@ -399,9 +424,17 @@ class PlotMixin:
             return
         if ctype not in ("折れ線", "散布図") or not series:
             return
+        # X↔Y入れ替え中は座標が転置されるため塗りつぶしは無効（対応が取れない）
+        if getattr(self, "swap_xy_check", None) and self.swap_xy_check.isChecked():
+            self._set_status("塗りつぶし: X↔Y入れ替え中は無効です。")
+            return
         import numpy as np
         import pandas as pd
         items = self._selected_series_items()
+        # 複数X時は系列数(N_x×N_y)と選択数(N_y)がずれ、名前で系列を一意に選べないため無効
+        if len(series) != len(items):
+            self._set_status("塗りつぶし: X軸を複数選択中は無効です。")
+            return
         dispmap = {it[2]: s for it, s in zip(items, series)}
         a = dispmap.get(self.fill_a.currentText())
         if a is None or a.get("x") is None:
