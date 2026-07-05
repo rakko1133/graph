@@ -39,6 +39,7 @@ class UIBuildMixin:
         self._menu_action(em, "やり直す", self.redo, "Ctrl+Y", tip="戻した変更をやり直す")
         # 表示
         vm = m.addMenu("表示(&V)")
+        self.view_menu = vm   # パネルの表示/非表示トグルを _build_central で追加する
         self._menu_action(vm, "グラフを描画", self.draw_graph, "F5")
         self._menu_action(vm, "全データに合わせる（オートスケール）", self.auto_scale_scope, None)
         # 解析
@@ -88,24 +89,34 @@ class UIBuildMixin:
         act("やり直す", self.redo, "戻した変更をやり直す（Ctrl+Y）", SP.SP_ArrowForward)
 
     def _build_central(self):
-        central = QtWidgets.QWidget()
-        self.setCentralWidget(central)
-        outer = QtWidgets.QHBoxLayout(central)
-        outer.setContentsMargins(6, 6, 6, 6)
+        # 中央＝グラフ＋データ編集。周囲のパネルはすべてドックウィジェット：
+        # 既定は従来どおり「左にタブ4枚・右に書式」だが、タブ（タイトル部）を
+        # ドラッグすると独立ウィンドウとして切り離せる。閉じたパネルは
+        # 「表示」メニューから再表示でき、配置はリセットも可能。
+        self.setDockOptions(
+            QtWidgets.QMainWindow.DockOption.AnimatedDocks
+            | QtWidgets.QMainWindow.DockOption.AllowTabbedDocks
+            | QtWidgets.QMainWindow.DockOption.AllowNestedDocks)
+        self.setTabPosition(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea,
+                            QtWidgets.QTabWidget.TabPosition.North)
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        self.main_splitter = splitter
-        outer.addWidget(splitter)
-
-        # 左：入力・解析タブ（データ読込 / オシロ / 高度解析）
-        tabs = QtWidgets.QTabWidget()
-        self.tabs = tabs
-        tabs.setMinimumWidth(220)   # 下限を下げ、境界線ドラッグで幅を広く/狭くしやすく
-        tabs.addTab(self._build_tab_data(), "1. データ")
-        tabs.addTab(self._build_tab_scope(), "2. オシロ/解析")
-        tabs.addTab(self._build_tab_advanced(), "3. 高度解析")
-        tabs.addTab(self._build_tab_datasci(), "4. 統計解析")
-        splitter.addWidget(tabs)
+        # 左：入力・解析パネル（データ読込 / オシロ / 高度解析 / 統計解析）
+        left = QtCore.Qt.DockWidgetArea.LeftDockWidgetArea
+        self.left_docks = []
+        for key, title, builder in (
+                ("data", "1. データ", self._build_tab_data),
+                ("scope", "2. オシロ/解析", self._build_tab_scope),
+                ("advanced", "3. 高度解析", self._build_tab_advanced),
+                ("datasci", "4. 統計解析", self._build_tab_datasci)):
+            dock = QtWidgets.QDockWidget(title, self)
+            dock.setObjectName("dock_" + key)   # saveState に必須
+            w = builder()
+            w.setMinimumWidth(220)   # 下限を下げ、境界線ドラッグで幅を調整しやすく
+            dock.setWidget(w)
+            self.addDockWidget(left, dock)
+            self.left_docks.append(dock)
+        for d in self.left_docks[1:]:           # 既定はタブ化（従来の見た目）
+            self.tabifyDockWidget(self.left_docks[0], d)
 
         # 中央：グラフ表示＋データ編集
         center = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
@@ -114,18 +125,101 @@ class UIBuildMixin:
         center.addWidget(self._build_preview())
         center.setStretchFactor(0, 4)
         center.setStretchFactor(1, 1)
-        splitter.addWidget(center)
+        self.setCentralWidget(center)
 
         # 右端：グラフ書式調整パネル（書式コントロール＋系列スタイル表）
-        splitter.addWidget(self._build_format_panel())
+        fdock = QtWidgets.QDockWidget("グラフ書式調整", self)
+        fdock.setObjectName("dock_format")
+        fdock.setWidget(self._build_format_panel())
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, fdock)
+        self.format_dock = fdock
 
-        splitter.setStretchFactor(0, 0)   # 左タブ：固定気味
-        splitter.setStretchFactor(1, 1)   # 中央グラフ：伸びる
-        splitter.setStretchFactor(2, 0)   # 右書式：固定気味
-        splitter.setSizes([360, 680, 400])
+        self.left_docks[0].raise_()   # 既定は「1. データ」を前面に
+        # 幅の初期値（旧レイアウトの 左360 / 右400 相当）
+        self.resizeDocks([self.left_docks[0]], [360], QtCore.Qt.Orientation.Horizontal)
+        self.resizeDocks([fdock], [400], QtCore.Qt.Orientation.Horizontal)
+
+        # 表示メニューへ各パネルの表示/非表示と配置リセットを追加
+        vm = self.view_menu
+        vm.addSeparator()
+        for d in [*self.left_docks, fdock]:
+            act = d.toggleViewAction()
+            act.setStatusTip(f"{d.windowTitle()} パネルの表示/非表示")
+            vm.addAction(act)
+        # ドラッグ以外の明示的な切り離し手段（チェック=別ウィンドウ、外す=元に戻す）
+        vm.addSeparator()
+        float_menu = vm.addMenu("別ウィンドウで表示（切り離し）")
+        self._float_actions = {}
+        for d in [*self.left_docks, fdock]:
+            a = QtGui.QAction(d.windowTitle(), self)
+            a.setCheckable(True)
+            a.setStatusTip(f"{d.windowTitle()} を独立ウィンドウとして切り離す／チェックを外すと元の位置へ戻す")
+            a.toggled.connect(lambda on, dd=d: self._set_dock_floating(dd, on))
+            d.topLevelChanged.connect(lambda floating, aa=a: self._sync_float_action(aa, floating))
+            # ドックの移動でタブバーが作り直されることがあるため、そのたびに配線し直す
+            d.topLevelChanged.connect(self._wire_dock_tabbars)
+            d.dockLocationChanged.connect(self._wire_dock_tabbars)
+            float_menu.addAction(a)
+            self._float_actions[d.objectName()] = a
+        vm.addSeparator()
+        self._menu_action(vm, "パネル配置をリセット", self._reset_panel_layout,
+                          tip="パネルのドッキング配置・表示状態を初期状態に戻す")
+        self._default_window_state = self.saveState()   # リセット用に既定配置を記憶
+        self._wire_dock_tabbars()   # タブのダブルクリック=切り離し
 
         self._wire_live_signals()
         self._add_tooltips()
+
+    def _set_dock_floating(self, dock, on):
+        """メニューからの切り離し/復帰。非表示なら表示してから切り替える。"""
+        if dock.isFloating() == bool(on):
+            return
+        dock.setVisible(True)
+        dock.setFloating(bool(on))
+        if on:
+            dock.raise_()
+            self._set_status(f"{dock.windowTitle()} を別ウィンドウにしました。"
+                             "（ウィンドウのタイトルをダブルクリックすると元に戻ります）")
+
+    @staticmethod
+    def _sync_float_action(action, floating):
+        """ドラッグ等での切り離し/復帰をメニューのチェックへ反映する。"""
+        action.blockSignals(True)
+        action.setChecked(bool(floating))
+        action.blockSignals(False)
+
+    def _wire_dock_tabbars(self, *_):
+        """ドックのタブバーに『ダブルクリック=切り離し』を配線する。
+
+        タブバーは Qt がドックのタブ化時に動的に作るため、ドックの移動のたびに
+        呼ばれ、未配線のタブバーだけを接続する（多重接続防止にプロパティ印）。"""
+        for tb in self.findChildren(QtWidgets.QTabBar):
+            if tb.parent() is not self or tb.property("_dock_dbl"):
+                continue
+            tb.setProperty("_dock_dbl", True)
+            tb.setToolTip("ドラッグ=パネルの移動・切り離し／ダブルクリック=別ウィンドウ化")
+            tb.tabBarDoubleClicked.connect(
+                lambda i, bar=tb: self._float_dock_by_tab(bar, i))
+
+    def _float_dock_by_tab(self, bar, index):
+        title = bar.tabText(index)
+        for d in [*self.left_docks, self.format_dock]:
+            if d.windowTitle() == title:
+                d.setFloating(True)
+                d.raise_()
+                self._set_status(f"{title} を別ウィンドウにしました。"
+                                 "（ウィンドウのタイトルをダブルクリックすると元に戻ります）")
+                return
+
+    def _reset_panel_layout(self):
+        """ドッキングパネルの配置・表示状態を初期状態に戻す。"""
+        if getattr(self, "_default_window_state", None) is not None:
+            self.restoreState(self._default_window_state)
+        for d in [*self.left_docks, self.format_dock]:
+            d.setFloating(False)
+            d.setVisible(True)
+        self.left_docks[0].raise_()
+        self._set_status("パネル配置を初期状態に戻しました。")
 
     # ---- データタブ ----
     def _build_tab_data(self):
@@ -134,30 +228,50 @@ class UIBuildMixin:
         vsplit = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         outer.addWidget(vsplit)
 
-        # === 上段：読み込み済みファイル一覧（縦幅は下の境界線ドラッグで調整可）===
+        # === 上段：読み込み済みファイル（VS Code風エクスプローラー：ファイル→列ツリー）===
         top = QtWidgets.QWidget(); tv = QtWidgets.QVBoxLayout(top)
         tv.setContentsMargins(2, 2, 2, 2)
-        tv.addWidget(self._bold("読み込み済みファイル"))
-        hint = QtWidgets.QLabel("ファイルを追加（ここにドラッグ&ドロップも可）→ X/Y を選び「グラフを描画」")
+        tv.addWidget(self._bold("読み込み済みファイル（▶で列を展開）"))
+        hint = QtWidgets.QLabel("ファイルを追加（ここにドラッグ&ドロップも可）→ "
+                                "描きたい列（Y軸）をチェック →「グラフを描画」")
         hint.setWordWrap(True); hint.setStyleSheet("color:#666;")
         tv.addWidget(hint)
+        # 旧ファイル一覧は非表示のまま「選択・削除・プレビューの土台」として保持する。
+        # 下のツリーと双方向同期するので、既存の機能（複数選択削除・再読込・設定
+        # 復元・テスト）はそのまま動く。レイアウトには追加しない。
         self.file_list = QtWidgets.QListWidget()
-        self.file_list.setMinimumHeight(60)   # 下限。下の境界線ドラッグで縦幅を自由に変更
-        self.file_list.setToolTip("読み込んだファイル一覧。選択するとプレビューを表示します。\n"
-                                  "長い名前は横スクロール／ホバーで全体を表示。\n"
-                                  "縦幅は下の境界線、横幅は左パネルとグラフの境界線をドラッグで変えられます。")
-        # 長いファイル名を省略せず表示し、横スクロールで全体を読めるようにする
-        self.file_list.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
-        self.file_list.setWordWrap(False)
-        self.file_list.setHorizontalScrollMode(
-            QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.file_list.setHorizontalScrollBarPolicy(
-            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        # 複数選択可（Ctrl/Shift＋クリック）。選択したものをまとめて削除できる
+        self.file_list.setVisible(False)
         self.file_list.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.file_list.currentRowChanged.connect(self._on_file_selected)
-        tv.addWidget(self.file_list, 1)
+        self.file_list.currentRowChanged.connect(self._sync_explorer_current)
+        # VS Code風ツリー：ファイル行（アイコン＋行数×列数＋フォルダ名）を展開すると
+        # 列（Y系列）がチェックボックス付きで並ぶ。行クリックでチェックがトグル。
+        self._explorer_building = False
+        self.explorer = ExplorerTree()
+        self.explorer.setColumnCount(2)
+        self.explorer.setHeaderHidden(True)
+        self.explorer.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.explorer.setAllColumnsShowFocus(True)
+        self.explorer.setMinimumHeight(120)
+        hdr = self.explorer.header()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.explorer.setToolTip(
+            "読み込んだファイルの一覧。▶で展開すると列（Y系列）が出ます。\n"
+            "列の行クリック=チェックON/OFF／ダブルクリック=その列だけ表示。\n"
+            "ファイルのチェック=全列を一括ON/OFF。右クリックでメニュー\n"
+            "（X軸にする・再読込・削除・エクスプローラーで表示など）。\n"
+            "ファイル行はCtrl/Shift＋クリックで複数選択→「削除」でまとめて削除。")
+        self.explorer.itemChanged.connect(self._on_explorer_item_changed)
+        self.explorer.itemDoubleClicked.connect(self._on_explorer_double_clicked)
+        self.explorer.itemSelectionChanged.connect(self._on_explorer_selection_changed)
+        self.explorer.currentItemChanged.connect(self._on_explorer_current_changed)
+        self.explorer.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.explorer.customContextMenuRequested.connect(self._explorer_menu)
+        tv.addWidget(self.explorer, 1)
 
         row = QtWidgets.QHBoxLayout()
         b_add = QtWidgets.QPushButton("ファイル追加...")
@@ -176,6 +290,23 @@ class UIBuildMixin:
         row_b = QtWidgets.QHBoxLayout()
         row_b.addWidget(b_del); row_b.addWidget(b_clear)
         tv.addLayout(row_b)
+        # 名前で選択（入力した名前を含む系列だけをチェックし、他は解除）
+        yf = QtWidgets.QHBoxLayout()
+        self.y_filter = QtWidgets.QLineEdit()
+        self.y_filter.setPlaceholderText("名前で選択（例: 電圧）")
+        self.y_filter.setToolTip("入力した名前を含む列（系列）だけを選択します（他は解除）。Enter でも実行。\n"
+                                 "複数ファイルで同じ列名だけ選びたいときに便利です。")
+        self.y_filter.returnPressed.connect(self.select_by_name)
+        b_yf = QtWidgets.QPushButton("名前で選択"); b_yf.clicked.connect(self.select_by_name)
+        yf.addWidget(self.y_filter, 1); yf.addWidget(b_yf)
+        tv.addLayout(yf)
+        ybtns = QtWidgets.QHBoxLayout()
+        for text, fn in (("全選択", lambda: self._check_all_y(True)),
+                         ("全解除", lambda: self._check_all_y(False)),
+                         ("反転", self._invert_y)):
+            btn = QtWidgets.QPushButton(text); btn.clicked.connect(fn)
+            ybtns.addWidget(btn)
+        tv.addLayout(ybtns)
         vsplit.addWidget(top)
 
         # === 下段：読み込み設定・X/Y選択・描画 ===
@@ -247,36 +378,12 @@ class UIBuildMixin:
         self.z_combo.setEnabled(False)
         v.addWidget(self.z_combo)
 
-        ylab = QtWidgets.QLabel("Y軸（値）※チェックした系列を描画（行クリックでON/OFF）")
-        ylab.setWordWrap(True)
-        v.addWidget(ylab)
+        # 旧Yリストは非表示の「選択モデル」として保持（上のツリー・系列バー・
+        # 設定復元・テストが (ファイル, 列) 単位でここを読む）。レイアウトには足さない。
         self.y_list = CheckListWidget()
-        self.y_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
-        self.y_list.setToolTip("描画したい系列にチェック。ダブルクリック=その系列だけ表示／"
-                               "右クリック=表示メニュー（この系列だけ／非表示／すべて表示）")
-        self.y_list.setStyleSheet("QListWidget::indicator { width:16px; height:16px; }")
+        self.y_list.setVisible(False)
         self.y_list.itemChanged.connect(self._on_y_check_changed)
         self.y_list.itemDoubleClicked.connect(self._on_y_double_clicked)
-        self.y_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.y_list.customContextMenuRequested.connect(self._y_list_menu)
-        v.addWidget(self.y_list, 1)
-        # 名前で選択（入力した名前を含む系列だけをチェックし、他は解除）
-        yf = QtWidgets.QHBoxLayout()
-        self.y_filter = QtWidgets.QLineEdit()
-        self.y_filter.setPlaceholderText("名前で選択（例: 電圧）")
-        self.y_filter.setToolTip("入力した名前を含む系列だけを選択します（他は解除）。Enter でも実行。\n"
-                                 "複数ファイルで同じ列名だけ選びたいときに便利です。")
-        self.y_filter.returnPressed.connect(self.select_by_name)
-        b_yf = QtWidgets.QPushButton("名前で選択"); b_yf.clicked.connect(self.select_by_name)
-        yf.addWidget(self.y_filter, 1); yf.addWidget(b_yf)
-        v.addLayout(yf)
-        ybtns = QtWidgets.QHBoxLayout()
-        for text, fn in (("全選択", lambda: self._check_all_y(True)),
-                         ("全解除", lambda: self._check_all_y(False)),
-                         ("反転", self._invert_y)):
-            btn = QtWidgets.QPushButton(text); btn.clicked.connect(fn)
-            ybtns.addWidget(btn)
-        v.addLayout(ybtns)
 
         # リアルタイム更新 / 間引き / 描画ボタン（データタブからも描けるように）
         self.live_check = QtWidgets.QCheckBox("リアルタイム更新（変更を即反映）")
@@ -300,10 +407,248 @@ class UIBuildMixin:
         drow.addWidget(b_draw, 2); drow.addWidget(b_batch2, 1)
         v.addLayout(drow)
         vsplit.addWidget(bottom)
-        vsplit.setStretchFactor(0, 0)
-        vsplit.setStretchFactor(1, 1)
-        vsplit.setSizes([140, 520])
+        self.data_splitter = vsplit
+        vsplit.setStretchFactor(0, 1)   # 上のツリーが主役として伸びる
+        vsplit.setStretchFactor(1, 0)
+        vsplit.setSizes([380, 320])
         return w
+
+    # ---- VS Code風エクスプローラー（ファイル → 列ツリー）----
+    # 真実の源は従来どおり file_list / y_list（非表示）。ツリーは表示と操作の
+    # 入り口で、変更は必ず y_list / file_list を経由して既存パイプラインに流す。
+    def _find_y_item(self, fl, col):
+        for i in range(self.y_list.count()):
+            it = self.y_list.item(i)
+            if it.data(UserRole) == (fl, col):
+                return it
+        return None
+
+    def _rebuild_explorer(self):
+        """ツリーの構造（ファイル→列）を file_list / y_list から作り直す。
+        チェック・色・現在ファイルは最後に _sync_explorer_* で確定する。"""
+        if not hasattr(self, "explorer"):
+            return
+        tree = self.explorer
+        collapsed = set()   # 既定は展開。ユーザーが畳んだファイルだけ覚えて維持する
+        for i in range(tree.topLevelItemCount()):
+            node = tree.topLevelItem(i)
+            if not node.isExpanded():
+                collapsed.add(node.data(0, UserRole)[1])
+        self._explorer_building = True
+        tree.blockSignals(True)
+        tree.clear()
+        by_file = {}
+        for i in range(self.y_list.count()):
+            it = self.y_list.item(i)
+            fl, _c = it.data(UserRole)
+            by_file.setdefault(fl, []).append(it)
+        ficon = self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileIcon)
+        gray = QtGui.QBrush(QtGui.QColor("#808080"))
+        flags_file = (QtCore.Qt.ItemFlag.ItemIsEnabled
+                      | QtCore.Qt.ItemFlag.ItemIsSelectable
+                      | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+        # 列は選択不可（ファイル削除の対象にならない）。クリック＝チェックのトグル
+        flags_col = (QtCore.Qt.ItemFlag.ItemIsEnabled
+                     | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+        for row in range(self.file_list.count()):
+            label = self.file_list.item(row).text()
+            df = self.datasets.get(label)
+            path = self.meta.get(label, {}).get("path", "")
+            node = QtWidgets.QTreeWidgetItem([label, ""])
+            node.setData(0, UserRole, ("file", label))
+            node.setIcon(0, ficon)
+            node.setFlags(flags_file)
+            node.setCheckState(0, QtCore.Qt.CheckState.Unchecked)
+            info = f"{len(df):,}×{len(df.columns)}" if df is not None else ""
+            folder = os.path.basename(os.path.dirname(path)) if path else ""
+            node.setText(1, f"{info}  {folder}".strip())
+            node.setForeground(1, gray)
+            tip = (path or label) + (f"\n{info.replace('×', ' 行 × ')} 列" if info else "")
+            node.setToolTip(0, tip); node.setToolTip(1, tip)
+            for yit in by_file.get(label, []):
+                _fl, col = yit.data(UserRole)
+                child = QtWidgets.QTreeWidgetItem([str(col), ""])
+                child.setData(0, UserRole, ("col", label, col))
+                child.setFlags(flags_col)
+                child.setCheckState(0, yit.checkState())
+                child.setToolTip(0, "クリック=チェックON/OFF／ダブルクリック=この列だけ表示／"
+                                    "右クリック=表示・X軸メニュー")
+                node.addChild(child)
+            tree.addTopLevelItem(node)
+            node.setExpanded(label not in collapsed)
+        tree.blockSignals(False)
+        self._explorer_building = False
+        self._sync_explorer_checks()
+        self._sync_explorer_current()
+        # 再構築でツリーの選択は消えている。非表示 file_list に古い複数選択が
+        # 残ると「削除」が見えないファイルを巻き添えにするため、必ず映し直す。
+        self._on_explorer_selection_changed()
+
+    def _sync_explorer_checks(self):
+        """y_list のチェック状態と系列色をツリーへ反映する（y_list が真実の源）。"""
+        if not hasattr(self, "explorer") or getattr(self, "_explorer_building", False):
+            return
+        self._explorer_building = True
+        try:
+            ymap = {}
+            for i in range(self.y_list.count()):
+                it = self.y_list.item(i)
+                ymap[it.data(UserRole)] = it
+            ck = QtCore.Qt.CheckState.Checked
+            for i in range(self.explorer.topLevelItemCount()):
+                node = self.explorer.topLevelItem(i)
+                n_ck = 0
+                for j in range(node.childCount()):
+                    child = node.child(j)
+                    _k, fl, col = child.data(0, UserRole)
+                    yit = ymap.get((fl, col))
+                    if yit is None:
+                        continue
+                    checked = yit.checkState() == ck
+                    child.setCheckState(0, ck if checked
+                                        else QtCore.Qt.CheckState.Unchecked)
+                    n_ck += checked
+                    st = self.series_styles.get(self._style_key(fl, col)) or {}
+                    color = st.get("color") if checked else None
+                    child.setForeground(0, QtGui.QBrush(QtGui.QColor(color)) if color
+                                        else QtGui.QBrush())
+                    f = child.font(0); f.setBold(checked); child.setFont(0, f)
+                total = node.childCount()
+                node.setCheckState(0, ck if (total and n_ck == total)
+                                   else (QtCore.Qt.CheckState.PartiallyChecked if n_ck
+                                         else QtCore.Qt.CheckState.Unchecked))
+        finally:
+            self._explorer_building = False
+
+    def _sync_explorer_current(self, *_):
+        """file_list の現在ファイルをツリーのハイライトに反映する。"""
+        if not hasattr(self, "explorer") or getattr(self, "_explorer_building", False):
+            return
+        it = self.file_list.currentItem()
+        label = it.text() if it else None
+        self._explorer_building = True
+        try:
+            for i in range(self.explorer.topLevelItemCount()):
+                node = self.explorer.topLevelItem(i)
+                if node.data(0, UserRole)[1] == label:
+                    if self.explorer.currentItem() is not node:
+                        self.explorer.setCurrentItem(node)
+                    break
+        finally:
+            self._explorer_building = False
+
+    def _on_explorer_item_changed(self, item, column):
+        """ツリーのチェック操作を y_list へ流す（列=1系列／ファイル=全列一括）。"""
+        if getattr(self, "_explorer_building", False) or column != 0:
+            return
+        data = item.data(0, UserRole)
+        if not data:
+            return
+        if data[0] == "col":
+            _k, fl, col = data
+            yit = self._find_y_item(fl, col)
+            if yit is not None and yit.checkState() != item.checkState(0):
+                yit.setCheckState(item.checkState(0))   # → 既存の再描画・同期パイプへ
+        else:   # ファイル行のチェック＝配下の列を一括ON/OFF（他ファイルは維持）
+            label = data[1]
+            on = item.checkState(0) == QtCore.Qt.CheckState.Checked
+            ck = QtCore.Qt.CheckState.Checked
+            self._set_all_checks(lambda it: on if it.data(UserRole)[0] == label
+                                 else it.checkState() == ck)
+
+    def _on_explorer_double_clicked(self, item, _column):
+        """列のダブルクリック＝その列だけ表示（旧Yリストと同じ）。"""
+        data = item.data(0, UserRole)
+        if data and data[0] == "col":
+            yit = self._find_y_item(data[1], data[2])
+            if yit is not None:
+                self._on_y_double_clicked(yit)
+
+    def _on_explorer_selection_changed(self):
+        """ツリーで選択したファイルを file_list の選択へ反映（複数選択削除用）。"""
+        if getattr(self, "_explorer_building", False):
+            return
+        labels = {it.data(0, UserRole)[1] for it in self.explorer.selectedItems()
+                  if (it.data(0, UserRole) or ("",))[0] == "file"}
+        self._explorer_building = True
+        try:
+            for i in range(self.file_list.count()):
+                it = self.file_list.item(i)
+                it.setSelected(it.text() in labels)
+        finally:
+            self._explorer_building = False
+
+    def _on_explorer_current_changed(self, current, _previous):
+        """ツリーの現在ファイルを file_list に反映 → プレビューが追従する。"""
+        if getattr(self, "_explorer_building", False) or current is None:
+            return
+        data = current.data(0, UserRole)
+        if not data or data[0] != "file":
+            return
+        it = self._find_file_item(data[1])
+        if it is not None:
+            row = self.file_list.row(it)
+            if row != self.file_list.currentRow():
+                self.file_list.setCurrentRow(row)
+
+    def _explorer_menu(self, pos):
+        item = self.explorer.itemAt(pos)
+        if item is None:
+            return
+        gpos = self.explorer.viewport().mapToGlobal(pos)
+        data = item.data(0, UserRole)
+        if not data:
+            return
+        if data and data[0] == "col":
+            _k, fl, col = data
+            menu = self._series_menu(self._find_y_item(fl, col))
+            menu.addSeparator()
+            menu.addAction("この列をX軸にする", lambda: self._set_x_from_tree(col))
+            menu.exec(gpos)
+            return
+        label = data[1]
+        path = self.meta.get(label, {}).get("path", "")
+        menu = QtWidgets.QMenu(self)
+        menu.addAction("全列をチェック", lambda: self._check_file_cols(label, True))
+        menu.addAction("全列を解除", lambda: self._check_file_cols(label, False))
+        menu.addSeparator()
+        menu.addAction("再読込", lambda: self._reload_label(label))
+        menu.addAction("削除", lambda: (self._remove_labels([label]),
+                                        self._set_status(f"{label} を削除しました。")))
+        if path and os.path.isfile(path):
+            menu.addSeparator()
+            menu.addAction("エクスプローラーで表示", lambda: self._reveal_in_explorer(path))
+            menu.addAction("パスをコピー",
+                           lambda: QtWidgets.QApplication.clipboard().setText(path))
+        menu.exec(gpos)
+
+    def _check_file_cols(self, label, on):
+        ck = QtCore.Qt.CheckState.Checked
+        self._set_all_checks(lambda it: on if it.data(UserRole)[0] == label
+                             else it.checkState() == ck)
+        self._maybe_draw()
+
+    def _reload_label(self, label):
+        it = self._find_file_item(label)
+        if it is not None:
+            self.file_list.setCurrentRow(self.file_list.row(it))
+            self.reload_current()
+
+    def _set_x_from_tree(self, col):
+        if self._use_leftmost_x():
+            self._set_status("『一番左の列をX軸にする』がONのため、X軸は先頭列固定です。")
+            return
+        i = self.x_combo.findText(str(col))
+        if i >= 0:
+            self.x_combo.setCurrentIndex(i)
+            self._set_status(f"X軸を「{col}」にしました。")
+
+    def _reveal_in_explorer(self, path):
+        import subprocess
+        try:
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        except OSError:
+            self._set_status("エクスプローラーを開けませんでした。")
 
     # ---- 右側：グラフ書式調整パネル ----
     def _build_style_box(self):
@@ -994,6 +1339,7 @@ class UIBuildMixin:
         利用可能な全Y系列をチェックボックスで表示し、ここでON/OFFすると左の
         Y軸選択と同期して描画される。左でチェックしなくても、データを読み込めば
         上のバーに系列が並ぶ（＝上のバーだけで系列を選べる）。"""
+        self._sync_explorer_checks()   # 左のツリーもここで色・チェックを同期
         chart_type = chart_type or self.chart_combo.currentText()
         lay = self.series_bar_layout
         while lay.count():

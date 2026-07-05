@@ -53,7 +53,8 @@ def _wave():
 # ---------------- スモーク（GUI が壊れていないか）----------------
 def test_construct():
     w = _make_app(_wave())
-    assert w.tabs.count() == 4
+    assert len(w.left_docks) == 4          # データ/オシロ/高度解析/統計解析 のドック
+    assert w.format_dock is not None       # 右端の書式パネル
     assert hasattr(w, "ax")
 
 
@@ -378,6 +379,36 @@ def test_fill_between():
     assert any(isinstance(c, PolyCollection) for c in w.ax.collections)
     w.fill_b.setCurrentText("0（X軸）"); w.draw_graph()
     assert any(isinstance(c, PolyCollection) for c in w.ax.collections)
+
+
+def test_explorer_tree_sync():
+    """ファイル→列ツリーが y_list / file_list と双方向同期すること。"""
+    ck, un = QtCore.Qt.CheckState.Checked, QtCore.Qt.CheckState.Unchecked
+    w = _make_app(_wave())   # 電圧・電流がチェック済み（時間=X軸列は未チェック）
+    tree = w.explorer
+    assert tree.topLevelItemCount() == 1
+    node = tree.topLevelItem(0)
+    assert node.childCount() == w.y_list.count() == 3
+    assert node.checkState(0) == QtCore.Qt.CheckState.PartiallyChecked   # 2/3列ON
+    # y_list → ツリー（電圧をOFF）
+    idx = next(i for i in range(w.y_list.count())
+               if w.y_list.item(i).data(graph_app.UserRole)[1] == "電圧")
+    w.y_list.item(idx).setCheckState(un)
+    assert node.child(idx).checkState(0) == un
+    # ツリー → y_list（電圧をON）
+    node.child(idx).setCheckState(0, ck)
+    assert w.y_list.item(idx).checkState() == ck
+    # ファイル行のチェック＝全列一括
+    node.setCheckState(0, un)
+    assert not w._selected_series_items()
+    node.setCheckState(0, ck)
+    assert len(w._selected_series_items()) == 3
+    assert node.checkState(0) == ck
+    # 現在ファイルの同期（file_list → ツリー）
+    assert tree.currentItem() is node
+    # ファイル削除でツリーも空になる
+    w._remove_labels(["t.csv"])
+    assert tree.topLevelItemCount() == 0
 
 
 def test_undo_redo():

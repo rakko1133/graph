@@ -8,11 +8,16 @@ class PersistenceMixin:
         QtWidgets.QMessageBox.information(
             self, "使い方",
             "【基本の流れ】\n"
-            "1. 『データ』タブで「ファイル追加」（ドラッグ&ドロップ可）\n"
-            "2. X軸の列を選び、Y軸（値）は描きたい系列にチェック（行クリックでON/OFF・全選択ボタンあり）\n"
+            "1. 『データ』パネルで「ファイル追加」（ドラッグ&ドロップ可）\n"
+            "2. ツリーでファイルを展開し、描きたい列（Y軸）にチェック（行クリックでON/OFF・\n"
+            "   ダブルクリック=その列だけ表示・右クリックでメニュー）。X軸の列は下のコンボで選択\n"
             "3. 「グラフを描画」(F5)。『リアルタイム更新』ONなら設定変更が即反映\n"
             "4. 右端の『グラフ書式調整』パネルで種別・色・軸範囲・系列スタイルなどを編集\n"
             "   （項目は見出しクリックで開閉できます。開閉状態・ウィンドウ配置は次回起動時に復元）\n"
+            "※ パネルの切り離し（別ウィンドウ化）は3通り:\n"
+            "   ①タブをダブルクリック ②タブを外へドラッグ ③表示メニュー「別ウィンドウで表示」\n"
+            "   元に戻す: ウィンドウのタイトルをダブルクリック／メニューのチェックを外す／枠へドラッグ\n"
+            "   ✕で閉じたパネルは表示メニューで再表示。「パネル配置をリセット」で全部初期位置へ\n"
             "5. 波形は『オシロ/解析』タブで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
             "【出力】右端パネルの画像出力、またはメニュー「ファイル」から保存／コピー\n"
             "【グラフ種別と列】棒/円は1ファイル、折れ線/散布図は複数ファイル重ね描き可")
@@ -35,19 +40,30 @@ class PersistenceMixin:
         geo = s.value("ui/geometry")
         if geo is not None:
             self.restoreGeometry(geo)
-        for key, sp in (("ui/main_splitter", getattr(self, "main_splitter", None)),
-                        ("ui/center_splitter", getattr(self, "center_splitter", None)),
-                        ("ui/format_splitter", getattr(self, "format_splitter", None))):
+        ws = s.value("ui/window_state")   # ドック配置・ツールバー位置
+        if ws is not None:
+            self.restoreState(ws)
+        for key, sp in (("ui/center_splitter", getattr(self, "center_splitter", None)),
+                        ("ui/format_splitter", getattr(self, "format_splitter", None)),
+                        ("ui/data_splitter", getattr(self, "data_splitter", None))):
             st = s.value(key)
             if st is not None and sp is not None:
                 sp.restoreState(st)
+        # 復元した切り離し状態をメニューのチェックへ反映し、タブバーも配線し直す
+        if hasattr(self, "_float_actions"):
+            for d in [*self.left_docks, self.format_dock]:
+                a = self._float_actions.get(d.objectName())
+                if a is not None:
+                    self._sync_float_action(a, d.isFloating())
+            self._wire_dock_tabbars()
 
     def _save_ui_state(self):
         s = self._ui_settings()
         s.setValue("ui/geometry", self.saveGeometry())
-        for key, sp in (("ui/main_splitter", getattr(self, "main_splitter", None)),
-                        ("ui/center_splitter", getattr(self, "center_splitter", None)),
-                        ("ui/format_splitter", getattr(self, "format_splitter", None))):
+        s.setValue("ui/window_state", self.saveState())   # ドック配置・ツールバー位置
+        for key, sp in (("ui/center_splitter", getattr(self, "center_splitter", None)),
+                        ("ui/format_splitter", getattr(self, "format_splitter", None)),
+                        ("ui/data_splitter", getattr(self, "data_splitter", None))):
             if sp is not None:
                 s.setValue(key, sp.saveState())
         for k, box in getattr(self, "_fmt_sections", {}).items():
@@ -232,6 +248,7 @@ class PersistenceMixin:
         self.xdivs.setValue(sc.get("x_divs", 10)); self.ydivs.setValue(sc.get("y_divs", 8))
         self.npeaks.setValue(cfg.get("npeaks", 5))
         self._rebuild_style_table()
+        self._sync_explorer_checks()   # blockSignals中に復元したY選択をツリーへ反映
         self._on_chart_type_change()
 
     def save_config_dialog(self):

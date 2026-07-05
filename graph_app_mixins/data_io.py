@@ -285,6 +285,8 @@ class DataIOMixin:
                 item.setCheckState(checked if (label, c) in prev else unchecked)
                 self.y_list.addItem(item)
         self.y_list.blockSignals(False)
+        if hasattr(self, "explorer"):
+            self._rebuild_explorer()     # ファイル→列ツリーを作り直す
         self._on_y_selection_changed()   # スタイル表・解析候補をまとめて更新
 
     def _selected_series_items(self):

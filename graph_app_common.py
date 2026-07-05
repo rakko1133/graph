@@ -96,6 +96,45 @@ class LazyColumnCombo(QtWidgets.QComboBox):
             self.blockSignals(False)
         super().showPopup()
 
+class ExplorerTree(QtWidgets.QTreeWidget):
+    """VS Code のエクスプローラー風ツリー（ファイル → 列）。
+
+    チェック可能な子行（列）は行のどこを左クリックしてもチェックがトグルする
+    （CheckListWidget と同じ操作感）。ファイル行（トップレベル）は通常の
+    クリック＝選択・展開。列行かどうかは「親を持つか」で判定する
+    （childCount()==0 だと列ゼロのファイル行まで葉扱いになり選択できなくなる）。
+
+    ダブルクリックは自前で itemDoubleClicked を発火する: mousePressEvent が
+    イベントを消費すると Qt 内部の pressedIndex が更新されず、標準の
+    doubleClicked 判定（pressedIndex == index）が成立しないため。
+    """
+
+    @staticmethod
+    def _is_check_leaf(item):
+        return (item is not None and item.parent() is not None
+                and item.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            item = self.itemAt(event.position().toPoint())
+            if self._is_check_leaf(item):
+                checked = item.checkState(0) == QtCore.Qt.CheckState.Checked
+                item.setCheckState(0, QtCore.Qt.CheckState.Unchecked if checked
+                                   else QtCore.Qt.CheckState.Checked)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            item = self.itemAt(event.position().toPoint())
+            if self._is_check_leaf(item):
+                self.itemDoubleClicked.emit(item, 0)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+
 class CollapsibleBox(QtWidgets.QWidget):
     """見出しクリックで開閉できるセクション。
 
@@ -167,4 +206,5 @@ __all__ = [
     "CheckListWidget",
     "LazyColumnCombo",
     "CollapsibleBox",
+    "ExplorerTree",
 ]
