@@ -18,7 +18,16 @@ class PersistenceMixin:
             "   ①タブをダブルクリック ②タブを外へドラッグ ③表示メニュー「別ウィンドウで表示」\n"
             "   元に戻す: ウィンドウのタイトルをダブルクリック／メニューのチェックを外す／枠へドラッグ\n"
             "   ✕で閉じたパネルは表示メニューで再表示。「パネル配置をリセット」で全部初期位置へ\n"
-            "5. 波形は『オシロ/解析』タブで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
+            "5. 波形は『オシロ/解析』パネルで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
+            "【グラフ上の操作】ホバー=近傍点の値を右下に表示／ホイール=ズーム"
+            "（Shift+ホイール=X方向のみ）／ダブルクリック=全体表示／凡例クリック=系列ON/OFF\n"
+            "【区間測定】『オシロ/解析』の「区間測定」ONでドラッグした区間だけを測定\n"
+            "【結果の持ち出し】各結果表を右クリック→コピー/CSV保存。"
+            "「ファイル→Excelレポート出力」でグラフ+表を1つのExcelブックに\n"
+            "【その他】Ctrl+Shift+P=コマンドパレット（全操作を検索実行）／"
+            "「ファイル→ファイルの変更を監視」=更新されたCSVを自動再読込／\n"
+            "　書式パネル「系列ごとに段を分ける」=サブプロット表示／"
+            "データ編集バーの「編集を戻す/やり直す」\n"
             "【出力】右端パネルの画像出力、またはメニュー「ファイル」から保存／コピー\n"
             "【グラフ種別と列】棒/円は1ファイル、折れ線/散布図は複数ファイル重ね描き可")
 
@@ -49,6 +58,8 @@ class PersistenceMixin:
             st = s.value(key)
             if st is not None and sp is not None:
                 sp.restoreState(st)
+        if str(s.value("ui/watch_files")) in ("1", "true", "True"):
+            self._watch_action.setChecked(True)   # → toggle_file_watch で監視開始
         # 復元した切り離し状態をメニューのチェックへ反映し、タブバーも配線し直す
         if hasattr(self, "_float_actions"):
             for d in [*self.left_docks, self.format_dock]:
@@ -69,6 +80,40 @@ class PersistenceMixin:
         for k, box in getattr(self, "_fmt_sections", {}).items():
             s.setValue("fmt_section/" + k, "1" if box.is_expanded() else "0")
 
+    # ------------------------------------------------------------ Excelレポート出力
+    def export_excel_report(self):
+        """現在のグラフ設定＋データ＋解析結果の表を1つのExcelブックに出力する。
+        グラフはネイティブExcelグラフ（Excelがあれば COM=VBA互換、無ければ openpyxl）。
+        測定値・ピーク・FFT指標・統計解析の表は、値が入っていれば別シートで同梱する。"""
+        items = self._selected_series_items()
+        if not items:
+            QtWidgets.QMessageBox.information(self, "情報", "先にY系列を選択してください。")
+            return
+        src = items[0][0]   # 棒グラフ等と同じく、最初に選んだ系列のファイルを対象にする
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Excelレポート出力", os.path.join(self.last_dir, "レポート.xlsx"),
+            "Excel (*.xlsx)")
+        if not path:
+            return
+        extra = {}
+        for name, table in (("測定値", getattr(self, "meas_table", None)),
+                            ("ピーク", getattr(self, "peak_table", None)),
+                            ("FFT指標", getattr(self, "fft_metrics", None)),
+                            ("統計解析", getattr(self, "ds_table", None))):
+            if table is not None and table.rowCount():
+                extra[name] = self._table_rows(table, False)
+        try:
+            import excel_chart
+            out, eng = excel_chart.export_from_config(
+                self.datasets[src], self._collect_config(), out_path=path,
+                only_file=src, extra_sheets=extra or None)
+        except Exception as e:  # noqa: BLE001  種別未対応・列不一致などを分かりやすく表示
+            QtWidgets.QMessageBox.critical(self, "Excelレポート出力", str(e))
+            return
+        self.last_dir = os.path.dirname(path)
+        n = f"＋表{len(extra)}シート" if extra else ""
+        self._set_status(f"Excelレポートを出力しました（{eng}エンジン{n}）: {out}")
+
     # ------------------------------------------------------------ 設定保存
     def _collect_config(self):
         return {
@@ -79,6 +124,7 @@ class PersistenceMixin:
             "selected_y": [[fl, col] for fl, col, _ in self._selected_series_items()],
             "chart_type": self.chart_combo.currentText(),
             "threed": self.threed_check.isChecked() if hasattr(self, "threed_check") else False,
+            "stack": self.stack_check.isChecked() if hasattr(self, "stack_check") else False,
             "swap_xy": self.swap_xy_check.isChecked() if hasattr(self, "swap_xy_check") else False,
             "multi_x": self.multix_check.isChecked() if hasattr(self, "multix_check") else False,
             "x_cols": ([self.x_list.item(i).data(UserRole)
@@ -175,6 +221,8 @@ class PersistenceMixin:
                 self.threed_check.setChecked(mig3d)
         if hasattr(self, "swap_xy_check"):
             self.swap_xy_check.setChecked(bool(cfg.get("swap_xy", False)))
+        if hasattr(self, "stack_check"):
+            self.stack_check.setChecked(bool(cfg.get("stack", False)))
         if hasattr(self, "x_list"):            # 複数X（列名一致で復元）
             want = set(cfg.get("x_cols", []) or [])
             self.x_list.blockSignals(True)
@@ -291,7 +339,7 @@ class PersistenceMixin:
 
     # ------------------------------------------------------------ 書式プリセット
     # 「データ/ファイル選択」に依存しない“見た目”だけを名前付きで保存・呼び出す。
-    _PRESET_KEYS = ("chart_type", "threed", "swap_xy", "fonts", "grid", "legend", "legend_loc",
+    _PRESET_KEYS = ("chart_type", "threed", "swap_xy", "stack", "fonts", "grid", "legend", "legend_loc",
                     "show_filename", "show_ext", "frame_width", "grid_width",
                     "xlog", "ylog", "xinvert", "yinvert", "bins", "pct", "data_labels",
                     "trend", "trend_degree", "trend_window", "trend_eq", "trend_color",
@@ -389,6 +437,7 @@ class PersistenceMixin:
                     ("bins", self.bins_spin, "val"), ("pct", self.pct_check, "chk"),
                     ("data_labels", self.data_labels_check, "chk"),
                     ("swap_xy", getattr(self, "swap_xy_check", None), "chk"),
+                    ("stack", getattr(self, "stack_check", None), "chk"),
                     ("trend", self.trend_combo, "txt"), ("trend_degree", self.trend_degree, "val"),
                     ("trend_window", self.trend_window, "val"), ("trend_eq", self.trend_eq, "chk")):
                 if widget is None:

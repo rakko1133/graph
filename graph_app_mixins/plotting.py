@@ -49,6 +49,8 @@ class PlotMixin:
             self.data_labels_check.setEnabled(
                 ctype in plotter._XY_TYPES
                 or ctype in ("棒", "横棒", "積み上げ棒") or want3d)
+        if hasattr(self, "stack_check"):   # 段分けは折れ線/散布図の2Dのみ
+            self.stack_check.setEnabled(ctype in ("折れ線", "散布図") and not want3d)
         if hasattr(self, "series_bar"):
             self._rebuild_series_bar(ctype)   # 折れ線/散布図でのみ上部バーを出す
 
@@ -338,6 +340,26 @@ class PlotMixin:
             max_points = (DECIMATE_TARGET if (self.decimate_check.isChecked()
                           and ctype in ("折れ線", "散布図") and total > DECIMATE_TARGET) else 0)
 
+            # 系列ごとに段を分ける（サブプロット）モード。オシロ・3D・多すぎる系列は通常表示
+            stack_now = (getattr(self, "stack_check", None) is not None
+                         and self.stack_check.isChecked()
+                         and ctype in ("折れ線", "散布図")
+                         and not self._want_3d()
+                         and not scope["enabled"])
+            if stack_now and len(series) > 8:
+                issues.append("段分け表示は8系列まで（9系列以上は通常表示に切替）")
+                stack_now = False
+            if stack_now:
+                self._draw_stacked(series, ctype, xlim, ylim, max_points)
+                self._rebuild_series_bar(ctype)
+                self._has_drawn = True
+                self._snapshot()
+                msg = f"「{ctype}」を{len(series)}段に分けて描画しました。"
+                if issues:
+                    msg += "  ⚠ " + " / ".join(issues)
+                self._set_status(msg)
+                return
+
             busy = total > BUSY_ROWS
             if busy:
                 QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
@@ -382,6 +404,8 @@ class PlotMixin:
                 if "近似" not in str(ln.get_label())]
             # スタイルのみ変更を即時反映するための skey->Line2D マップ（安全な場合のみ）
             self._style_artists = self._build_style_artist_map(series, ctype, bool(max_points))
+            self._wire_legend_picking()   # 凡例クリックで系列ON/OFF
+            self._regate()                # 区間測定ON中は選択機構を作り直す
             self._has_drawn = True
             self._snapshot()   # Undo/Redo 用に設定の履歴を記録
             msg = f"「{ctype}」を描画しました（系列 {len(series)}）。"
@@ -393,6 +417,85 @@ class PlotMixin:
         except Exception as e:  # noqa: BLE001
             applog.get_logger().exception("描画エラー")
             QtWidgets.QMessageBox.critical(self, "描画エラー", str(e))
+
+    def _draw_stacked(self, series, ctype, xlim, ylim, max_points):
+        """系列ごとに上下の段（サブプロット・X軸共有）へ分けて描画する。
+
+        各段のY軸ラベルに系列名を使うので凡例は出さない。第2軸・塗りつぶし・
+        動的リサンプル・スタイル即時反映は段分け中は使わない（通常描画に任せる）。"""
+        self._clear_dynamic_resample()
+        for a in list(self.fig.axes):
+            try:
+                a.remove()
+            except Exception:
+                pass
+        n = len(series)
+        axes = self.fig.subplots(n, 1, sharex=True)
+        if n == 1:
+            axes = [axes]
+        kw = self._plot_format_kwargs()
+        kw["legend"] = False
+        xlabel = self.xlabel_edit.text() or self._effective_x_label()
+        for i, (ax, s) in enumerate(zip(axes, series)):
+            s2 = dict(s)
+            s2["axis"] = "primary"   # 段分け中は各段が独立軸なので第2軸は使わない
+            st = s.get("style") or {}
+            plotter.plot_series(
+                ax, [s2], ctype,
+                title=(self.title_edit.text() if i == 0 else ""),
+                xlabel=(xlabel if i == n - 1 else ""),
+                ylabel=str(st.get("label") or s.get("label") or ""),
+                xlim=xlim, ylim=ylim,
+                scope=None, markers=None, max_points=max_points,
+                secondary_label="", threed=False, **kw)
+            ax._twin_secondary = None
+        self.ax = axes[-1]   # 以降の操作（区間測定・注記等）は最下段を基準にする
+        self._draw_ds_annotations()
+        try:
+            self.fig.tight_layout()
+        except Exception:
+            pass
+        self.canvas.draw()
+        self._plotted_artists = [(ln.get_label(), ln) for a in axes for ln in a.get_lines()
+                                 if "近似" not in str(ln.get_label())]
+        self._style_artists = {}      # スタイル即時反映は無効（全再描画へフォールバック）
+        self._legend_pick_map = {}
+        self._regate()
+        self._stacked = True
+
+    def _wire_legend_picking(self):
+        """凡例の項目（線・文字）をクリックすると系列の表示/非表示が切り替わるようにする。
+        凡例ラベル→(ファイル, 列) の対応が取れた項目だけ有効（複数X時の変種などは対象外）。"""
+        self._legend_pick_map = {}
+        leg = self.ax.get_legend()
+        if leg is None:
+            return
+        label_map = {}
+        for fl, col, _disp in self._selected_series_items():
+            st = self.series_styles.get(self._style_key(fl, col)) or {}
+            for k in {self._series_label(fl, col), st.get("label") or str(col)}:
+                label_map[k] = (fl, col)
+        handles = getattr(leg, "legend_handles", None) or getattr(leg, "legendHandles", [])
+        for h, t in zip(handles, leg.get_texts()):
+            key = label_map.get(t.get_text())
+            if key is None:
+                continue
+            for art in (h, t):
+                try:
+                    art.set_picker(6)
+                    self._legend_pick_map[art] = key
+                except Exception:
+                    pass
+
+    def _on_legend_pick(self, event):
+        key = getattr(self, "_legend_pick_map", {}).get(event.artist)
+        if key is None:
+            return
+        yit = self._find_y_item(*key)
+        if yit is not None:
+            ck = QtCore.Qt.CheckState.Checked
+            yit.setCheckState(QtCore.Qt.CheckState.Unchecked
+                              if yit.checkState() == ck else ck)
 
     def _apply_tick_spacing(self, ctype, scope):
         """目盛り間隔（メモリ間隔）の手動指定を適用する。
@@ -545,6 +648,9 @@ class PlotMixin:
         2D 前提のイベント接続はキャンバス側にあり軸差し替えの影響を受けないが、
         軸に紐づくコールバック（動的リサンプル）や描画キャッシュは張り替える。"""
         cur = getattr(self, "ax", None)
+        if getattr(self, "_stacked", False):
+            self._stacked = False
+            cur = None   # 段分け（複数軸）から戻るときは単一軸を作り直す
         if cur is not None and bool(want_3d) == (getattr(cur, "name", None) == "3d"):
             return   # 既に目的の投影。差し替え不要（clear で再利用）
         self._clear_dynamic_resample()          # 旧軸の xlim コールバックを外す

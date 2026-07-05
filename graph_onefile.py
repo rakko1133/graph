@@ -3516,7 +3516,19 @@ class UIBuildMixin:
             act.setStatusTip(tip)
         act.triggered.connect(slot)
         menu.addAction(act)
+        self._palette_register(menu.title(), label, act)
         return act
+
+    def _palette_register(self, category, label, act):
+        """コマンドパレットの候補として登録する。
+
+        メニューを動的に走査すると PySide6 の QAction.menu() が返す一時ラッパーの
+        破棄で C++ 側の QMenu ごと削除される（所有権の罠）ため、構築時に登録した
+        アクションだけを候補にする。"""
+        if not hasattr(self, "_all_actions"):
+            self._all_actions = []
+        cat = str(category).replace("&", "").replace("...", "").strip()
+        self._all_actions.append((f"{cat} › {label.replace('&', '')}", act))
 
     def _build_menu(self):
         m = self.menuBar()
@@ -3528,8 +3540,18 @@ class UIBuildMixin:
         self.recent_menu = fm.addMenu("最近使ったファイル")
         self._rebuild_recent_menu()
         fm.addSeparator()
+        self._watch_action = QtGui.QAction("ファイルの変更を監視して自動再読込", self)
+        self._watch_action.setCheckable(True)
+        self._watch_action.setStatusTip("読み込み済みファイルが外部で更新されたら自動で読み直して再描画します"
+                                        "（測定器・ロガーのライブ監視向け）")
+        self._watch_action.toggled.connect(self.toggle_file_watch)
+        fm.addAction(self._watch_action)
+        self._palette_register("ファイル", "ファイルの変更を監視して自動再読込", self._watch_action)
+        fm.addSeparator()
         self._menu_action(fm, "グラフ画像を保存...", self.save_figure, "Ctrl+S")
         self._menu_action(fm, "ファイルごとに一括画像出力...", self.batch_export, "Ctrl+B")
+        self._menu_action(fm, "Excelレポート出力...", self.export_excel_report, None,
+                          tip="現在のグラフ（ネイティブExcelグラフ）とデータ・解析結果の表を1つのExcelブックに出力")
         self._menu_action(fm, "クリップボードにコピー", self.copy_figure, "Ctrl+Shift+C")
         fm.addSeparator()
         self._menu_action(fm, "設定を保存...", self.save_config_dialog, "Ctrl+Shift+S")
@@ -3543,6 +3565,9 @@ class UIBuildMixin:
         # 表示
         vm = m.addMenu("表示(&V)")
         self.view_menu = vm   # パネルの表示/非表示トグルを _build_central で追加する
+        self._menu_action(vm, "コマンドパレット...", self.show_command_palette, "Ctrl+Shift+P",
+                          tip="すべてのメニュー操作を名前で検索して実行")
+        vm.addSeparator()
         self._menu_action(vm, "グラフを描画", self.draw_graph, "F5")
         self._menu_action(vm, "全データに合わせる（オートスケール）", self.auto_scale_scope, None)
         # 解析
@@ -3554,6 +3579,70 @@ class UIBuildMixin:
         hm = m.addMenu("ヘルプ(&H)")
         self._menu_action(hm, "使い方", self.show_help, "F1")
         self._menu_action(hm, "バージョン情報", self.show_about, None)
+
+    def show_command_palette(self):
+        """コマンドパレット（Ctrl+Shift+P）: 登録済みの全メニュー操作を名前で検索して実行する。
+        （最近使ったファイルなど動的に増減する項目は対象外）"""
+        acts = list(getattr(self, "_all_actions", []))
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("コマンドパレット")
+        dlg.resize(560, 420)
+        v = QtWidgets.QVBoxLayout(dlg)
+        edit = QtWidgets.QLineEdit()
+        edit.setPlaceholderText("コマンド名で検索（例: FFT ／ 保存 ／ 切り離し）")
+        lst = QtWidgets.QListWidget()
+        v.addWidget(edit)
+        v.addWidget(lst, 1)
+
+        def refill(text=""):
+            tl = text.strip().lower()
+            lst.clear()
+            for name, a in acts:
+                if tl and tl not in name.lower():
+                    continue
+                try:
+                    if not a.isEnabled():
+                        continue
+                    sc = a.shortcut().toString()
+                except RuntimeError:
+                    continue   # 破棄済みアクションはスキップ
+                it = QtWidgets.QListWidgetItem(name + (f"　（{sc}）" if sc else ""))
+                it.setData(UserRole, a)
+                lst.addItem(it)
+            if lst.count():
+                lst.setCurrentRow(0)
+
+        def run_current():
+            it = lst.currentItem()
+            if it is not None:
+                act = it.data(UserRole)
+                dlg.accept()
+                try:
+                    act.trigger()
+                except RuntimeError:
+                    self._set_status("この操作は現在実行できません。")
+
+        edit.textChanged.connect(refill)
+        edit.returnPressed.connect(run_current)
+        lst.itemActivated.connect(lambda *_: run_current())
+
+        class _Nav(QtCore.QObject):
+            """検索ボックスにフォーカスしたまま ↑↓ で候補を選べるようにする。"""
+            def eventFilter(self, _obj, ev):
+                if (ev.type() == QtCore.QEvent.Type.KeyPress
+                        and ev.key() in (QtCore.Qt.Key.Key_Down, QtCore.Qt.Key.Key_Up)):
+                    step = 1 if ev.key() == QtCore.Qt.Key.Key_Down else -1
+                    lst.setCurrentRow(max(0, min(lst.count() - 1, lst.currentRow() + step)))
+                    return True
+                return False
+
+        nav = _Nav(dlg)
+        edit.installEventFilter(nav)
+        refill()
+        edit.setFocus()
+        self._palette_dlg = dlg   # テスト・再入から参照できるように保持
+        dlg.exec()
 
     def _build_toolbar(self):
         """よく使う操作をワンクリックで呼べるツールバー（メニューと同じ機能）。"""
@@ -3649,6 +3738,7 @@ class UIBuildMixin:
             act = d.toggleViewAction()
             act.setStatusTip(f"{d.windowTitle()} パネルの表示/非表示")
             vm.addAction(act)
+            self._palette_register("表示", f"{d.windowTitle()} パネルの表示/非表示", act)
         # ドラッグ以外の明示的な切り離し手段（チェック=別ウィンドウ、外す=元に戻す）
         vm.addSeparator()
         float_menu = vm.addMenu("別ウィンドウで表示（切り離し）")
@@ -3663,6 +3753,7 @@ class UIBuildMixin:
             d.topLevelChanged.connect(self._wire_dock_tabbars)
             d.dockLocationChanged.connect(self._wire_dock_tabbars)
             float_menu.addAction(a)
+            self._palette_register("表示", f"{d.windowTitle()} を別ウィンドウで表示", a)
             self._float_actions[d.objectName()] = a
         vm.addSeparator()
         self._menu_action(vm, "パネル配置をリセット", self._reset_panel_layout,
@@ -4232,6 +4323,16 @@ class UIBuildMixin:
         self.threed_check.toggled.connect(self._on_3d_toggled)
         v.addWidget(self.threed_check)
 
+        # 系列ごとに段を分けるサブプロット表示（折れ線/散布図の2Dのみ）
+        self.stack_check = QtWidgets.QCheckBox("系列ごとに段を分ける（サブプロット）")
+        self.stack_check.setToolTip(
+            "各系列を上下の段に分けて描きます（X軸は共有・最大8段）。\n"
+            "単位が違う系列の比較に便利。折れ線/散布図の2Dで有効。\n"
+            "オシロ表示・第2軸・塗りつぶしとは併用できません（通常表示に戻ります）。\n"
+            "一括画像出力には適用されません。")
+        self.stack_check.setEnabled(False)
+        v.addWidget(self.stack_check)
+
         # 3D の視点角度（マウスドラッグでも回転可。ここで数値指定もできる）
         view = QtWidgets.QHBoxLayout()
         view.addWidget(QtWidgets.QLabel("3D視点 仰角"))
@@ -4578,12 +4679,20 @@ class UIBuildMixin:
         brow2 = QtWidgets.QHBoxLayout()
         brow2.addWidget(b_fft); brow2.addWidget(b_cur)
         v.addLayout(brow2)
+        b_gate = QtWidgets.QPushButton("区間測定（ドラッグで範囲指定）")
+        b_gate.setCheckable(True)
+        b_gate.setToolTip("ONにしてグラフ上を横にドラッグすると、選んだX区間だけの\n"
+                          "測定値（平均/RMS/周期など）を下の表に表示します。")
+        b_gate.toggled.connect(self.toggle_gate)
+        self.gate_btn = b_gate
+        v.addWidget(b_gate)
 
         v.addWidget(self._bold("ピーク（第1=最大）"))
         self.peak_table = QtWidgets.QTableWidget(0, 3)
         self.peak_table.setHorizontalHeaderLabels(["順位", "時間/周波数", "値"])
         self.peak_table.horizontalHeader().setStretchLastSection(True)
         self.peak_table.setMaximumHeight(160)
+        self._wire_table_export(self.peak_table, "ピーク")
         v.addWidget(self.peak_table)
 
         v.addWidget(self._bold("測定値（右端「表示」でグラフに注記）"))
@@ -4594,6 +4703,7 @@ class UIBuildMixin:
         mh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
         mh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.meas_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._wire_table_export(self.meas_table, "測定値")
         v.addWidget(self.meas_table, 1)
         # 統計・トレンド・位相
         srow = QtWidgets.QHBoxLayout()
@@ -4669,6 +4779,7 @@ class UIBuildMixin:
         self.fft_metrics.setHorizontalHeaderLabels(["指標", "値"])
         self.fft_metrics.horizontalHeader().setStretchLastSection(True)
         self.fft_metrics.setMaximumHeight(170)
+        self._wire_table_export(self.fft_metrics, "FFT指標")
         v.addWidget(self.fft_metrics)
         v.addWidget(self._hline())
 
@@ -4715,6 +4826,7 @@ class UIBuildMixin:
         self.proto_table = QtWidgets.QTableWidget(0, 4)
         self.proto_table.setHorizontalHeaderLabels(["時刻", "種別", "値(hex)", "備考"])
         self.proto_table.horizontalHeader().setStretchLastSection(True)
+        self._wire_table_export(self.proto_table, "プロトコル解読")
         v.addWidget(self.proto_table, 1)
 
         self._on_math_op_change(self.math_op.currentText())
@@ -4797,6 +4909,7 @@ class UIBuildMixin:
         hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.ds_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._wire_table_export(self.ds_table, "統計解析")
         v.addWidget(self.ds_table, 1)
         return outer
 
@@ -4833,6 +4946,8 @@ class UIBuildMixin:
         self.canvas.mpl_connect("motion_notify_event", self._scope_on_motion)
         self.canvas.mpl_connect("button_release_event", self._scope_on_release)
         self.canvas.mpl_connect("scroll_event", self._scope_on_scroll)
+        self.canvas.mpl_connect("motion_notify_event", self._hover_readout)
+        self.canvas.mpl_connect("pick_event", self._on_legend_pick)
         self._draw_placeholder()
         return wrap
 
@@ -4898,6 +5013,8 @@ class UIBuildMixin:
                 ("行追加", self._row_add, "末尾に空行を追加"),
                 ("行削除", self._row_del, "選択した行を削除"),
                 ("列追加", self._col_add, "新しい数値列を追加"),
+                ("編集を戻す", self._data_undo, "データ編集（セル・行・列）を1つ戻す"),
+                ("やり直す", self._data_redo, "戻したデータ編集をやり直す"),
                 ("CSV保存", self._save_csv, "編集後のデータをCSV/TSVに書き出し")]:
             b = QtWidgets.QPushButton(text); b.setToolTip(tip)
             b.clicked.connect(slot); bar.addWidget(b)
@@ -4912,8 +5029,69 @@ class UIBuildMixin:
 
     def _build_statusbar(self):
         self.status = self.statusBar()
+        # マウス近傍のデータ値の常時表示（右端。通常のステータス文言とは独立）
+        self._hover_label = QtWidgets.QLabel("")
+        self._hover_label.setStyleSheet("color:#0a7a55;")
+        self.status.addPermanentWidget(self._hover_label)
         fi = f"日本語: {self.font_name}" if self.font_name else "日本語フォント未検出"
         self.status.addPermanentWidget(QtWidgets.QLabel(fi))
+
+    # ---- 表の右クリック：コピー / CSV保存（結果表を報告に持ち出せるように）----
+    def _wire_table_export(self, table, name):
+        """表に右クリックメニュー（コピー/CSV保存）を付ける。読み取り専用の結果表向け。"""
+        table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(
+            lambda pos, t=table, n=name: self._table_export_menu(t, n, pos))
+
+    def _table_export_menu(self, table, name, pos):
+        menu = QtWidgets.QMenu(table)
+        if table.selectedIndexes():
+            menu.addAction("選択範囲をコピー", lambda: self._copy_table(table, True))
+        menu.addAction("表全体をコピー", lambda: self._copy_table(table, False))
+        menu.addAction("CSVで保存…", lambda: self._save_table_csv(table, name))
+        menu.exec(table.viewport().mapToGlobal(pos))
+
+    @staticmethod
+    def _table_rows(table, selected_only):
+        """表の内容を [ヘッダ行, データ行...] で返す。セルウィジェット（チェック等）は空欄。"""
+        if selected_only and table.selectedIndexes():
+            rows = sorted({i.row() for i in table.selectedIndexes()})
+            cols = sorted({i.column() for i in table.selectedIndexes()})
+        else:
+            rows = range(table.rowCount())
+            cols = range(table.columnCount())
+        def head(c):
+            h = table.horizontalHeaderItem(c)
+            return h.text() if h is not None else str(c)
+        out = [[head(c) for c in cols]]
+        for r in rows:
+            line = []
+            for c in cols:
+                it = table.item(r, c)
+                line.append(it.text() if it is not None else "")
+            out.append(line)
+        return out
+
+    def _copy_table(self, table, selected_only):
+        rows = self._table_rows(table, selected_only)
+        text = "\n".join("\t".join(cells) for cells in rows)
+        QtWidgets.QApplication.clipboard().setText(text)
+        self._set_status(f"{len(rows) - 1} 行をコピーしました（Excel等にそのまま貼り付け可）。")
+
+    def _save_table_csv(self, table, name):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, f"{name}をCSVで保存", os.path.join(self.last_dir, f"{name}.csv"),
+            "CSV (*.csv)")
+        if not path:
+            return
+        import csv
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                csv.writer(f).writerows(self._table_rows(table, False))
+            self.last_dir = os.path.dirname(path)
+            self._set_status(f"{name}を保存しました: {path}")
+        except OSError as e:
+            QtWidgets.QMessageBox.critical(self, "保存エラー", str(e))
 
     @staticmethod
     def _bold(text):
@@ -4939,7 +5117,7 @@ class UIBuildMixin:
             s.valueChanged.connect(r)
         for c in (self.grid_check, self.legend_check, self.pct_check,
                   self.xlog, self.ylog, self.show_filename_check, self.show_ext_check,
-                  self.xinvert_check, self.yinvert_check):
+                  self.xinvert_check, self.yinvert_check, self.stack_check):
             c.toggled.connect(r)
         self.legend_loc.currentTextChanged.connect(r)
         # 近似曲線・データラベル
@@ -5094,6 +5272,85 @@ class DataIOMixin:
             self._add_file_item(label)
         self._push_recent(path)
         self._set_status(f"{label} を読み込み（{len(df)}行 × {len(df.columns)}列, {used_enc}）")
+
+    # ------------------------------------------------------------ ファイル監視（自動再読込）
+    # 測定器やロガーが書き続けるCSVを監視し、更新されたら自動で読み直して再描画する。
+    # メニュー「ファイル→ファイルの変更を監視して自動再読込」でON/OFF（QSettingsに保存）。
+    def _watch_enabled(self):
+        return bool(getattr(self, "_watch_action", None) and self._watch_action.isChecked())
+
+    def toggle_file_watch(self, on):
+        self._ui_settings().setValue("ui/watch_files", "1" if on else "0")
+        if on:
+            self._ensure_watcher()
+            self._rebuild_watch_paths()
+            self._set_status("ファイル監視: ON（監視中のファイルが更新されると自動で再読込・再描画します）")
+        else:
+            w = getattr(self, "_fs_watcher", None)
+            if w is not None and w.files():
+                w.removePaths(w.files())
+            self._set_status("ファイル監視: OFF")
+
+    def _ensure_watcher(self):
+        if getattr(self, "_fs_watcher", None) is None:
+            self._fs_watcher = QtCore.QFileSystemWatcher(self)
+            self._fs_watcher.fileChanged.connect(self._on_watched_file_changed)
+            self._watch_pending = set()
+            self._watch_timer = QtCore.QTimer(self)
+            self._watch_timer.setSingleShot(True)
+            self._watch_timer.setInterval(600)   # 書き込み途中の連続イベントをまとめる
+            self._watch_timer.timeout.connect(self._reload_watched)
+
+    def _rebuild_watch_paths(self):
+        """監視対象を現在の読み込みファイル一覧に合わせて貼り直す。"""
+        if not self._watch_enabled():
+            return
+        self._ensure_watcher()
+        w = self._fs_watcher
+        if w.files():
+            w.removePaths(w.files())
+        paths = sorted({m.get("path") for m in self.meta.values()
+                        if m.get("path") and os.path.isfile(m.get("path"))})
+        if paths:
+            w.addPaths(paths)
+
+    def _on_watched_file_changed(self, path):
+        self._watch_pending.add(path)
+        self._watch_timer.start()
+
+    def _reload_watched(self):
+        pending, self._watch_pending = set(self._watch_pending), set()
+        labels = [l for l, m in self.meta.items() if m.get("path") in pending]
+        reloaded = []
+        for label in labels:
+            if self._reload_label_inplace(label):
+                reloaded.append(label)
+        # エディタの「置換保存」では旧ファイルが消えて監視から外れるため貼り直す
+        self._rebuild_watch_paths()
+        if reloaded:
+            self._refresh_columns()
+            if self._has_drawn:
+                self.draw_graph()
+            self._set_status("自動再読込: " + ", ".join(reloaded))
+
+    def _reload_label_inplace(self, label):
+        """一覧の並びと選択を保ったまま、保存済みの読み込み条件でデータだけ差し替える。"""
+        meta = self.meta.get(label) or {}
+        path = meta.get("path")
+        if not path or not os.path.isfile(path):
+            return False
+        enc = meta.get("enc")
+        enc = None if (not enc or str(enc).startswith(("自動", "clipboard"))) else enc
+        try:
+            df, used_enc, used_delim = load_table(
+                path, encoding=enc, delimiter=meta.get("delim"))
+        except Exception:  # noqa: BLE001  書き込み途中で開けない等は次の変更イベントに任せる
+            return False
+        self.datasets[label] = df
+        self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim}
+        if getattr(self, "_preview_label", None) == label:
+            self._populate_preview(df, label=label)
+        return True
 
     def _find_file_item(self, label):
         for i in range(self.file_list.count()):
@@ -5282,6 +5539,7 @@ class DataIOMixin:
         self.y_list.blockSignals(False)
         if hasattr(self, "explorer"):
             self._rebuild_explorer()     # ファイル→列ツリーを作り直す
+        self._rebuild_watch_paths()      # ファイル監視ON時は監視対象を貼り直す
         self._on_y_selection_changed()   # スタイル表・解析候補をまとめて更新
 
     def _selected_series_items(self):
@@ -5304,10 +5562,31 @@ class DataIOMixin:
             self.table.setColumnCount(len(cols))
             self.table.setRowCount(len(head))
             self.table.setHorizontalHeaderLabels([str(c) for c in cols])
+            nan_bg = QtGui.QBrush(QtGui.QColor("#ffe4e1"))   # 欠損セルは薄赤で目立たせる
             for r in range(len(head)):
                 for c in range(len(cols)):
                     v = head.iat[r, c]
-                    self.table.setItem(r, c, QtWidgets.QTableWidgetItem("" if pd.isna(v) else str(v)))
+                    missing = pd.isna(v)
+                    it = QtWidgets.QTableWidgetItem("" if missing else str(v))
+                    if missing:
+                        it.setBackground(nan_bg)
+                        it.setToolTip("欠損値（NaN）")
+                    self.table.setItem(r, c, it)
+            # 列ヘッダに品質情報のツールチップ（型・全行の欠損数・数値なら範囲）。
+            # 欠損を含む列はヘッダ名に ⚠ を付けて一目でわかるようにする。
+            for c, col in enumerate(cols):
+                s = df[col]
+                n_nan = int(s.isna().sum())
+                tip = [f"列: {col}", f"型: {s.dtype}", f"全 {len(s):,} 行"]
+                if n_nan:
+                    tip.append(f"⚠ 欠損: {n_nan:,} 行（{n_nan / max(len(s), 1):.1%}）")
+                if pd.api.types.is_numeric_dtype(s):
+                    v = s.dropna()
+                    if len(v):
+                        tip.append(f"範囲: {v.min():.6g} 〜 {v.max():.6g}")
+                hi = QtWidgets.QTableWidgetItem(("⚠ " if n_nan else "") + str(col))
+                hi.setToolTip("\n".join(tip))
+                self.table.setHorizontalHeaderItem(c, hi)
             self.table.resizeColumnsToContents()
             if label is not None:
                 self._preview_label = label
@@ -5337,7 +5616,10 @@ class DataIOMixin:
             val = pd.to_numeric(text, errors="coerce")   # 数値列は数値化（不可ならNaN）
         else:
             val = text
+        old = df.iat[r, c]
         df.iat[r, c] = val
+        self._data_record({"kind": "cell", "label": self._preview_label,
+                           "row": r, "col": c, "old": old, "new": val})
         self._set_status(f"編集: {self._preview_label} 行{r}「{col}」= {text}")
         self._request_redraw()
 
@@ -5356,6 +5638,7 @@ class DataIOMixin:
         df = self.datasets[lbl]
         df.loc[len(df)] = [np.nan] * df.shape[1]
         df.reset_index(drop=True, inplace=True)
+        self._data_record({"kind": "row_add", "label": lbl})
         self._populate_preview(df, label=lbl)
         if len(df) > PREVIEW_ROWS:
             self._set_status(f"行を追加（全{len(df)}行。表示は先頭{PREVIEW_ROWS}行）")
@@ -5365,11 +5648,13 @@ class DataIOMixin:
         lbl = self._edit_target()
         if not lbl:
             return
-        rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
         if not rows:
             self._set_status("削除する行を選択してください。")
             return
         df = self.datasets[lbl]
+        self._data_record({"kind": "row_del", "label": lbl, "rows": rows,
+                           "data": df.iloc[rows].copy()})
         df.drop(df.index[rows], inplace=True)
         df.reset_index(drop=True, inplace=True)
         self._populate_preview(df, label=lbl)
@@ -5388,9 +5673,97 @@ class DataIOMixin:
             QtWidgets.QMessageBox.warning(self, "列追加", "同名の列が既にあります。")
             return
         df[name] = 0.0
+        self._data_record({"kind": "col_add", "label": lbl, "name": name})
         self._populate_preview(df, label=lbl)
         self._refresh_columns()      # X/Y軸の候補へ反映
         self._set_status(f"列「{name}」を追加（値0.0で初期化）")
+
+    # ------------------------------------------------------------ データ編集の Undo / Redo
+    # 設定のUndo（Ctrl+Z）とは別に、セル編集・行追加/削除・列追加を逆操作で戻せる。
+    # 位置ベースの記録だが、スタックを順に戻す/やり直す限り整合する（LIFO前提）。
+    def _data_record(self, op):
+        if not hasattr(self, "_data_hist"):
+            self._data_hist, self._data_hist_i = [], -1
+        del self._data_hist[self._data_hist_i + 1:]   # redo分岐を捨てる
+        self._data_hist.append(op)
+        if len(self._data_hist) > 100:
+            self._data_hist.pop(0)
+        self._data_hist_i = len(self._data_hist) - 1
+
+    def _data_undo(self):
+        hist = getattr(self, "_data_hist", None)
+        if not hist or self._data_hist_i < 0:
+            self._set_status("戻せるデータ編集はありません。")
+            return
+        op = hist[self._data_hist_i]
+        if self._data_apply(op, forward=False):
+            self._data_hist_i -= 1
+            self._set_status(f"データ編集を戻しました（{self._data_op_name(op)}）。")
+
+    def _data_redo(self):
+        hist = getattr(self, "_data_hist", None)
+        if not hist or self._data_hist_i >= len(hist) - 1:
+            self._set_status("やり直せるデータ編集はありません。")
+            return
+        op = hist[self._data_hist_i + 1]
+        if self._data_apply(op, forward=True):
+            self._data_hist_i += 1
+            self._set_status(f"データ編集をやり直しました（{self._data_op_name(op)}）。")
+
+    @staticmethod
+    def _data_op_name(op):
+        return {"cell": "セル編集", "row_add": "行追加",
+                "row_del": "行削除", "col_add": "列追加"}.get(op["kind"], op["kind"])
+
+    def _data_apply(self, op, forward):
+        """opを適用（forward=True）/逆適用（False）する。対象ファイルが無ければ何もしない。"""
+        import pandas as pd
+        label = op["label"]
+        df = self.datasets.get(label)
+        if df is None:
+            self._set_status(f"対象ファイル「{label}」は読み込まれていません。")
+            return False
+        kind = op["kind"]
+        if kind == "cell":
+            r, c = op["row"], op["col"]
+            if r >= len(df) or c >= df.shape[1]:
+                return False
+            df.iat[r, c] = op["new"] if forward else op["old"]
+        elif kind == "row_add":
+            if forward:
+                import numpy as np
+                df.loc[len(df)] = [np.nan] * df.shape[1]
+                df.reset_index(drop=True, inplace=True)
+            else:
+                if not len(df):
+                    return False
+                df.drop(df.index[-1], inplace=True)
+                df.reset_index(drop=True, inplace=True)
+        elif kind == "row_del":
+            if forward:
+                df.drop(df.index[op["rows"]], inplace=True)
+                df.reset_index(drop=True, inplace=True)
+            else:   # 削除した行を元の位置へ差し戻す（1回のconcatで済ませる）
+                parts, prev = [], 0
+                for j, r in enumerate(op["rows"]):
+                    cut = r - j
+                    parts.append(df.iloc[prev:cut])
+                    parts.append(op["data"].iloc[[j]])
+                    prev = cut
+                parts.append(df.iloc[prev:])
+                self.datasets[label] = pd.concat(parts, ignore_index=True)
+        elif kind == "col_add":
+            if forward:
+                self.datasets[label][op["name"]] = 0.0
+            else:
+                self.datasets[label].drop(columns=[op["name"]], inplace=True, errors="ignore")
+        df2 = self.datasets[label]
+        if getattr(self, "_preview_label", None) == label:
+            self._populate_preview(df2, label=label)
+        if kind == "col_add":
+            self._refresh_columns()   # X/Y候補・ツリーへ反映
+        self._request_redraw()
+        return True
 
     def _save_csv(self):
         lbl = self._edit_target()
@@ -5969,6 +6342,8 @@ class PlotMixin:
             self.data_labels_check.setEnabled(
                 ctype in _XY_TYPES
                 or ctype in ("棒", "横棒", "積み上げ棒") or want3d)
+        if hasattr(self, "stack_check"):   # 段分けは折れ線/散布図の2Dのみ
+            self.stack_check.setEnabled(ctype in ("折れ線", "散布図") and not want3d)
         if hasattr(self, "series_bar"):
             self._rebuild_series_bar(ctype)   # 折れ線/散布図でのみ上部バーを出す
 
@@ -6258,6 +6633,26 @@ class PlotMixin:
             max_points = (DECIMATE_TARGET if (self.decimate_check.isChecked()
                           and ctype in ("折れ線", "散布図") and total > DECIMATE_TARGET) else 0)
 
+            # 系列ごとに段を分ける（サブプロット）モード。オシロ・3D・多すぎる系列は通常表示
+            stack_now = (getattr(self, "stack_check", None) is not None
+                         and self.stack_check.isChecked()
+                         and ctype in ("折れ線", "散布図")
+                         and not self._want_3d()
+                         and not scope["enabled"])
+            if stack_now and len(series) > 8:
+                issues.append("段分け表示は8系列まで（9系列以上は通常表示に切替）")
+                stack_now = False
+            if stack_now:
+                self._draw_stacked(series, ctype, xlim, ylim, max_points)
+                self._rebuild_series_bar(ctype)
+                self._has_drawn = True
+                self._snapshot()
+                msg = f"「{ctype}」を{len(series)}段に分けて描画しました。"
+                if issues:
+                    msg += "  ⚠ " + " / ".join(issues)
+                self._set_status(msg)
+                return
+
             busy = total > BUSY_ROWS
             if busy:
                 QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
@@ -6302,6 +6697,8 @@ class PlotMixin:
                 if "近似" not in str(ln.get_label())]
             # スタイルのみ変更を即時反映するための skey->Line2D マップ（安全な場合のみ）
             self._style_artists = self._build_style_artist_map(series, ctype, bool(max_points))
+            self._wire_legend_picking()   # 凡例クリックで系列ON/OFF
+            self._regate()                # 区間測定ON中は選択機構を作り直す
             self._has_drawn = True
             self._snapshot()   # Undo/Redo 用に設定の履歴を記録
             msg = f"「{ctype}」を描画しました（系列 {len(series)}）。"
@@ -6313,6 +6710,85 @@ class PlotMixin:
         except Exception as e:  # noqa: BLE001
             get_logger().exception("描画エラー")
             QtWidgets.QMessageBox.critical(self, "描画エラー", str(e))
+
+    def _draw_stacked(self, series, ctype, xlim, ylim, max_points):
+        """系列ごとに上下の段（サブプロット・X軸共有）へ分けて描画する。
+
+        各段のY軸ラベルに系列名を使うので凡例は出さない。第2軸・塗りつぶし・
+        動的リサンプル・スタイル即時反映は段分け中は使わない（通常描画に任せる）。"""
+        self._clear_dynamic_resample()
+        for a in list(self.fig.axes):
+            try:
+                a.remove()
+            except Exception:
+                pass
+        n = len(series)
+        axes = self.fig.subplots(n, 1, sharex=True)
+        if n == 1:
+            axes = [axes]
+        kw = self._plot_format_kwargs()
+        kw["legend"] = False
+        xlabel = self.xlabel_edit.text() or self._effective_x_label()
+        for i, (ax, s) in enumerate(zip(axes, series)):
+            s2 = dict(s)
+            s2["axis"] = "primary"   # 段分け中は各段が独立軸なので第2軸は使わない
+            st = s.get("style") or {}
+            plot_series(
+                ax, [s2], ctype,
+                title=(self.title_edit.text() if i == 0 else ""),
+                xlabel=(xlabel if i == n - 1 else ""),
+                ylabel=str(st.get("label") or s.get("label") or ""),
+                xlim=xlim, ylim=ylim,
+                scope=None, markers=None, max_points=max_points,
+                secondary_label="", threed=False, **kw)
+            ax._twin_secondary = None
+        self.ax = axes[-1]   # 以降の操作（区間測定・注記等）は最下段を基準にする
+        self._draw_ds_annotations()
+        try:
+            self.fig.tight_layout()
+        except Exception:
+            pass
+        self.canvas.draw()
+        self._plotted_artists = [(ln.get_label(), ln) for a in axes for ln in a.get_lines()
+                                 if "近似" not in str(ln.get_label())]
+        self._style_artists = {}      # スタイル即時反映は無効（全再描画へフォールバック）
+        self._legend_pick_map = {}
+        self._regate()
+        self._stacked = True
+
+    def _wire_legend_picking(self):
+        """凡例の項目（線・文字）をクリックすると系列の表示/非表示が切り替わるようにする。
+        凡例ラベル→(ファイル, 列) の対応が取れた項目だけ有効（複数X時の変種などは対象外）。"""
+        self._legend_pick_map = {}
+        leg = self.ax.get_legend()
+        if leg is None:
+            return
+        label_map = {}
+        for fl, col, _disp in self._selected_series_items():
+            st = self.series_styles.get(self._style_key(fl, col)) or {}
+            for k in {self._series_label(fl, col), st.get("label") or str(col)}:
+                label_map[k] = (fl, col)
+        handles = getattr(leg, "legend_handles", None) or getattr(leg, "legendHandles", [])
+        for h, t in zip(handles, leg.get_texts()):
+            key = label_map.get(t.get_text())
+            if key is None:
+                continue
+            for art in (h, t):
+                try:
+                    art.set_picker(6)
+                    self._legend_pick_map[art] = key
+                except Exception:
+                    pass
+
+    def _on_legend_pick(self, event):
+        key = getattr(self, "_legend_pick_map", {}).get(event.artist)
+        if key is None:
+            return
+        yit = self._find_y_item(*key)
+        if yit is not None:
+            ck = QtCore.Qt.CheckState.Checked
+            yit.setCheckState(QtCore.Qt.CheckState.Unchecked
+                              if yit.checkState() == ck else ck)
 
     def _apply_tick_spacing(self, ctype, scope):
         """目盛り間隔（メモリ間隔）の手動指定を適用する。
@@ -6465,6 +6941,9 @@ class PlotMixin:
         2D 前提のイベント接続はキャンバス側にあり軸差し替えの影響を受けないが、
         軸に紐づくコールバック（動的リサンプル）や描画キャッシュは張り替える。"""
         cur = getattr(self, "ax", None)
+        if getattr(self, "_stacked", False):
+            self._stacked = False
+            cur = None   # 段分け（複数軸）から戻るときは単一軸を作り直す
         if cur is not None and bool(want_3d) == (getattr(cur, "name", None) == "3d"):
             return   # 既に目的の投影。差し替え不要（clear で再利用）
         self._clear_dynamic_resample()          # 旧軸の xlim コールバックを外す
@@ -6573,6 +7052,8 @@ class PlotMixin:
 class ScopeCursorMixin:
     # ------------------------------------------------------------ カーソル測定
     def toggle_cursors(self, on):
+        if on and getattr(self, "gate_btn", None) and self.gate_btn.isChecked():
+            self.gate_btn.setChecked(False)   # 区間測定と排他（ドラッグ操作が競合する）
         if on:
             self._cursors = []          # [{x, vline, marker}, ...] 最大2本
             self._cursor_drag = None
@@ -6721,6 +7202,15 @@ class ScopeCursorMixin:
         return bool(event is not None and event.key and "shift" in str(event.key))
 
     def _scope_on_press(self, event):
+        # ダブルクリック=全体表示（カーソル測定・ツールバーモード・3Dでは無効）
+        if (event.dblclick and event.button == 1
+                and event.inaxes is not None and event.inaxes in self.fig.axes
+                and self._cursor_cid is None and not getattr(self.toolbar, "mode", "")
+                and getattr(event.inaxes, "name", None) != "3d"
+                and event.inaxes.get_label() != "<colorbar>"
+                and getattr(self, "_has_drawn", False)):
+            self._autoscale_view()
+            return
         if (not self._scope_active() or event.inaxes is not self.ax
                 or event.button not in (1, 3) or event.x is None):
             return
@@ -6794,26 +7284,138 @@ class ScopeCursorMixin:
 
     def _wheel_zoom(self, event):
         """通常グラフのマウスホイール拡大縮小。カーソル位置を中心にズームする。
-        Shift+ホイールはX方向のみ（波形の横拡大）。"""
+        Shift+ホイールはX方向のみ（波形の横拡大）。段分け表示中はホバー中の段を拡縮。"""
         # カーソル測定中・ツールバーのパン/ズーム中・未描画・円・3Dでは無効
         # （3Dは mplot3d 標準のドラッグ回転・ホイールに任せる）
+        ax = event.inaxes if event.inaxes in self.fig.axes else self.ax
         if (self._cursor_cid is not None
                 or getattr(self.toolbar, "mode", "")
                 or not getattr(self, "_has_drawn", False)
                 or self.chart_combo.currentText() == "円"
-                or getattr(self.ax, "name", None) == "3d"):
+                or getattr(ax, "name", None) == "3d"
+                or ax.get_label() == "<colorbar>"):
             return
         factor = 0.8 if event.button == "up" else 1.25   # up=拡大（範囲を狭める）
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
         xc = event.xdata if event.xdata is not None else (x0 + x1) / 2.0
         yc = event.ydata if event.ydata is not None else (y0 + y1) / 2.0
-        xlog = self.ax.get_xscale() == "log"
-        ylog = self.ax.get_yscale() == "log"
-        self.ax.set_xlim(*self._zoom_pair(x0, x1, xc, factor, xlog))
+        xlog = ax.get_xscale() == "log"
+        ylog = ax.get_yscale() == "log"
+        ax.set_xlim(*self._zoom_pair(x0, x1, xc, factor, xlog))
         if not self._shift_held(event):     # Shift押下時はYを保持（横方向のみ拡大）
-            self.ax.set_ylim(*self._zoom_pair(y0, y1, yc, factor, ylog))
+            ax.set_ylim(*self._zoom_pair(y0, y1, yc, factor, ylog))
         self.canvas.draw_idle()
+
+    # ------------------------------------------------------ 区間測定（ゲーティング）
+    def toggle_gate(self, on):
+        """ONの間、グラフを横にドラッグしてX区間を選ぶと、その区間だけを測定する。"""
+        if on:
+            if getattr(self.ax, "name", None) == "3d":
+                self._set_status("区間測定は2Dグラフで使えます（3D表示では無効）。")
+                self.gate_btn.setChecked(False)
+                return
+            if self.cursor_btn.isChecked():
+                self.cursor_btn.setChecked(False)   # カーソル測定と排他
+            from matplotlib.widgets import SpanSelector
+            self._gate_span = SpanSelector(
+                self.ax, self._on_gate_select, "horizontal", useblit=True,
+                props=dict(alpha=0.2, facecolor="#2b6cb0"), interactive=True)
+            self._set_status("区間測定: グラフ上を横にドラッグしてX範囲を選ぶと、"
+                             "その区間だけの測定値を下の表に表示します。")
+        else:
+            sp = getattr(self, "_gate_span", None)
+            if sp is not None:
+                try:
+                    sp.set_visible(False)
+                    sp.disconnect_events()
+                except Exception:
+                    pass
+            self._gate_span = None
+            self.canvas.draw_idle()
+
+    def _regate(self):
+        """再描画で軸の中身がクリアされた後、区間測定の選択機構を作り直す。"""
+        if getattr(self, "gate_btn", None) and self.gate_btn.isChecked():
+            self.toggle_gate(False)
+            if getattr(self.ax, "name", None) == "3d":
+                self.gate_btn.setChecked(False)   # 3Dに切り替わったら解除
+            else:
+                self.toggle_gate(True)
+
+    def _on_gate_select(self, x0, x1):
+        if x1 < x0:
+            x0, x1 = x1, x0
+        if x0 == x1:
+            return
+        self._run_gated_analysis(float(x0), float(x1))
+
+    def _autoscale_view(self):
+        """ダブルクリックで全体表示。通常グラフは軸範囲指定をクリアして再描画、
+        オシロ表示中は自動スケール（解析対象に合わせる）。"""
+        if (self.scope_check.isChecked()
+                and self.chart_combo.currentText() in ("折れ線", "散布図")):
+            self.auto_scale_scope()
+            return
+        self._suspend_redraw = True
+        for le in (self.xmin, self.xmax, self.ymin, self.ymax):
+            le.clear()
+        self._suspend_redraw = False
+        self.draw_graph()
+        self._set_status("全体表示に戻しました（ダブルクリックでいつでも戻れます）。")
+
+    def _hover_readout(self, event):
+        """マウス近傍のデータ点（系列名・X・Y）をステータスバー右端に常時表示する。
+        ピクセル座標で最近傍を探すので、対数軸・単位換算後の表示座標でも正しい。"""
+        lbl = getattr(self, "_hover_label", None)
+        if lbl is None:
+            return
+        ax = event.inaxes
+        if (ax is None or ax not in self.fig.axes or event.x is None
+                or not getattr(self, "_has_drawn", False)
+                or getattr(ax, "name", None) == "3d"
+                or self._scope_drag or self._cursor_drag is not None):
+            if lbl.text():
+                lbl.setText("")
+            return
+        import time
+        now = time.monotonic()
+        if now - getattr(self, "_hover_t", 0.0) < 0.05:   # 20Hzに間引き（負荷対策）
+            return
+        self._hover_t = now
+        import numpy as np
+        # イベントの軸（段分け中は各段）と、重なっている第2軸/主軸を対象にする
+        axs = [ax]
+        twin = getattr(ax, "_twin_secondary", None)
+        if twin is not None:
+            axs.append(twin)
+        if ax is getattr(self.ax, "_twin_secondary", None):
+            axs.append(self.ax)
+        cands = [(ln.get_label(), ln) for a in axs for ln in a.get_lines()
+                 if not str(ln.get_label()).startswith("_")
+                 and "近似" not in str(ln.get_label())]
+        best = None   # (画面距離^2, 系列名, x, y)
+        for label, ln in cands:
+            try:
+                xd = np.asarray(ln.get_xdata(), float)
+                yd = np.asarray(ln.get_ydata(), float)
+            except (TypeError, ValueError):
+                continue
+            if xd.size == 0 or xd.size != yd.size:
+                continue
+            m = np.isfinite(xd) & np.isfinite(yd)
+            if not m.any():
+                continue
+            pts = ln.axes.transData.transform(np.column_stack([xd[m], yd[m]]))
+            d2 = (pts[:, 0] - event.x) ** 2 + (pts[:, 1] - event.y) ** 2
+            i = int(np.argmin(d2))
+            if best is None or d2[i] < best[0]:
+                best = (float(d2[i]), str(label), float(xd[m][i]), float(yd[m][i]))
+        if best is not None and best[0] <= 20.0 ** 2:   # 20px以内の点だけ表示
+            _, label, x, y = best
+            lbl.setText(f"{label}:  X={format_eng(x)}  Y={format_eng(y)}  ")
+        elif lbl.text():
+            lbl.setText("")
 
     @staticmethod
     def _zoom_pair(lo, hi, center, factor, log=False):
@@ -6938,7 +7540,31 @@ class AnalysisMixin:
         y = np.asarray(y, float)
         res = analyze(t, y, n_peaks=self.npeaks.value(),
                                smooth=self.smooth_spin.value())
+        self._show_analysis_result(res, f"解析しました: {label}")
 
+    def _run_gated_analysis(self, x0, x1):
+        """区間測定: 表示座標 [x0, x1] の範囲だけを解析して表に表示する。"""
+        import numpy as np
+        t, y, label = self._analysis_xy()
+        if t is None:
+            self._set_status("区間測定: 『オシロ/解析』の解析対象で系列を選択してください。")
+            return
+        t = np.asarray(t, float)
+        # 画面のX座標は単位変換後。生の t を同じ変換にかけてから区間を切り出す
+        t_disp = axis_scale(t, self.xscale_edit.text())
+        mask = (t_disp >= x0) & (t_disp <= x1)
+        if int(mask.sum()) < 3:
+            self._set_status("区間測定: 選択した区間のデータ点が少なすぎます（3点以上必要）。")
+            return
+        res = analyze(t[mask], np.asarray(y, float)[mask],
+                               n_peaks=self.npeaks.value(), smooth=self.smooth_spin.value())
+        self._show_analysis_result(
+            res,
+            f"区間測定 [{format_eng(x0)} 〜 {format_eng(x1)}]: "
+            f"{label}（{int(mask.sum()):,}点）", redraw_ok=False)
+
+    def _show_analysis_result(self, res, status, redraw_ok=True):
+        """解析結果（ピーク・測定値）を表に反映する（解析実行・区間測定で共通）。"""
         self.peak_table.setRowCount(len(res["peaks"]))
         for r, p in enumerate(res["peaks"]):
             self.peak_table.setItem(r, 0, QtWidgets.QTableWidgetItem(f"第{p['rank']}"))
@@ -6960,9 +7586,9 @@ class AnalysisMixin:
             cb.toggled.connect(self._refresh_meas_annotations)
             self.meas_table.setCellWidget(r, 2, cb)
 
-        if self.show_peaks_check.isChecked() or had_ann:
+        if redraw_ok and (self.show_peaks_check.isChecked() or had_ann):
             self.draw_graph()   # ピーク表示中、または前回の注記を消すため
-        self._set_status(f"解析しました: {label}")
+        self._set_status(status)
 
     def _refresh_meas_annotations(self, *_):
         """測定値表で『表示』にチェックした行を集めてグラフへ注記表示する。"""
@@ -7066,6 +7692,7 @@ class AnalysisMixin:
             pk.setItem(r, 2, QtWidgets.QTableWidgetItem("-" if tv is None else f"{tv:.4g} ms"))
             pk.setItem(r, 3, QtWidgets.QTableWidgetItem(f"{val:.6g}"))
         pk.resizeColumnsToContents()
+        self._wire_table_export(pk, "全系列ピーク")
         lay.addWidget(pk)
 
         lay.addWidget(QtWidgets.QLabel("■ 測定（系列ごと）"))
@@ -7078,6 +7705,7 @@ class AnalysisMixin:
             ms.setItem(r, 2, QtWidgets.QTableWidgetItem("-" if val is None else f"{val:.6g}"))
             ms.setItem(r, 3, QtWidgets.QTableWidgetItem(str(unit)))
         ms.resizeColumnsToContents()
+        self._wire_table_export(ms, "全系列測定")
         lay.addWidget(ms, 1)
 
         brow = QtWidgets.QHBoxLayout()
@@ -8091,7 +8719,16 @@ class PersistenceMixin:
             "   ①タブをダブルクリック ②タブを外へドラッグ ③表示メニュー「別ウィンドウで表示」\n"
             "   元に戻す: ウィンドウのタイトルをダブルクリック／メニューのチェックを外す／枠へドラッグ\n"
             "   ✕で閉じたパネルは表示メニューで再表示。「パネル配置をリセット」で全部初期位置へ\n"
-            "5. 波形は『オシロ/解析』タブで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
+            "5. 波形は『オシロ/解析』パネルで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
+            "【グラフ上の操作】ホバー=近傍点の値を右下に表示／ホイール=ズーム"
+            "（Shift+ホイール=X方向のみ）／ダブルクリック=全体表示／凡例クリック=系列ON/OFF\n"
+            "【区間測定】『オシロ/解析』の「区間測定」ONでドラッグした区間だけを測定\n"
+            "【結果の持ち出し】各結果表を右クリック→コピー/CSV保存。"
+            "「ファイル→Excelレポート出力」でグラフ+表を1つのExcelブックに\n"
+            "【その他】Ctrl+Shift+P=コマンドパレット（全操作を検索実行）／"
+            "「ファイル→ファイルの変更を監視」=更新されたCSVを自動再読込／\n"
+            "　書式パネル「系列ごとに段を分ける」=サブプロット表示／"
+            "データ編集バーの「編集を戻す/やり直す」\n"
             "【出力】右端パネルの画像出力、またはメニュー「ファイル」から保存／コピー\n"
             "【グラフ種別と列】棒/円は1ファイル、折れ線/散布図は複数ファイル重ね描き可")
 
@@ -8122,6 +8759,8 @@ class PersistenceMixin:
             st = s.value(key)
             if st is not None and sp is not None:
                 sp.restoreState(st)
+        if str(s.value("ui/watch_files")) in ("1", "true", "True"):
+            self._watch_action.setChecked(True)   # → toggle_file_watch で監視開始
         # 復元した切り離し状態をメニューのチェックへ反映し、タブバーも配線し直す
         if hasattr(self, "_float_actions"):
             for d in [*self.left_docks, self.format_dock]:
@@ -8142,6 +8781,40 @@ class PersistenceMixin:
         for k, box in getattr(self, "_fmt_sections", {}).items():
             s.setValue("fmt_section/" + k, "1" if box.is_expanded() else "0")
 
+    # ------------------------------------------------------------ Excelレポート出力
+    def export_excel_report(self):
+        """現在のグラフ設定＋データ＋解析結果の表を1つのExcelブックに出力する。
+        グラフはネイティブExcelグラフ（Excelがあれば COM=VBA互換、無ければ openpyxl）。
+        測定値・ピーク・FFT指標・統計解析の表は、値が入っていれば別シートで同梱する。"""
+        items = self._selected_series_items()
+        if not items:
+            QtWidgets.QMessageBox.information(self, "情報", "先にY系列を選択してください。")
+            return
+        src = items[0][0]   # 棒グラフ等と同じく、最初に選んだ系列のファイルを対象にする
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Excelレポート出力", os.path.join(self.last_dir, "レポート.xlsx"),
+            "Excel (*.xlsx)")
+        if not path:
+            return
+        extra = {}
+        for name, table in (("測定値", getattr(self, "meas_table", None)),
+                            ("ピーク", getattr(self, "peak_table", None)),
+                            ("FFT指標", getattr(self, "fft_metrics", None)),
+                            ("統計解析", getattr(self, "ds_table", None))):
+            if table is not None and table.rowCount():
+                extra[name] = self._table_rows(table, False)
+        try:
+            import excel_chart
+            out, eng = excel_chart.export_from_config(
+                self.datasets[src], self._collect_config(), out_path=path,
+                only_file=src, extra_sheets=extra or None)
+        except Exception as e:  # noqa: BLE001  種別未対応・列不一致などを分かりやすく表示
+            QtWidgets.QMessageBox.critical(self, "Excelレポート出力", str(e))
+            return
+        self.last_dir = os.path.dirname(path)
+        n = f"＋表{len(extra)}シート" if extra else ""
+        self._set_status(f"Excelレポートを出力しました（{eng}エンジン{n}）: {out}")
+
     # ------------------------------------------------------------ 設定保存
     def _collect_config(self):
         return {
@@ -8152,6 +8825,7 @@ class PersistenceMixin:
             "selected_y": [[fl, col] for fl, col, _ in self._selected_series_items()],
             "chart_type": self.chart_combo.currentText(),
             "threed": self.threed_check.isChecked() if hasattr(self, "threed_check") else False,
+            "stack": self.stack_check.isChecked() if hasattr(self, "stack_check") else False,
             "swap_xy": self.swap_xy_check.isChecked() if hasattr(self, "swap_xy_check") else False,
             "multi_x": self.multix_check.isChecked() if hasattr(self, "multix_check") else False,
             "x_cols": ([self.x_list.item(i).data(UserRole)
@@ -8248,6 +8922,8 @@ class PersistenceMixin:
                 self.threed_check.setChecked(mig3d)
         if hasattr(self, "swap_xy_check"):
             self.swap_xy_check.setChecked(bool(cfg.get("swap_xy", False)))
+        if hasattr(self, "stack_check"):
+            self.stack_check.setChecked(bool(cfg.get("stack", False)))
         if hasattr(self, "x_list"):            # 複数X（列名一致で復元）
             want = set(cfg.get("x_cols", []) or [])
             self.x_list.blockSignals(True)
@@ -8364,7 +9040,7 @@ class PersistenceMixin:
 
     # ------------------------------------------------------------ 書式プリセット
     # 「データ/ファイル選択」に依存しない“見た目”だけを名前付きで保存・呼び出す。
-    _PRESET_KEYS = ("chart_type", "threed", "swap_xy", "fonts", "grid", "legend", "legend_loc",
+    _PRESET_KEYS = ("chart_type", "threed", "swap_xy", "stack", "fonts", "grid", "legend", "legend_loc",
                     "show_filename", "show_ext", "frame_width", "grid_width",
                     "xlog", "ylog", "xinvert", "yinvert", "bins", "pct", "data_labels",
                     "trend", "trend_degree", "trend_window", "trend_eq", "trend_color",
@@ -8462,6 +9138,7 @@ class PersistenceMixin:
                     ("bins", self.bins_spin, "val"), ("pct", self.pct_check, "chk"),
                     ("data_labels", self.data_labels_check, "chk"),
                     ("swap_xy", getattr(self, "swap_xy_check", None), "chk"),
+                    ("stack", getattr(self, "stack_check", None), "chk"),
                     ("trend", self.trend_combo, "txt"), ("trend_degree", self.trend_degree, "val"),
                     ("trend_window", self.trend_window, "val"), ("trend_eq", self.trend_eq, "chk")):
                 if widget is None:

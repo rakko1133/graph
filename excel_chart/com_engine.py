@@ -51,7 +51,7 @@ def _set_line(fmt, color_bgr, width_pt, dash):
         pass
 
 
-def write(spec, df, out_path, *, visible=False, macro_enabled=False):
+def write(spec, df, out_path, *, visible=False, macro_enabled=False, extra_sheets=None):
     """ChartSpec + DataFrame からネイティブ Excel グラフ入りブックを保存する。
 
     out_path: .xlsx（既定）。macro_enabled=True または拡張子 .xlsm なら .xlsm 保存。
@@ -92,6 +92,14 @@ def write(spec, df, out_path, *, visible=False, macro_enabled=False):
         nrow = _write_data(ws, spec, df)        # シートへ列を書き込み、行数を返す
         chart = _build_chart(ws, spec, df, nrow)
         _format_axes_and_legend(chart, spec)
+
+        for name, rows in (extra_sheets or {}).items():
+            es = wb.Worksheets.Add(After=wb.Worksheets(wb.Worksheets.Count))
+            es.Name = str(name)[:31]   # Excel のシート名は31文字まで
+            if rows:
+                ncol = max(len(r) for r in rows)
+                block = [list(r) + [None] * (ncol - len(r)) for r in rows]
+                es.Range(es.Cells(1, 1), es.Cells(len(block), ncol)).Value = block
 
         wb.SaveAs(out_path, FileFormat=file_format)
         wb.Close(SaveChanges=False)

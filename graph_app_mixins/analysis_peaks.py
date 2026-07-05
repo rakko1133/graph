@@ -69,7 +69,31 @@ class AnalysisMixin:
         y = np.asarray(y, float)
         res = analysis.analyze(t, y, n_peaks=self.npeaks.value(),
                                smooth=self.smooth_spin.value())
+        self._show_analysis_result(res, f"解析しました: {label}")
 
+    def _run_gated_analysis(self, x0, x1):
+        """区間測定: 表示座標 [x0, x1] の範囲だけを解析して表に表示する。"""
+        import numpy as np
+        t, y, label = self._analysis_xy()
+        if t is None:
+            self._set_status("区間測定: 『オシロ/解析』の解析対象で系列を選択してください。")
+            return
+        t = np.asarray(t, float)
+        # 画面のX座標は単位変換後。生の t を同じ変換にかけてから区間を切り出す
+        t_disp = mathchan.axis_scale(t, self.xscale_edit.text())
+        mask = (t_disp >= x0) & (t_disp <= x1)
+        if int(mask.sum()) < 3:
+            self._set_status("区間測定: 選択した区間のデータ点が少なすぎます（3点以上必要）。")
+            return
+        res = analysis.analyze(t[mask], np.asarray(y, float)[mask],
+                               n_peaks=self.npeaks.value(), smooth=self.smooth_spin.value())
+        self._show_analysis_result(
+            res,
+            f"区間測定 [{plotter.format_eng(x0)} 〜 {plotter.format_eng(x1)}]: "
+            f"{label}（{int(mask.sum()):,}点）", redraw_ok=False)
+
+    def _show_analysis_result(self, res, status, redraw_ok=True):
+        """解析結果（ピーク・測定値）を表に反映する（解析実行・区間測定で共通）。"""
         self.peak_table.setRowCount(len(res["peaks"]))
         for r, p in enumerate(res["peaks"]):
             self.peak_table.setItem(r, 0, QtWidgets.QTableWidgetItem(f"第{p['rank']}"))
@@ -91,9 +115,9 @@ class AnalysisMixin:
             cb.toggled.connect(self._refresh_meas_annotations)
             self.meas_table.setCellWidget(r, 2, cb)
 
-        if self.show_peaks_check.isChecked() or had_ann:
+        if redraw_ok and (self.show_peaks_check.isChecked() or had_ann):
             self.draw_graph()   # ピーク表示中、または前回の注記を消すため
-        self._set_status(f"解析しました: {label}")
+        self._set_status(status)
 
     def _refresh_meas_annotations(self, *_):
         """測定値表で『表示』にチェックした行を集めてグラフへ注記表示する。"""
@@ -197,6 +221,7 @@ class AnalysisMixin:
             pk.setItem(r, 2, QtWidgets.QTableWidgetItem("-" if tv is None else f"{tv:.4g} ms"))
             pk.setItem(r, 3, QtWidgets.QTableWidgetItem(f"{val:.6g}"))
         pk.resizeColumnsToContents()
+        self._wire_table_export(pk, "全系列ピーク")
         lay.addWidget(pk)
 
         lay.addWidget(QtWidgets.QLabel("■ 測定（系列ごと）"))
@@ -209,6 +234,7 @@ class AnalysisMixin:
             ms.setItem(r, 2, QtWidgets.QTableWidgetItem("-" if val is None else f"{val:.6g}"))
             ms.setItem(r, 3, QtWidgets.QTableWidgetItem(str(unit)))
         ms.resizeColumnsToContents()
+        self._wire_table_export(ms, "全系列測定")
         lay.addWidget(ms, 1)
 
         brow = QtWidgets.QHBoxLayout()

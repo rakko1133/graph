@@ -100,6 +100,85 @@ class DataIOMixin:
         self._push_recent(path)
         self._set_status(f"{label} を読み込み（{len(df)}行 × {len(df.columns)}列, {used_enc}）")
 
+    # ------------------------------------------------------------ ファイル監視（自動再読込）
+    # 測定器やロガーが書き続けるCSVを監視し、更新されたら自動で読み直して再描画する。
+    # メニュー「ファイル→ファイルの変更を監視して自動再読込」でON/OFF（QSettingsに保存）。
+    def _watch_enabled(self):
+        return bool(getattr(self, "_watch_action", None) and self._watch_action.isChecked())
+
+    def toggle_file_watch(self, on):
+        self._ui_settings().setValue("ui/watch_files", "1" if on else "0")
+        if on:
+            self._ensure_watcher()
+            self._rebuild_watch_paths()
+            self._set_status("ファイル監視: ON（監視中のファイルが更新されると自動で再読込・再描画します）")
+        else:
+            w = getattr(self, "_fs_watcher", None)
+            if w is not None and w.files():
+                w.removePaths(w.files())
+            self._set_status("ファイル監視: OFF")
+
+    def _ensure_watcher(self):
+        if getattr(self, "_fs_watcher", None) is None:
+            self._fs_watcher = QtCore.QFileSystemWatcher(self)
+            self._fs_watcher.fileChanged.connect(self._on_watched_file_changed)
+            self._watch_pending = set()
+            self._watch_timer = QtCore.QTimer(self)
+            self._watch_timer.setSingleShot(True)
+            self._watch_timer.setInterval(600)   # 書き込み途中の連続イベントをまとめる
+            self._watch_timer.timeout.connect(self._reload_watched)
+
+    def _rebuild_watch_paths(self):
+        """監視対象を現在の読み込みファイル一覧に合わせて貼り直す。"""
+        if not self._watch_enabled():
+            return
+        self._ensure_watcher()
+        w = self._fs_watcher
+        if w.files():
+            w.removePaths(w.files())
+        paths = sorted({m.get("path") for m in self.meta.values()
+                        if m.get("path") and os.path.isfile(m.get("path"))})
+        if paths:
+            w.addPaths(paths)
+
+    def _on_watched_file_changed(self, path):
+        self._watch_pending.add(path)
+        self._watch_timer.start()
+
+    def _reload_watched(self):
+        pending, self._watch_pending = set(self._watch_pending), set()
+        labels = [l for l, m in self.meta.items() if m.get("path") in pending]
+        reloaded = []
+        for label in labels:
+            if self._reload_label_inplace(label):
+                reloaded.append(label)
+        # エディタの「置換保存」では旧ファイルが消えて監視から外れるため貼り直す
+        self._rebuild_watch_paths()
+        if reloaded:
+            self._refresh_columns()
+            if self._has_drawn:
+                self.draw_graph()
+            self._set_status("自動再読込: " + ", ".join(reloaded))
+
+    def _reload_label_inplace(self, label):
+        """一覧の並びと選択を保ったまま、保存済みの読み込み条件でデータだけ差し替える。"""
+        meta = self.meta.get(label) or {}
+        path = meta.get("path")
+        if not path or not os.path.isfile(path):
+            return False
+        enc = meta.get("enc")
+        enc = None if (not enc or str(enc).startswith(("自動", "clipboard"))) else enc
+        try:
+            df, used_enc, used_delim = data_loader.load_table(
+                path, encoding=enc, delimiter=meta.get("delim"))
+        except Exception:  # noqa: BLE001  書き込み途中で開けない等は次の変更イベントに任せる
+            return False
+        self.datasets[label] = df
+        self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim}
+        if getattr(self, "_preview_label", None) == label:
+            self._populate_preview(df, label=label)
+        return True
+
     def _find_file_item(self, label):
         for i in range(self.file_list.count()):
             if self.file_list.item(i).text() == label:
@@ -287,6 +366,7 @@ class DataIOMixin:
         self.y_list.blockSignals(False)
         if hasattr(self, "explorer"):
             self._rebuild_explorer()     # ファイル→列ツリーを作り直す
+        self._rebuild_watch_paths()      # ファイル監視ON時は監視対象を貼り直す
         self._on_y_selection_changed()   # スタイル表・解析候補をまとめて更新
 
     def _selected_series_items(self):
@@ -309,10 +389,31 @@ class DataIOMixin:
             self.table.setColumnCount(len(cols))
             self.table.setRowCount(len(head))
             self.table.setHorizontalHeaderLabels([str(c) for c in cols])
+            nan_bg = QtGui.QBrush(QtGui.QColor("#ffe4e1"))   # 欠損セルは薄赤で目立たせる
             for r in range(len(head)):
                 for c in range(len(cols)):
                     v = head.iat[r, c]
-                    self.table.setItem(r, c, QtWidgets.QTableWidgetItem("" if pd.isna(v) else str(v)))
+                    missing = pd.isna(v)
+                    it = QtWidgets.QTableWidgetItem("" if missing else str(v))
+                    if missing:
+                        it.setBackground(nan_bg)
+                        it.setToolTip("欠損値（NaN）")
+                    self.table.setItem(r, c, it)
+            # 列ヘッダに品質情報のツールチップ（型・全行の欠損数・数値なら範囲）。
+            # 欠損を含む列はヘッダ名に ⚠ を付けて一目でわかるようにする。
+            for c, col in enumerate(cols):
+                s = df[col]
+                n_nan = int(s.isna().sum())
+                tip = [f"列: {col}", f"型: {s.dtype}", f"全 {len(s):,} 行"]
+                if n_nan:
+                    tip.append(f"⚠ 欠損: {n_nan:,} 行（{n_nan / max(len(s), 1):.1%}）")
+                if pd.api.types.is_numeric_dtype(s):
+                    v = s.dropna()
+                    if len(v):
+                        tip.append(f"範囲: {v.min():.6g} 〜 {v.max():.6g}")
+                hi = QtWidgets.QTableWidgetItem(("⚠ " if n_nan else "") + str(col))
+                hi.setToolTip("\n".join(tip))
+                self.table.setHorizontalHeaderItem(c, hi)
             self.table.resizeColumnsToContents()
             if label is not None:
                 self._preview_label = label
@@ -342,7 +443,10 @@ class DataIOMixin:
             val = pd.to_numeric(text, errors="coerce")   # 数値列は数値化（不可ならNaN）
         else:
             val = text
+        old = df.iat[r, c]
         df.iat[r, c] = val
+        self._data_record({"kind": "cell", "label": self._preview_label,
+                           "row": r, "col": c, "old": old, "new": val})
         self._set_status(f"編集: {self._preview_label} 行{r}「{col}」= {text}")
         self._request_redraw()
 
@@ -361,6 +465,7 @@ class DataIOMixin:
         df = self.datasets[lbl]
         df.loc[len(df)] = [np.nan] * df.shape[1]
         df.reset_index(drop=True, inplace=True)
+        self._data_record({"kind": "row_add", "label": lbl})
         self._populate_preview(df, label=lbl)
         if len(df) > PREVIEW_ROWS:
             self._set_status(f"行を追加（全{len(df)}行。表示は先頭{PREVIEW_ROWS}行）")
@@ -370,11 +475,13 @@ class DataIOMixin:
         lbl = self._edit_target()
         if not lbl:
             return
-        rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
         if not rows:
             self._set_status("削除する行を選択してください。")
             return
         df = self.datasets[lbl]
+        self._data_record({"kind": "row_del", "label": lbl, "rows": rows,
+                           "data": df.iloc[rows].copy()})
         df.drop(df.index[rows], inplace=True)
         df.reset_index(drop=True, inplace=True)
         self._populate_preview(df, label=lbl)
@@ -393,9 +500,97 @@ class DataIOMixin:
             QtWidgets.QMessageBox.warning(self, "列追加", "同名の列が既にあります。")
             return
         df[name] = 0.0
+        self._data_record({"kind": "col_add", "label": lbl, "name": name})
         self._populate_preview(df, label=lbl)
         self._refresh_columns()      # X/Y軸の候補へ反映
         self._set_status(f"列「{name}」を追加（値0.0で初期化）")
+
+    # ------------------------------------------------------------ データ編集の Undo / Redo
+    # 設定のUndo（Ctrl+Z）とは別に、セル編集・行追加/削除・列追加を逆操作で戻せる。
+    # 位置ベースの記録だが、スタックを順に戻す/やり直す限り整合する（LIFO前提）。
+    def _data_record(self, op):
+        if not hasattr(self, "_data_hist"):
+            self._data_hist, self._data_hist_i = [], -1
+        del self._data_hist[self._data_hist_i + 1:]   # redo分岐を捨てる
+        self._data_hist.append(op)
+        if len(self._data_hist) > 100:
+            self._data_hist.pop(0)
+        self._data_hist_i = len(self._data_hist) - 1
+
+    def _data_undo(self):
+        hist = getattr(self, "_data_hist", None)
+        if not hist or self._data_hist_i < 0:
+            self._set_status("戻せるデータ編集はありません。")
+            return
+        op = hist[self._data_hist_i]
+        if self._data_apply(op, forward=False):
+            self._data_hist_i -= 1
+            self._set_status(f"データ編集を戻しました（{self._data_op_name(op)}）。")
+
+    def _data_redo(self):
+        hist = getattr(self, "_data_hist", None)
+        if not hist or self._data_hist_i >= len(hist) - 1:
+            self._set_status("やり直せるデータ編集はありません。")
+            return
+        op = hist[self._data_hist_i + 1]
+        if self._data_apply(op, forward=True):
+            self._data_hist_i += 1
+            self._set_status(f"データ編集をやり直しました（{self._data_op_name(op)}）。")
+
+    @staticmethod
+    def _data_op_name(op):
+        return {"cell": "セル編集", "row_add": "行追加",
+                "row_del": "行削除", "col_add": "列追加"}.get(op["kind"], op["kind"])
+
+    def _data_apply(self, op, forward):
+        """opを適用（forward=True）/逆適用（False）する。対象ファイルが無ければ何もしない。"""
+        import pandas as pd
+        label = op["label"]
+        df = self.datasets.get(label)
+        if df is None:
+            self._set_status(f"対象ファイル「{label}」は読み込まれていません。")
+            return False
+        kind = op["kind"]
+        if kind == "cell":
+            r, c = op["row"], op["col"]
+            if r >= len(df) or c >= df.shape[1]:
+                return False
+            df.iat[r, c] = op["new"] if forward else op["old"]
+        elif kind == "row_add":
+            if forward:
+                import numpy as np
+                df.loc[len(df)] = [np.nan] * df.shape[1]
+                df.reset_index(drop=True, inplace=True)
+            else:
+                if not len(df):
+                    return False
+                df.drop(df.index[-1], inplace=True)
+                df.reset_index(drop=True, inplace=True)
+        elif kind == "row_del":
+            if forward:
+                df.drop(df.index[op["rows"]], inplace=True)
+                df.reset_index(drop=True, inplace=True)
+            else:   # 削除した行を元の位置へ差し戻す（1回のconcatで済ませる）
+                parts, prev = [], 0
+                for j, r in enumerate(op["rows"]):
+                    cut = r - j
+                    parts.append(df.iloc[prev:cut])
+                    parts.append(op["data"].iloc[[j]])
+                    prev = cut
+                parts.append(df.iloc[prev:])
+                self.datasets[label] = pd.concat(parts, ignore_index=True)
+        elif kind == "col_add":
+            if forward:
+                self.datasets[label][op["name"]] = 0.0
+            else:
+                self.datasets[label].drop(columns=[op["name"]], inplace=True, errors="ignore")
+        df2 = self.datasets[label]
+        if getattr(self, "_preview_label", None) == label:
+            self._populate_preview(df2, label=label)
+        if kind == "col_add":
+            self._refresh_columns()   # X/Y候補・ツリーへ反映
+        self._request_redraw()
+        return True
 
     def _save_csv(self):
         lbl = self._edit_target()

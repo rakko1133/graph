@@ -13,7 +13,19 @@ class UIBuildMixin:
             act.setStatusTip(tip)
         act.triggered.connect(slot)
         menu.addAction(act)
+        self._palette_register(menu.title(), label, act)
         return act
+
+    def _palette_register(self, category, label, act):
+        """コマンドパレットの候補として登録する。
+
+        メニューを動的に走査すると PySide6 の QAction.menu() が返す一時ラッパーの
+        破棄で C++ 側の QMenu ごと削除される（所有権の罠）ため、構築時に登録した
+        アクションだけを候補にする。"""
+        if not hasattr(self, "_all_actions"):
+            self._all_actions = []
+        cat = str(category).replace("&", "").replace("...", "").strip()
+        self._all_actions.append((f"{cat} › {label.replace('&', '')}", act))
 
     def _build_menu(self):
         m = self.menuBar()
@@ -25,8 +37,18 @@ class UIBuildMixin:
         self.recent_menu = fm.addMenu("最近使ったファイル")
         self._rebuild_recent_menu()
         fm.addSeparator()
+        self._watch_action = QtGui.QAction("ファイルの変更を監視して自動再読込", self)
+        self._watch_action.setCheckable(True)
+        self._watch_action.setStatusTip("読み込み済みファイルが外部で更新されたら自動で読み直して再描画します"
+                                        "（測定器・ロガーのライブ監視向け）")
+        self._watch_action.toggled.connect(self.toggle_file_watch)
+        fm.addAction(self._watch_action)
+        self._palette_register("ファイル", "ファイルの変更を監視して自動再読込", self._watch_action)
+        fm.addSeparator()
         self._menu_action(fm, "グラフ画像を保存...", self.save_figure, "Ctrl+S")
         self._menu_action(fm, "ファイルごとに一括画像出力...", self.batch_export, "Ctrl+B")
+        self._menu_action(fm, "Excelレポート出力...", self.export_excel_report, None,
+                          tip="現在のグラフ（ネイティブExcelグラフ）とデータ・解析結果の表を1つのExcelブックに出力")
         self._menu_action(fm, "クリップボードにコピー", self.copy_figure, "Ctrl+Shift+C")
         fm.addSeparator()
         self._menu_action(fm, "設定を保存...", self.save_config_dialog, "Ctrl+Shift+S")
@@ -40,6 +62,9 @@ class UIBuildMixin:
         # 表示
         vm = m.addMenu("表示(&V)")
         self.view_menu = vm   # パネルの表示/非表示トグルを _build_central で追加する
+        self._menu_action(vm, "コマンドパレット...", self.show_command_palette, "Ctrl+Shift+P",
+                          tip="すべてのメニュー操作を名前で検索して実行")
+        vm.addSeparator()
         self._menu_action(vm, "グラフを描画", self.draw_graph, "F5")
         self._menu_action(vm, "全データに合わせる（オートスケール）", self.auto_scale_scope, None)
         # 解析
@@ -51,6 +76,70 @@ class UIBuildMixin:
         hm = m.addMenu("ヘルプ(&H)")
         self._menu_action(hm, "使い方", self.show_help, "F1")
         self._menu_action(hm, "バージョン情報", self.show_about, None)
+
+    def show_command_palette(self):
+        """コマンドパレット（Ctrl+Shift+P）: 登録済みの全メニュー操作を名前で検索して実行する。
+        （最近使ったファイルなど動的に増減する項目は対象外）"""
+        acts = list(getattr(self, "_all_actions", []))
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("コマンドパレット")
+        dlg.resize(560, 420)
+        v = QtWidgets.QVBoxLayout(dlg)
+        edit = QtWidgets.QLineEdit()
+        edit.setPlaceholderText("コマンド名で検索（例: FFT ／ 保存 ／ 切り離し）")
+        lst = QtWidgets.QListWidget()
+        v.addWidget(edit)
+        v.addWidget(lst, 1)
+
+        def refill(text=""):
+            tl = text.strip().lower()
+            lst.clear()
+            for name, a in acts:
+                if tl and tl not in name.lower():
+                    continue
+                try:
+                    if not a.isEnabled():
+                        continue
+                    sc = a.shortcut().toString()
+                except RuntimeError:
+                    continue   # 破棄済みアクションはスキップ
+                it = QtWidgets.QListWidgetItem(name + (f"　（{sc}）" if sc else ""))
+                it.setData(UserRole, a)
+                lst.addItem(it)
+            if lst.count():
+                lst.setCurrentRow(0)
+
+        def run_current():
+            it = lst.currentItem()
+            if it is not None:
+                act = it.data(UserRole)
+                dlg.accept()
+                try:
+                    act.trigger()
+                except RuntimeError:
+                    self._set_status("この操作は現在実行できません。")
+
+        edit.textChanged.connect(refill)
+        edit.returnPressed.connect(run_current)
+        lst.itemActivated.connect(lambda *_: run_current())
+
+        class _Nav(QtCore.QObject):
+            """検索ボックスにフォーカスしたまま ↑↓ で候補を選べるようにする。"""
+            def eventFilter(self, _obj, ev):
+                if (ev.type() == QtCore.QEvent.Type.KeyPress
+                        and ev.key() in (QtCore.Qt.Key.Key_Down, QtCore.Qt.Key.Key_Up)):
+                    step = 1 if ev.key() == QtCore.Qt.Key.Key_Down else -1
+                    lst.setCurrentRow(max(0, min(lst.count() - 1, lst.currentRow() + step)))
+                    return True
+                return False
+
+        nav = _Nav(dlg)
+        edit.installEventFilter(nav)
+        refill()
+        edit.setFocus()
+        self._palette_dlg = dlg   # テスト・再入から参照できるように保持
+        dlg.exec()
 
     def _build_toolbar(self):
         """よく使う操作をワンクリックで呼べるツールバー（メニューと同じ機能）。"""
@@ -146,6 +235,7 @@ class UIBuildMixin:
             act = d.toggleViewAction()
             act.setStatusTip(f"{d.windowTitle()} パネルの表示/非表示")
             vm.addAction(act)
+            self._palette_register("表示", f"{d.windowTitle()} パネルの表示/非表示", act)
         # ドラッグ以外の明示的な切り離し手段（チェック=別ウィンドウ、外す=元に戻す）
         vm.addSeparator()
         float_menu = vm.addMenu("別ウィンドウで表示（切り離し）")
@@ -160,6 +250,7 @@ class UIBuildMixin:
             d.topLevelChanged.connect(self._wire_dock_tabbars)
             d.dockLocationChanged.connect(self._wire_dock_tabbars)
             float_menu.addAction(a)
+            self._palette_register("表示", f"{d.windowTitle()} を別ウィンドウで表示", a)
             self._float_actions[d.objectName()] = a
         vm.addSeparator()
         self._menu_action(vm, "パネル配置をリセット", self._reset_panel_layout,
@@ -729,6 +820,16 @@ class UIBuildMixin:
         self.threed_check.toggled.connect(self._on_3d_toggled)
         v.addWidget(self.threed_check)
 
+        # 系列ごとに段を分けるサブプロット表示（折れ線/散布図の2Dのみ）
+        self.stack_check = QtWidgets.QCheckBox("系列ごとに段を分ける（サブプロット）")
+        self.stack_check.setToolTip(
+            "各系列を上下の段に分けて描きます（X軸は共有・最大8段）。\n"
+            "単位が違う系列の比較に便利。折れ線/散布図の2Dで有効。\n"
+            "オシロ表示・第2軸・塗りつぶしとは併用できません（通常表示に戻ります）。\n"
+            "一括画像出力には適用されません。")
+        self.stack_check.setEnabled(False)
+        v.addWidget(self.stack_check)
+
         # 3D の視点角度（マウスドラッグでも回転可。ここで数値指定もできる）
         view = QtWidgets.QHBoxLayout()
         view.addWidget(QtWidgets.QLabel("3D視点 仰角"))
@@ -1075,12 +1176,20 @@ class UIBuildMixin:
         brow2 = QtWidgets.QHBoxLayout()
         brow2.addWidget(b_fft); brow2.addWidget(b_cur)
         v.addLayout(brow2)
+        b_gate = QtWidgets.QPushButton("区間測定（ドラッグで範囲指定）")
+        b_gate.setCheckable(True)
+        b_gate.setToolTip("ONにしてグラフ上を横にドラッグすると、選んだX区間だけの\n"
+                          "測定値（平均/RMS/周期など）を下の表に表示します。")
+        b_gate.toggled.connect(self.toggle_gate)
+        self.gate_btn = b_gate
+        v.addWidget(b_gate)
 
         v.addWidget(self._bold("ピーク（第1=最大）"))
         self.peak_table = QtWidgets.QTableWidget(0, 3)
         self.peak_table.setHorizontalHeaderLabels(["順位", "時間/周波数", "値"])
         self.peak_table.horizontalHeader().setStretchLastSection(True)
         self.peak_table.setMaximumHeight(160)
+        self._wire_table_export(self.peak_table, "ピーク")
         v.addWidget(self.peak_table)
 
         v.addWidget(self._bold("測定値（右端「表示」でグラフに注記）"))
@@ -1091,6 +1200,7 @@ class UIBuildMixin:
         mh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
         mh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.meas_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._wire_table_export(self.meas_table, "測定値")
         v.addWidget(self.meas_table, 1)
         # 統計・トレンド・位相
         srow = QtWidgets.QHBoxLayout()
@@ -1166,6 +1276,7 @@ class UIBuildMixin:
         self.fft_metrics.setHorizontalHeaderLabels(["指標", "値"])
         self.fft_metrics.horizontalHeader().setStretchLastSection(True)
         self.fft_metrics.setMaximumHeight(170)
+        self._wire_table_export(self.fft_metrics, "FFT指標")
         v.addWidget(self.fft_metrics)
         v.addWidget(self._hline())
 
@@ -1212,6 +1323,7 @@ class UIBuildMixin:
         self.proto_table = QtWidgets.QTableWidget(0, 4)
         self.proto_table.setHorizontalHeaderLabels(["時刻", "種別", "値(hex)", "備考"])
         self.proto_table.horizontalHeader().setStretchLastSection(True)
+        self._wire_table_export(self.proto_table, "プロトコル解読")
         v.addWidget(self.proto_table, 1)
 
         self._on_math_op_change(self.math_op.currentText())
@@ -1294,6 +1406,7 @@ class UIBuildMixin:
         hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.ds_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._wire_table_export(self.ds_table, "統計解析")
         v.addWidget(self.ds_table, 1)
         return outer
 
@@ -1330,6 +1443,8 @@ class UIBuildMixin:
         self.canvas.mpl_connect("motion_notify_event", self._scope_on_motion)
         self.canvas.mpl_connect("button_release_event", self._scope_on_release)
         self.canvas.mpl_connect("scroll_event", self._scope_on_scroll)
+        self.canvas.mpl_connect("motion_notify_event", self._hover_readout)
+        self.canvas.mpl_connect("pick_event", self._on_legend_pick)
         self._draw_placeholder()
         return wrap
 
@@ -1395,6 +1510,8 @@ class UIBuildMixin:
                 ("行追加", self._row_add, "末尾に空行を追加"),
                 ("行削除", self._row_del, "選択した行を削除"),
                 ("列追加", self._col_add, "新しい数値列を追加"),
+                ("編集を戻す", self._data_undo, "データ編集（セル・行・列）を1つ戻す"),
+                ("やり直す", self._data_redo, "戻したデータ編集をやり直す"),
                 ("CSV保存", self._save_csv, "編集後のデータをCSV/TSVに書き出し")]:
             b = QtWidgets.QPushButton(text); b.setToolTip(tip)
             b.clicked.connect(slot); bar.addWidget(b)
@@ -1409,8 +1526,69 @@ class UIBuildMixin:
 
     def _build_statusbar(self):
         self.status = self.statusBar()
+        # マウス近傍のデータ値の常時表示（右端。通常のステータス文言とは独立）
+        self._hover_label = QtWidgets.QLabel("")
+        self._hover_label.setStyleSheet("color:#0a7a55;")
+        self.status.addPermanentWidget(self._hover_label)
         fi = f"日本語: {self.font_name}" if self.font_name else "日本語フォント未検出"
         self.status.addPermanentWidget(QtWidgets.QLabel(fi))
+
+    # ---- 表の右クリック：コピー / CSV保存（結果表を報告に持ち出せるように）----
+    def _wire_table_export(self, table, name):
+        """表に右クリックメニュー（コピー/CSV保存）を付ける。読み取り専用の結果表向け。"""
+        table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(
+            lambda pos, t=table, n=name: self._table_export_menu(t, n, pos))
+
+    def _table_export_menu(self, table, name, pos):
+        menu = QtWidgets.QMenu(table)
+        if table.selectedIndexes():
+            menu.addAction("選択範囲をコピー", lambda: self._copy_table(table, True))
+        menu.addAction("表全体をコピー", lambda: self._copy_table(table, False))
+        menu.addAction("CSVで保存…", lambda: self._save_table_csv(table, name))
+        menu.exec(table.viewport().mapToGlobal(pos))
+
+    @staticmethod
+    def _table_rows(table, selected_only):
+        """表の内容を [ヘッダ行, データ行...] で返す。セルウィジェット（チェック等）は空欄。"""
+        if selected_only and table.selectedIndexes():
+            rows = sorted({i.row() for i in table.selectedIndexes()})
+            cols = sorted({i.column() for i in table.selectedIndexes()})
+        else:
+            rows = range(table.rowCount())
+            cols = range(table.columnCount())
+        def head(c):
+            h = table.horizontalHeaderItem(c)
+            return h.text() if h is not None else str(c)
+        out = [[head(c) for c in cols]]
+        for r in rows:
+            line = []
+            for c in cols:
+                it = table.item(r, c)
+                line.append(it.text() if it is not None else "")
+            out.append(line)
+        return out
+
+    def _copy_table(self, table, selected_only):
+        rows = self._table_rows(table, selected_only)
+        text = "\n".join("\t".join(cells) for cells in rows)
+        QtWidgets.QApplication.clipboard().setText(text)
+        self._set_status(f"{len(rows) - 1} 行をコピーしました（Excel等にそのまま貼り付け可）。")
+
+    def _save_table_csv(self, table, name):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, f"{name}をCSVで保存", os.path.join(self.last_dir, f"{name}.csv"),
+            "CSV (*.csv)")
+        if not path:
+            return
+        import csv
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                csv.writer(f).writerows(self._table_rows(table, False))
+            self.last_dir = os.path.dirname(path)
+            self._set_status(f"{name}を保存しました: {path}")
+        except OSError as e:
+            QtWidgets.QMessageBox.critical(self, "保存エラー", str(e))
 
     @staticmethod
     def _bold(text):
@@ -1436,7 +1614,7 @@ class UIBuildMixin:
             s.valueChanged.connect(r)
         for c in (self.grid_check, self.legend_check, self.pct_check,
                   self.xlog, self.ylog, self.show_filename_check, self.show_ext_check,
-                  self.xinvert_check, self.yinvert_check):
+                  self.xinvert_check, self.yinvert_check, self.stack_check):
             c.toggled.connect(r)
         self.legend_loc.currentTextChanged.connect(r)
         # 近似曲線・データラベル

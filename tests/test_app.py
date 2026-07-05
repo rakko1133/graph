@@ -411,6 +411,39 @@ def test_explorer_tree_sync():
     assert tree.topLevelItemCount() == 0
 
 
+def test_new_ux_features():
+    """段分け表示・区間測定・データ編集Undo・表エクスポートの回帰。"""
+    w = _make_app(_wave())
+    w.draw_graph()
+    # 結果表の行抽出（コピー/CSV保存の土台）
+    w.run_analysis()
+    rows = w._table_rows(w.meas_table, False)
+    assert rows[0][0] == "項目" and len(rows) > 3
+    # 区間測定（ドラッグ範囲→測定）
+    w.gate_btn.setChecked(True)
+    w._on_gate_select(0.002, 0.012)
+    assert any(w.meas_table.item(r, 1).text() != "-"
+               for r in range(w.meas_table.rowCount()))
+    w.gate_btn.setChecked(False)
+    # 段分け表示（系列ごとにサブプロット）と通常表示への復帰
+    w.stack_check.setChecked(True)
+    w.draw_graph()
+    assert w._stacked and len(w.fig.axes) == 2   # 電圧・電流の2段
+    w.stack_check.setChecked(False)
+    w.draw_graph()
+    assert not getattr(w, "_stacked", False)
+    assert len(w.ax.get_lines()) >= 2            # 単一軸に戻って重ね描き
+    # データ編集の Undo / Redo
+    lbl = w._preview_label
+    n0 = len(w.datasets[lbl])
+    w._row_add()
+    assert len(w.datasets[lbl]) == n0 + 1
+    w._data_undo()
+    assert len(w.datasets[lbl]) == n0
+    w._data_redo()
+    assert len(w.datasets[lbl]) == n0 + 1
+
+
 def test_undo_redo():
     w = _make_app(_wave())
     for s in ("A", "B", "C"):

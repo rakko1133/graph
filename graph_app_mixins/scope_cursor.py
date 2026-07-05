@@ -6,6 +6,8 @@ from graph_app_common import *  # noqa: F401,F403
 class ScopeCursorMixin:
     # ------------------------------------------------------------ カーソル測定
     def toggle_cursors(self, on):
+        if on and getattr(self, "gate_btn", None) and self.gate_btn.isChecked():
+            self.gate_btn.setChecked(False)   # 区間測定と排他（ドラッグ操作が競合する）
         if on:
             self._cursors = []          # [{x, vline, marker}, ...] 最大2本
             self._cursor_drag = None
@@ -154,6 +156,15 @@ class ScopeCursorMixin:
         return bool(event is not None and event.key and "shift" in str(event.key))
 
     def _scope_on_press(self, event):
+        # ダブルクリック=全体表示（カーソル測定・ツールバーモード・3Dでは無効）
+        if (event.dblclick and event.button == 1
+                and event.inaxes is not None and event.inaxes in self.fig.axes
+                and self._cursor_cid is None and not getattr(self.toolbar, "mode", "")
+                and getattr(event.inaxes, "name", None) != "3d"
+                and event.inaxes.get_label() != "<colorbar>"
+                and getattr(self, "_has_drawn", False)):
+            self._autoscale_view()
+            return
         if (not self._scope_active() or event.inaxes is not self.ax
                 or event.button not in (1, 3) or event.x is None):
             return
@@ -227,26 +238,138 @@ class ScopeCursorMixin:
 
     def _wheel_zoom(self, event):
         """通常グラフのマウスホイール拡大縮小。カーソル位置を中心にズームする。
-        Shift+ホイールはX方向のみ（波形の横拡大）。"""
+        Shift+ホイールはX方向のみ（波形の横拡大）。段分け表示中はホバー中の段を拡縮。"""
         # カーソル測定中・ツールバーのパン/ズーム中・未描画・円・3Dでは無効
         # （3Dは mplot3d 標準のドラッグ回転・ホイールに任せる）
+        ax = event.inaxes if event.inaxes in self.fig.axes else self.ax
         if (self._cursor_cid is not None
                 or getattr(self.toolbar, "mode", "")
                 or not getattr(self, "_has_drawn", False)
                 or self.chart_combo.currentText() == "円"
-                or getattr(self.ax, "name", None) == "3d"):
+                or getattr(ax, "name", None) == "3d"
+                or ax.get_label() == "<colorbar>"):
             return
         factor = 0.8 if event.button == "up" else 1.25   # up=拡大（範囲を狭める）
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
         xc = event.xdata if event.xdata is not None else (x0 + x1) / 2.0
         yc = event.ydata if event.ydata is not None else (y0 + y1) / 2.0
-        xlog = self.ax.get_xscale() == "log"
-        ylog = self.ax.get_yscale() == "log"
-        self.ax.set_xlim(*self._zoom_pair(x0, x1, xc, factor, xlog))
+        xlog = ax.get_xscale() == "log"
+        ylog = ax.get_yscale() == "log"
+        ax.set_xlim(*self._zoom_pair(x0, x1, xc, factor, xlog))
         if not self._shift_held(event):     # Shift押下時はYを保持（横方向のみ拡大）
-            self.ax.set_ylim(*self._zoom_pair(y0, y1, yc, factor, ylog))
+            ax.set_ylim(*self._zoom_pair(y0, y1, yc, factor, ylog))
         self.canvas.draw_idle()
+
+    # ------------------------------------------------------ 区間測定（ゲーティング）
+    def toggle_gate(self, on):
+        """ONの間、グラフを横にドラッグしてX区間を選ぶと、その区間だけを測定する。"""
+        if on:
+            if getattr(self.ax, "name", None) == "3d":
+                self._set_status("区間測定は2Dグラフで使えます（3D表示では無効）。")
+                self.gate_btn.setChecked(False)
+                return
+            if self.cursor_btn.isChecked():
+                self.cursor_btn.setChecked(False)   # カーソル測定と排他
+            from matplotlib.widgets import SpanSelector
+            self._gate_span = SpanSelector(
+                self.ax, self._on_gate_select, "horizontal", useblit=True,
+                props=dict(alpha=0.2, facecolor="#2b6cb0"), interactive=True)
+            self._set_status("区間測定: グラフ上を横にドラッグしてX範囲を選ぶと、"
+                             "その区間だけの測定値を下の表に表示します。")
+        else:
+            sp = getattr(self, "_gate_span", None)
+            if sp is not None:
+                try:
+                    sp.set_visible(False)
+                    sp.disconnect_events()
+                except Exception:
+                    pass
+            self._gate_span = None
+            self.canvas.draw_idle()
+
+    def _regate(self):
+        """再描画で軸の中身がクリアされた後、区間測定の選択機構を作り直す。"""
+        if getattr(self, "gate_btn", None) and self.gate_btn.isChecked():
+            self.toggle_gate(False)
+            if getattr(self.ax, "name", None) == "3d":
+                self.gate_btn.setChecked(False)   # 3Dに切り替わったら解除
+            else:
+                self.toggle_gate(True)
+
+    def _on_gate_select(self, x0, x1):
+        if x1 < x0:
+            x0, x1 = x1, x0
+        if x0 == x1:
+            return
+        self._run_gated_analysis(float(x0), float(x1))
+
+    def _autoscale_view(self):
+        """ダブルクリックで全体表示。通常グラフは軸範囲指定をクリアして再描画、
+        オシロ表示中は自動スケール（解析対象に合わせる）。"""
+        if (self.scope_check.isChecked()
+                and self.chart_combo.currentText() in ("折れ線", "散布図")):
+            self.auto_scale_scope()
+            return
+        self._suspend_redraw = True
+        for le in (self.xmin, self.xmax, self.ymin, self.ymax):
+            le.clear()
+        self._suspend_redraw = False
+        self.draw_graph()
+        self._set_status("全体表示に戻しました（ダブルクリックでいつでも戻れます）。")
+
+    def _hover_readout(self, event):
+        """マウス近傍のデータ点（系列名・X・Y）をステータスバー右端に常時表示する。
+        ピクセル座標で最近傍を探すので、対数軸・単位換算後の表示座標でも正しい。"""
+        lbl = getattr(self, "_hover_label", None)
+        if lbl is None:
+            return
+        ax = event.inaxes
+        if (ax is None or ax not in self.fig.axes or event.x is None
+                or not getattr(self, "_has_drawn", False)
+                or getattr(ax, "name", None) == "3d"
+                or self._scope_drag or self._cursor_drag is not None):
+            if lbl.text():
+                lbl.setText("")
+            return
+        import time
+        now = time.monotonic()
+        if now - getattr(self, "_hover_t", 0.0) < 0.05:   # 20Hzに間引き（負荷対策）
+            return
+        self._hover_t = now
+        import numpy as np
+        # イベントの軸（段分け中は各段）と、重なっている第2軸/主軸を対象にする
+        axs = [ax]
+        twin = getattr(ax, "_twin_secondary", None)
+        if twin is not None:
+            axs.append(twin)
+        if ax is getattr(self.ax, "_twin_secondary", None):
+            axs.append(self.ax)
+        cands = [(ln.get_label(), ln) for a in axs for ln in a.get_lines()
+                 if not str(ln.get_label()).startswith("_")
+                 and "近似" not in str(ln.get_label())]
+        best = None   # (画面距離^2, 系列名, x, y)
+        for label, ln in cands:
+            try:
+                xd = np.asarray(ln.get_xdata(), float)
+                yd = np.asarray(ln.get_ydata(), float)
+            except (TypeError, ValueError):
+                continue
+            if xd.size == 0 or xd.size != yd.size:
+                continue
+            m = np.isfinite(xd) & np.isfinite(yd)
+            if not m.any():
+                continue
+            pts = ln.axes.transData.transform(np.column_stack([xd[m], yd[m]]))
+            d2 = (pts[:, 0] - event.x) ** 2 + (pts[:, 1] - event.y) ** 2
+            i = int(np.argmin(d2))
+            if best is None or d2[i] < best[0]:
+                best = (float(d2[i]), str(label), float(xd[m][i]), float(yd[m][i]))
+        if best is not None and best[0] <= 20.0 ** 2:   # 20px以内の点だけ表示
+            _, label, x, y = best
+            lbl.setText(f"{label}:  X={plotter.format_eng(x)}  Y={plotter.format_eng(y)}  ")
+        elif lbl.text():
+            lbl.setText("")
 
     @staticmethod
     def _zoom_pair(lo, hi, center, factor, log=False):
