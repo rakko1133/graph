@@ -12,6 +12,7 @@ class PersistenceMixin:
             "2. X軸の列を選び、Y軸（値）は描きたい系列にチェック（行クリックでON/OFF・全選択ボタンあり）\n"
             "3. 「グラフを描画」(F5)。『リアルタイム更新』ONなら設定変更が即反映\n"
             "4. 右端の『グラフ書式調整』パネルで種別・色・軸範囲・系列スタイルなどを編集\n"
+            "   （項目は見出しクリックで開閉できます。開閉状態・ウィンドウ配置は次回起動時に復元）\n"
             "5. 波形は『オシロ/解析』タブで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
             "【出力】右端パネルの画像出力、またはメニュー「ファイル」から保存／コピー\n"
             "【グラフ種別と列】棒/円は1ファイル、折れ線/散布図は複数ファイル重ね描き可")
@@ -22,6 +23,35 @@ class PersistenceMixin:
             "CSV / TSV / 波形 グラフ・解析ツール\n"
             "PySide6 + matplotlib 製\n"
             f"日本語フォント: {self.font_name or '未検出'}")
+
+    # ------------------------------------------------------------ UI状態（QSettings）
+    # ウィンドウ位置・分割位置・書式セクションの開閉といった「見た目の使い勝手」だけを
+    # OS のユーザー設定に保存する。グラフ設定（config JSON）とは独立で、混ざらない。
+    def _ui_settings(self):
+        return QtCore.QSettings("graph-tool", "GraphApp")
+
+    def _restore_ui_state(self):
+        s = self._ui_settings()
+        geo = s.value("ui/geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        for key, sp in (("ui/main_splitter", getattr(self, "main_splitter", None)),
+                        ("ui/center_splitter", getattr(self, "center_splitter", None)),
+                        ("ui/format_splitter", getattr(self, "format_splitter", None))):
+            st = s.value(key)
+            if st is not None and sp is not None:
+                sp.restoreState(st)
+
+    def _save_ui_state(self):
+        s = self._ui_settings()
+        s.setValue("ui/geometry", self.saveGeometry())
+        for key, sp in (("ui/main_splitter", getattr(self, "main_splitter", None)),
+                        ("ui/center_splitter", getattr(self, "center_splitter", None)),
+                        ("ui/format_splitter", getattr(self, "format_splitter", None))):
+            if sp is not None:
+                s.setValue(key, sp.saveState())
+        for k, box in getattr(self, "_fmt_sections", {}).items():
+            s.setValue("fmt_section/" + k, "1" if box.is_expanded() else "0")
 
     # ------------------------------------------------------------ 設定保存
     def _collect_config(self):

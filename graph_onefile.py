@@ -3387,6 +3387,50 @@ class LazyColumnCombo(QtWidgets.QComboBox):
             self.blockSignals(False)
         super().showPopup()
 
+class CollapsibleBox(QtWidgets.QWidget):
+    """見出しクリックで開閉できるセクション。
+
+    右パネルの書式コントロールのような縦に長い設定群を項目ごとにまとめ、
+    使わない項目を畳んで目的の設定を探しやすくする。中身のウィジェットは
+    畳んでも生きたまま（非表示になるだけ）なので、機能・設定値は変わらない。
+    """
+
+    def __init__(self, title, expanded=True, parent=None):
+        super().__init__(parent)
+        self._btn = QtWidgets.QToolButton()
+        self._btn.setText(title)
+        self._btn.setCheckable(True)
+        self._btn.setChecked(expanded)
+        self._btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._btn.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                QtWidgets.QSizePolicy.Policy.Fixed)
+        self._btn.setStyleSheet(
+            "QToolButton { border:none; font-weight:bold; text-align:left; padding:2px; }")
+        self._btn.toggled.connect(self._on_toggled)
+        self.body = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(2)
+        lay.addWidget(self._btn)
+        lay.addWidget(self.body)
+        self._on_toggled(expanded)
+
+    def _on_toggled(self, on):
+        self._btn.setArrowType(QtCore.Qt.ArrowType.DownArrow if on
+                               else QtCore.Qt.ArrowType.RightArrow)
+        self.body.setVisible(on)
+
+    def set_content_layout(self, layout):
+        layout.setContentsMargins(8, 2, 2, 2)
+        self.body.setLayout(layout)
+
+    def is_expanded(self):
+        return self._btn.isChecked()
+
+    def set_expanded(self, on):
+        self._btn.setChecked(bool(on))
+
+
 __all__ = [
     "os",
     "sys",
@@ -3413,6 +3457,7 @@ __all__ = [
     "_parse_float",
     "CheckListWidget",
     "LazyColumnCombo",
+    "CollapsibleBox",
 ]
 
 # ======================================================================
@@ -3469,6 +3514,42 @@ class UIBuildMixin:
         self._menu_action(hm, "使い方", self.show_help, "F1")
         self._menu_action(hm, "バージョン情報", self.show_about, None)
 
+    def _build_toolbar(self):
+        """よく使う操作をワンクリックで呼べるツールバー（メニューと同じ機能）。"""
+        tb = QtWidgets.QToolBar("メイン")
+        tb.setObjectName("main_toolbar")
+        tb.setMovable(False)
+        tb.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.addToolBar(tb)
+        SP = QtWidgets.QStyle.StandardPixmap
+
+        def act(text, slot, tip, icon=None):
+            if icon is not None:
+                a = QtGui.QAction(self.style().standardIcon(icon), text, self)
+            else:
+                a = QtGui.QAction(text, self)
+            a.setToolTip(tip)
+            a.triggered.connect(slot)
+            tb.addAction(a)
+            return a
+
+        act("ファイル追加", self.add_file,
+            "CSV/TSV/波形ファイルを読み込む（Ctrl+O）。ウィンドウへのドラッグ&ドロップも可",
+            SP.SP_DialogOpenButton)
+        act("貼り付け", self.paste_from_clipboard,
+            "Excel等からコピーした表を新規データとして読み込む（Ctrl+Shift+V）")
+        tb.addSeparator()
+        act("描画", self.draw_graph, "グラフを描画（F5）", SP.SP_BrowserReload)
+        tb.addSeparator()
+        act("画像保存", self.save_figure, "グラフを画像ファイルに保存（Ctrl+S）",
+            SP.SP_DialogSaveButton)
+        act("コピー", self.copy_figure, "グラフ画像をクリップボードにコピー（Ctrl+Shift+C）")
+        act("一括出力", self.batch_export,
+            "読み込んだ各ファイルを個別に描画してまとめて画像保存（Ctrl+B）")
+        tb.addSeparator()
+        act("戻す", self.undo, "書式・設定の変更を1つ戻す（Ctrl+Z）", SP.SP_ArrowBack)
+        act("やり直す", self.redo, "戻した変更をやり直す（Ctrl+Y）", SP.SP_ArrowForward)
+
     def _build_central(self):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -3476,6 +3557,7 @@ class UIBuildMixin:
         outer.setContentsMargins(6, 6, 6, 6)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.main_splitter = splitter
         outer.addWidget(splitter)
 
         # 左：入力・解析タブ（データ読込 / オシロ / 高度解析）
@@ -3490,6 +3572,7 @@ class UIBuildMixin:
 
         # 中央：グラフ表示＋データ編集
         center = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.center_splitter = center
         center.addWidget(self._build_plot_area())
         center.addWidget(self._build_preview())
         center.setStretchFactor(0, 4)
@@ -3705,6 +3788,7 @@ class UIBuildMixin:
     def _build_format_panel(self):
         """右端のグラフ書式調整パネル（上：グラフ書式コントロール／下：系列スタイル表）。"""
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.format_splitter = split
         split.setMinimumWidth(360)
         scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -3716,6 +3800,16 @@ class UIBuildMixin:
         return split
 
     # ---- グラフ書式コントロール（右パネル上段）----
+    def _fmt_section(self, title, key, default_open):
+        """書式パネルの折りたたみセクションを作る（開閉状態は前回起動から復元）。"""
+        val = self._ui_settings().value("fmt_section/" + key)
+        expanded = default_open if val is None else (str(val) in ("1", "true", "True"))
+        box = CollapsibleBox(title, expanded=expanded)
+        if not hasattr(self, "_fmt_sections"):
+            self._fmt_sections = {}
+        self._fmt_sections[key] = box
+        return box
+
     def _build_tab_graph(self):
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
@@ -3772,6 +3866,7 @@ class UIBuildMixin:
         v.addLayout(view)
 
         # タイトル・ラベル・フォント
+        sec_labels = self._fmt_section("タイトル・軸ラベル・文字", "labels", True)
         form = QtWidgets.QGridLayout()
         form.addWidget(QtWidgets.QLabel("タイトル"), 0, 0)
         self.title_edit = QtWidgets.QLineEdit()
@@ -3813,9 +3908,12 @@ class UIBuildMixin:
         self.yscale_edit.setToolTip("Y軸の数値変換（主軸）。数値なら倍率（例: 1000）。\n"
                                     "y の代わりに x を使った式も可: 20*log10(x), x**2, abs(x) など。")
         form.addWidget(self.yscale_edit, 4, 3)
-        v.addLayout(form)
+        sec_labels.set_content_layout(form)
+        v.addWidget(sec_labels)
 
-        # オプション行
+        # オプション行（凡例・グリッド・背景。横に詰めすぎないよう2行に分ける）
+        sec_leg = self._fmt_section("凡例・グリッド・背景・枠線", "legend", True)
+        leg_v = QtWidgets.QVBoxLayout()
         opt = QtWidgets.QHBoxLayout()
         self.grid_check = QtWidgets.QCheckBox("グリッド"); self.grid_check.setChecked(True)
         self.legend_check = QtWidgets.QCheckBox("凡例"); self.legend_check.setChecked(True)
@@ -3830,7 +3928,8 @@ class UIBuildMixin:
         self.show_ext_check = QtWidgets.QCheckBox("拡張子"); self.show_ext_check.setChecked(True)
         self.show_ext_check.setToolTip("凡例に表示するファイル名に拡張子（.csv など）を含めます。\n"
                                        "オフにすると拡張子を除いた名前になります。")
-        opt.addWidget(self.show_filename_check); opt.addWidget(self.show_ext_check)
+        opt2 = QtWidgets.QHBoxLayout()
+        opt2.addWidget(self.show_filename_check); opt2.addWidget(self.show_ext_check)
         # 背景色（空=自動: 通常は白・オシロは濃色。指定すると両方その色になる）
         self.bg_color = ""
         self.bg_btn = QtWidgets.QPushButton("背景色: 自動")
@@ -3839,9 +3938,9 @@ class UIBuildMixin:
         self.bg_btn.clicked.connect(self._pick_bg_color)
         self.bg_btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.bg_btn.customContextMenuRequested.connect(lambda *_: self._reset_bg_color())
-        opt.addWidget(self.bg_btn)
-        opt.addStretch(1)
-        v.addLayout(opt)
+        opt2.addWidget(self.bg_btn)
+        opt.addStretch(1); opt2.addStretch(1)
+        leg_v.addLayout(opt); leg_v.addLayout(opt2)
 
         # 線の太さ（枠線＝プロットの外枠／グリッド線）
         lw = QtWidgets.QHBoxLayout()
@@ -3856,9 +3955,12 @@ class UIBuildMixin:
         self.grid_width.setToolTip("グリッド線の太さ（「グリッド」オン時）。")
         lw.addWidget(self.grid_width)
         lw.addStretch(1)
-        v.addLayout(lw)
+        leg_v.addLayout(lw)
+        sec_leg.set_content_layout(leg_v)
+        v.addWidget(sec_leg)
 
         # 軸範囲・対数
+        sec_axis = self._fmt_section("軸範囲・目盛り・対数・反転", "axis", False)
         ax = QtWidgets.QGridLayout()
         ax.addWidget(QtWidgets.QLabel("X範囲 min/max"), 0, 0)
         self.xmin = QtWidgets.QLineEdit(); self.xmin.setPlaceholderText("自動")
@@ -3885,9 +3987,12 @@ class UIBuildMixin:
         self.yinvert_check = QtWidgets.QCheckBox("Y軸反転")
         self.yinvert_check.setToolTip("Y軸の向きを反転します（例: 下→上 を 上→下 に）。")
         ax.addWidget(self.xinvert_check, 3, 1); ax.addWidget(self.yinvert_check, 3, 2)
-        v.addLayout(ax)
+        sec_axis.set_content_layout(ax)
+        v.addWidget(sec_axis)
 
         # 近似曲線（トレンドライン）・データラベル（折れ線/散布図向け）
+        sec_trend = self._fmt_section("近似曲線・データラベル", "trend", False)
+        trend_v = QtWidgets.QVBoxLayout()
         tl = QtWidgets.QHBoxLayout()
         tl.addWidget(QtWidgets.QLabel("近似曲線"))
         self.trend_combo = QtWidgets.QComboBox(); self.trend_combo.addItems(TRENDLINES)
@@ -3901,6 +4006,7 @@ class UIBuildMixin:
         self.trend_window = QtWidgets.QSpinBox(); self.trend_window.setRange(2, 9999); self.trend_window.setValue(5)
         self.trend_window.setToolTip("移動平均の窓幅")
         tl.addWidget(self.trend_window)
+        tl2 = QtWidgets.QHBoxLayout()
         # 近似曲線の色（空=自動: 系列と同じ色）。クリックで選択／右クリックで自動に戻す
         self.trend_color = ""
         self.trend_color_btn = QtWidgets.QPushButton("色: 自動")
@@ -3908,16 +4014,20 @@ class UIBuildMixin:
         self.trend_color_btn.clicked.connect(self._pick_trend_color)
         self.trend_color_btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.trend_color_btn.customContextMenuRequested.connect(lambda *_: self._reset_trend_color())
-        tl.addWidget(self.trend_color_btn)
+        tl2.addWidget(self.trend_color_btn)
         self.trend_eq = QtWidgets.QCheckBox("数式/R²"); self.trend_eq.setChecked(True)
-        tl.addWidget(self.trend_eq)
+        tl2.addWidget(self.trend_eq)
         self.data_labels_check = QtWidgets.QCheckBox("データラベル")
         self.data_labels_check.setToolTip("各データ点/棒に値を表示（点数が多い場合は間引き）")
-        tl.addWidget(self.data_labels_check)
-        tl.addStretch(1)
-        v.addLayout(tl)
+        tl2.addWidget(self.data_labels_check)
+        tl.addStretch(1); tl2.addStretch(1)
+        trend_v.addLayout(tl); trend_v.addLayout(tl2)
+        sec_trend.set_content_layout(trend_v)
+        v.addWidget(sec_trend)
 
         # 系列間の塗りつぶし（2系列の間、または系列とX軸(0)の間を帯で塗る）※折れ線/散布図
+        sec_fill = self._fmt_section("系列間の塗りつぶし", "fill", False)
+        fill_v = QtWidgets.QVBoxLayout()
         fl_ = QtWidgets.QHBoxLayout()
         self.fill_check = QtWidgets.QCheckBox("系列間を塗りつぶし")
         self.fill_check.setToolTip("2つの系列の間（または系列とX軸=0の間）を色で塗ります。折れ線/散布図で有効。")
@@ -3926,21 +4036,26 @@ class UIBuildMixin:
         self.fill_a = QtWidgets.QComboBox(); fl_.addWidget(self.fill_a, 1)
         fl_.addWidget(QtWidgets.QLabel("B"))
         self.fill_b = QtWidgets.QComboBox(); fl_.addWidget(self.fill_b, 1)
+        fl2 = QtWidgets.QHBoxLayout()
         self.fill_color = ""
         self.fill_color_btn = QtWidgets.QPushButton("色: 自動")
         self.fill_color_btn.setToolTip("塗りつぶしの色。クリックで選択／右クリックで自動（系列Aの色）に戻す。")
         self.fill_color_btn.clicked.connect(self._pick_fill_color)
         self.fill_color_btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.fill_color_btn.customContextMenuRequested.connect(lambda *_: self._reset_fill_color())
-        fl_.addWidget(self.fill_color_btn)
-        fl_.addWidget(QtWidgets.QLabel("濃さ"))
+        fl2.addWidget(self.fill_color_btn)
+        fl2.addWidget(QtWidgets.QLabel("濃さ"))
         self.fill_alpha = QtWidgets.QDoubleSpinBox()
         self.fill_alpha.setRange(0.05, 1.0); self.fill_alpha.setSingleStep(0.05); self.fill_alpha.setValue(0.3)
         self.fill_alpha.setToolTip("塗りつぶしの不透明度（0.05〜1.0）")
-        fl_.addWidget(self.fill_alpha)
-        v.addLayout(fl_)
+        fl2.addWidget(self.fill_alpha)
+        fl2.addStretch(1)
+        fill_v.addLayout(fl_); fill_v.addLayout(fl2)
+        sec_fill.set_content_layout(fill_v)
+        v.addWidget(sec_fill)
 
         # ビン数・パーセント
+        sec_bins = self._fmt_section("ヒストグラム・円のオプション", "bins", False)
         extra = QtWidgets.QHBoxLayout()
         self.bins_caption = QtWidgets.QLabel("ビン数:")
         extra.addWidget(self.bins_caption)
@@ -3948,9 +4063,11 @@ class UIBuildMixin:
         extra.addWidget(self.bins_spin)
         self.pct_check = QtWidgets.QCheckBox("円グラフ％表示"); self.pct_check.setChecked(True)
         extra.addWidget(self.pct_check); extra.addStretch(1)
-        v.addLayout(extra)
+        sec_bins.set_content_layout(extra)
+        v.addWidget(sec_bins)
 
         # 縦横比（プロット領域のアスペクト比を固定）
+        sec_ar = self._fmt_section("縦横比", "aspect", False)
         ar = QtWidgets.QHBoxLayout()
         ar.addWidget(QtWidgets.QLabel("縦横比"))
         self.aspect_combo = QtWidgets.QComboBox()
@@ -3964,13 +4081,14 @@ class UIBuildMixin:
         self.aspect_h = QtWidgets.QSpinBox(); self.aspect_h.setRange(1, 100); self.aspect_h.setValue(9)
         ar.addWidget(self.aspect_w); ar.addWidget(QtWidgets.QLabel(":")); ar.addWidget(self.aspect_h)
         ar.addStretch(1)
-        v.addLayout(ar)
+        sec_ar.set_content_layout(ar)
+        v.addWidget(sec_ar)
         self.aspect_combo.currentTextChanged.connect(self._on_aspect_changed)
         self._on_aspect_changed()
 
         # 画像出力（解像度・背景透過つき）
-        v.addWidget(self._hline())
-        v.addWidget(self._bold("画像出力"))
+        sec_exp = self._fmt_section("画像出力", "export", True)
+        exp_v = QtWidgets.QVBoxLayout()
         exp = QtWidgets.QHBoxLayout()
         exp.addWidget(QtWidgets.QLabel("解像度 DPI"))
         self.dpi_spin = QtWidgets.QSpinBox()
@@ -3979,19 +4097,21 @@ class UIBuildMixin:
         self.transparent_check = QtWidgets.QCheckBox("背景透過")
         exp.addWidget(self.transparent_check)
         exp.addStretch(1)
-        v.addLayout(exp)
+        exp_v.addLayout(exp)
         exp2 = QtWidgets.QHBoxLayout()
         b_save = QtWidgets.QPushButton("画像を保存...")
         b_save.clicked.connect(self.save_figure)
         b_copy = QtWidgets.QPushButton("クリップボードにコピー")
         b_copy.clicked.connect(self.copy_figure)
         exp2.addWidget(b_save); exp2.addWidget(b_copy)
-        v.addLayout(exp2)
+        exp_v.addLayout(exp2)
         b_batch = QtWidgets.QPushButton("ファイルごとに一括出力...")
         b_batch.setToolTip("読み込んだ各ファイルを、現在の設定（種別・選択列名・スタイル等）で"
                            "個別に描画し、ファイル名ごとの画像として一括保存します。")
         b_batch.clicked.connect(self.batch_export)
-        v.addWidget(b_batch)
+        exp_v.addWidget(b_batch)
+        sec_exp.set_content_layout(exp_v)
+        v.addWidget(sec_exp)
         v.addStretch(1)   # 余白を下にまとめ、各行の不自然な隙間をなくす
         return w
 
@@ -5446,6 +5566,21 @@ class PlotMixin:
         want3d = self._want_3d()
         if hasattr(self, "elev_spin"):   # 視点角度は3D表示中のみ操作可
             self.elev_spin.setEnabled(want3d); self.azim_spin.setEnabled(want3d)
+        # この種別で効かない書式はグレーアウトして迷いを減らす（設定値は保持される）
+        if hasattr(self, "trend_combo"):
+            xy_ok = (ctype in _XY_TYPES) and not want3d   # 近似曲線は2DのXY系のみ
+            for w_ in (self.trend_combo, self.trend_degree, self.trend_window,
+                       self.trend_color_btn, self.trend_eq):
+                w_.setEnabled(xy_ok)
+        if hasattr(self, "fill_check"):
+            fill_ok = ctype in ("折れ線", "散布図") and not want3d
+            for w_ in (self.fill_check, self.fill_a, self.fill_b,
+                       self.fill_color_btn, self.fill_alpha):
+                w_.setEnabled(fill_ok)
+        if hasattr(self, "data_labels_check"):   # データラベルはXY系・棒系・3Dで有効
+            self.data_labels_check.setEnabled(
+                ctype in _XY_TYPES
+                or ctype in ("棒", "横棒", "積み上げ棒") or want3d)
         if hasattr(self, "series_bar"):
             self._rebuild_series_bar(ctype)   # 折れ線/散布図でのみ上部バーを出す
 
@@ -5466,12 +5601,10 @@ class PlotMixin:
         self.threed_check.blockSignals(False)
 
     def _on_3d_toggled(self, *_):
-        """『3D表示』チェックの切替: Z軸・視点角度の有効状態を更新して再描画する。"""
-        want3d = self._want_3d()
+        """『3D表示』チェックの切替: Z軸・視点角度・書式の有効状態を更新して再描画する。"""
         self._update_z_combo_enabled()
         self._update_x_multi_enabled()   # 3D中は複数X不可
-        if hasattr(self, "elev_spin"):
-            self.elev_spin.setEnabled(want3d); self.azim_spin.setEnabled(want3d)
+        self._on_chart_type_change()     # 視点角度・近似曲線などの有効/無効を3D状態に合わせる
         self._request_redraw()
 
     def _on_multix_toggled(self, *_):
@@ -7564,6 +7697,7 @@ class PersistenceMixin:
             "2. X軸の列を選び、Y軸（値）は描きたい系列にチェック（行クリックでON/OFF・全選択ボタンあり）\n"
             "3. 「グラフを描画」(F5)。『リアルタイム更新』ONなら設定変更が即反映\n"
             "4. 右端の『グラフ書式調整』パネルで種別・色・軸範囲・系列スタイルなどを編集\n"
+            "   （項目は見出しクリックで開閉できます。開閉状態・ウィンドウ配置は次回起動時に復元）\n"
             "5. 波形は『オシロ/解析』タブで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
             "【出力】右端パネルの画像出力、またはメニュー「ファイル」から保存／コピー\n"
             "【グラフ種別と列】棒/円は1ファイル、折れ線/散布図は複数ファイル重ね描き可")
@@ -7574,6 +7708,35 @@ class PersistenceMixin:
             "CSV / TSV / 波形 グラフ・解析ツール\n"
             "PySide6 + matplotlib 製\n"
             f"日本語フォント: {self.font_name or '未検出'}")
+
+    # ------------------------------------------------------------ UI状態（QSettings）
+    # ウィンドウ位置・分割位置・書式セクションの開閉といった「見た目の使い勝手」だけを
+    # OS のユーザー設定に保存する。グラフ設定（config JSON）とは独立で、混ざらない。
+    def _ui_settings(self):
+        return QtCore.QSettings("graph-tool", "GraphApp")
+
+    def _restore_ui_state(self):
+        s = self._ui_settings()
+        geo = s.value("ui/geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        for key, sp in (("ui/main_splitter", getattr(self, "main_splitter", None)),
+                        ("ui/center_splitter", getattr(self, "center_splitter", None)),
+                        ("ui/format_splitter", getattr(self, "format_splitter", None))):
+            st = s.value(key)
+            if st is not None and sp is not None:
+                sp.restoreState(st)
+
+    def _save_ui_state(self):
+        s = self._ui_settings()
+        s.setValue("ui/geometry", self.saveGeometry())
+        for key, sp in (("ui/main_splitter", getattr(self, "main_splitter", None)),
+                        ("ui/center_splitter", getattr(self, "center_splitter", None)),
+                        ("ui/format_splitter", getattr(self, "format_splitter", None))):
+            if sp is not None:
+                s.setValue(key, sp.saveState())
+        for k, box in getattr(self, "_fmt_sections", {}).items():
+            s.setValue("fmt_section/" + k, "1" if box.is_expanded() else "0")
 
     # ------------------------------------------------------------ 設定保存
     def _collect_config(self):
@@ -8038,9 +8201,11 @@ class GraphApp(UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin,
         self._cursor_text = None
 
         self._build_menu()
+        self._build_toolbar()
         self._build_central()
         self._build_statusbar()
         self._on_chart_type_change()
+        self._restore_ui_state()      # 前回のウィンドウ位置・分割位置・セクション開閉を復元
 
         restored = self._try_restore_session()
         if not restored:
@@ -8052,6 +8217,10 @@ class GraphApp(UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin,
             save_last_session(self._collect_config())
         except Exception:
             get_logger().exception("終了時の設定保存に失敗")
+        try:
+            self._save_ui_state()
+        except Exception:
+            get_logger().exception("終了時のUI状態保存に失敗")
         get_logger().info("GraphApp 終了")
         super().closeEvent(event)
 

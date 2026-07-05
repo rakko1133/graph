@@ -34,6 +34,21 @@ class PlotMixin:
         want3d = self._want_3d()
         if hasattr(self, "elev_spin"):   # 視点角度は3D表示中のみ操作可
             self.elev_spin.setEnabled(want3d); self.azim_spin.setEnabled(want3d)
+        # この種別で効かない書式はグレーアウトして迷いを減らす（設定値は保持される）
+        if hasattr(self, "trend_combo"):
+            xy_ok = (ctype in plotter._XY_TYPES) and not want3d   # 近似曲線は2DのXY系のみ
+            for w_ in (self.trend_combo, self.trend_degree, self.trend_window,
+                       self.trend_color_btn, self.trend_eq):
+                w_.setEnabled(xy_ok)
+        if hasattr(self, "fill_check"):
+            fill_ok = ctype in ("折れ線", "散布図") and not want3d
+            for w_ in (self.fill_check, self.fill_a, self.fill_b,
+                       self.fill_color_btn, self.fill_alpha):
+                w_.setEnabled(fill_ok)
+        if hasattr(self, "data_labels_check"):   # データラベルはXY系・棒系・3Dで有効
+            self.data_labels_check.setEnabled(
+                ctype in plotter._XY_TYPES
+                or ctype in ("棒", "横棒", "積み上げ棒") or want3d)
         if hasattr(self, "series_bar"):
             self._rebuild_series_bar(ctype)   # 折れ線/散布図でのみ上部バーを出す
 
@@ -54,12 +69,10 @@ class PlotMixin:
         self.threed_check.blockSignals(False)
 
     def _on_3d_toggled(self, *_):
-        """『3D表示』チェックの切替: Z軸・視点角度の有効状態を更新して再描画する。"""
-        want3d = self._want_3d()
+        """『3D表示』チェックの切替: Z軸・視点角度・書式の有効状態を更新して再描画する。"""
         self._update_z_combo_enabled()
         self._update_x_multi_enabled()   # 3D中は複数X不可
-        if hasattr(self, "elev_spin"):
-            self.elev_spin.setEnabled(want3d); self.azim_spin.setEnabled(want3d)
+        self._on_chart_type_change()     # 視点角度・近似曲線などの有効/無効を3D状態に合わせる
         self._request_redraw()
 
     def _on_multix_toggled(self, *_):

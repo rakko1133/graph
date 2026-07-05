@@ -74,9 +74,11 @@ class GraphApp(UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin,
         self._cursor_text = None
 
         self._build_menu()
+        self._build_toolbar()
         self._build_central()
         self._build_statusbar()
         self._on_chart_type_change()
+        self._restore_ui_state()      # 前回のウィンドウ位置・分割位置・セクション開閉を復元
 
         restored = self._try_restore_session()
         if not restored:
@@ -88,6 +90,10 @@ class GraphApp(UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin,
             config_io.save_last_session(self._collect_config())
         except Exception:
             applog.get_logger().exception("終了時の設定保存に失敗")
+        try:
+            self._save_ui_state()
+        except Exception:
+            applog.get_logger().exception("終了時のUI状態保存に失敗")
         applog.get_logger().info("GraphApp 終了")
         super().closeEvent(event)
 

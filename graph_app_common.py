@@ -96,6 +96,50 @@ class LazyColumnCombo(QtWidgets.QComboBox):
             self.blockSignals(False)
         super().showPopup()
 
+class CollapsibleBox(QtWidgets.QWidget):
+    """見出しクリックで開閉できるセクション。
+
+    右パネルの書式コントロールのような縦に長い設定群を項目ごとにまとめ、
+    使わない項目を畳んで目的の設定を探しやすくする。中身のウィジェットは
+    畳んでも生きたまま（非表示になるだけ）なので、機能・設定値は変わらない。
+    """
+
+    def __init__(self, title, expanded=True, parent=None):
+        super().__init__(parent)
+        self._btn = QtWidgets.QToolButton()
+        self._btn.setText(title)
+        self._btn.setCheckable(True)
+        self._btn.setChecked(expanded)
+        self._btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._btn.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                QtWidgets.QSizePolicy.Policy.Fixed)
+        self._btn.setStyleSheet(
+            "QToolButton { border:none; font-weight:bold; text-align:left; padding:2px; }")
+        self._btn.toggled.connect(self._on_toggled)
+        self.body = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(2)
+        lay.addWidget(self._btn)
+        lay.addWidget(self.body)
+        self._on_toggled(expanded)
+
+    def _on_toggled(self, on):
+        self._btn.setArrowType(QtCore.Qt.ArrowType.DownArrow if on
+                               else QtCore.Qt.ArrowType.RightArrow)
+        self.body.setVisible(on)
+
+    def set_content_layout(self, layout):
+        layout.setContentsMargins(8, 2, 2, 2)
+        self.body.setLayout(layout)
+
+    def is_expanded(self):
+        return self._btn.isChecked()
+
+    def set_expanded(self, on):
+        self._btn.setChecked(bool(on))
+
+
 __all__ = [
     "os",
     "sys",
@@ -122,4 +166,5 @@ __all__ = [
     "_parse_float",
     "CheckListWidget",
     "LazyColumnCombo",
+    "CollapsibleBox",
 ]
