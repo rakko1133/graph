@@ -9,11 +9,15 @@ class DataIOMixin:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
+    _ACCEPT_EXTS = (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls",
+                    ".wav", ".raw", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5",
+                    ".asc", ".net")   # LTspice回路/ネットリスト（実行→.raw読込）
+
     def dropEvent(self, event):
         paths = []
         for url in event.mimeData().urls():
             p = url.toLocalFile()
-            if p and os.path.splitext(p)[1].lower() in (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls"):
+            if p and os.path.splitext(p)[1].lower() in self._ACCEPT_EXTS:
                 paths.append(p)
         if not paths:
             return
@@ -28,8 +32,10 @@ class DataIOMixin:
     def add_file(self):
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "ファイルを追加（複数選択可）", self.last_dir,
-            "データ (*.csv *.tsv *.txt *.xlsx *.xls *.xlsm);;Excel (*.xlsx *.xls *.xlsm);;"
-            "CSV/TSV (*.csv *.tsv *.txt);;すべて (*.*)")
+            "データ (*.csv *.tsv *.txt *.xlsx *.xls *.xlsm *.wav *.raw *.tdms *.mf4 *.mdf *.h5 *.hdf5 *.asc);;"
+            "Excel (*.xlsx *.xls *.xlsm);;CSV/TSV (*.csv *.tsv *.txt);;"
+            "波形/計測 (*.wav *.raw *.tdms *.mf4 *.mdf *.h5 *.hdf5);;"
+            "LTspice回路 (*.asc *.net);;すべて (*.*)")
         for p in paths:
             self._load_file(p)
         if paths:
@@ -66,6 +72,9 @@ class DataIOMixin:
         self._set_status(f"クリップボードから {len(df)}行 × {len(df.columns)}列 を貼り付けました。")
 
     def _load_file(self, path):
+        if os.path.splitext(path)[1].lower() in (".asc", ".net"):
+            self.run_ltspice_asc(path)   # 回路図/ネットリストは実行→.raw読込
+            return
         enc = self.enc_combo.currentText()
         enc = None if enc.startswith("自動") else enc
         delim = None
@@ -75,6 +84,16 @@ class DataIOMixin:
                 if lbl == dt:
                     delim = ch
                     break
+        # Excelで複数シートがある場合はどのシートを読むか選んでもらう
+        sheet = None
+        if os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm", ".xls"):
+            sheets = data_loader.excel_sheet_names(path)
+            if len(sheets) > 1:
+                sheet, ok = QtWidgets.QInputDialog.getItem(
+                    self, "シートの選択", f"{os.path.basename(path)} のシート:",
+                    sheets, 0, False)
+                if not ok:
+                    return
         size = os.path.getsize(path) if os.path.isfile(path) else 0
         busy = size > 5_000_000   # 5MB 超は待機カーソル＋進捗
         if busy:
@@ -82,7 +101,8 @@ class DataIOMixin:
             self._set_status(f"読み込み中… {os.path.basename(path)}")
             QtWidgets.QApplication.processEvents()
         try:
-            df, used_enc, used_delim = data_loader.load_table(path, encoding=enc, delimiter=delim)
+            df, used_enc, used_delim = data_loader.load_table(
+                path, encoding=enc, delimiter=delim, sheet=sheet)
         except Exception as e:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "読み込みエラー", f"{os.path.basename(path)}\n\n{e}")
             return
@@ -90,15 +110,144 @@ class DataIOMixin:
             if busy:
                 QtWidgets.QApplication.restoreOverrideCursor()
         label = os.path.basename(path)
+        if sheet:
+            label = f"{label}[{sheet}]"   # シート違いを別データとして区別できるように
         base, i = label, 2
         while label in self.datasets and self.meta.get(label, {}).get("path") != path:
             label = f"{base} ({i})"; i += 1
         self.datasets[label] = df
-        self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim}
+        self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim,
+                            "sheet": sheet}
         if not self._find_file_item(label):
             self._add_file_item(label)
         self._push_recent(path)
         self._set_status(f"{label} を読み込み（{len(df)}行 × {len(df.columns)}列, {used_enc}）")
+
+    # ------------------------------------------------------------ フォルダを開く
+    def add_folder(self):
+        """フォルダ内の対応データファイルを一括で読み込む（VS Codeの「フォルダを開く」相当）。"""
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "フォルダを開く", self.last_dir)
+        if d:
+            self._load_folder(d)
+
+    def _load_folder(self, d):
+        exts = set(self._ACCEPT_EXTS) - {".asc", ".net"}   # 回路は誤爆実行を避けて除外
+        try:
+            names = sorted(os.listdir(d))
+        except OSError as e:
+            QtWidgets.QMessageBox.critical(self, "フォルダを開く", str(e))
+            return
+        files = [os.path.join(d, f) for f in names
+                 if os.path.splitext(f)[1].lower() in exts
+                 and os.path.isfile(os.path.join(d, f))]
+        if not files:
+            QtWidgets.QMessageBox.information(
+                self, "情報", "このフォルダに読み込めるデータファイルがありません。")
+            return
+        if len(files) > 40:
+            ret = QtWidgets.QMessageBox.question(
+                self, "フォルダを開く",
+                f"{len(files)} 個のファイルが見つかりました。すべて読み込みますか？")
+            if ret != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        for p in files:
+            self._load_file(p)
+        self.last_dir = d
+        self._refresh_columns()
+        if self._has_drawn:
+            self.draw_graph()
+        self._set_status(f"フォルダを読み込みました: {os.path.basename(d)}（{len(files)}ファイル）")
+
+    # ------------------------------------------------------------ LTspice 連携
+    # .asc 回路をバッチ実行し、生成された .raw を自動で読み込む。ファイル監視を
+    # ONにしておけば、以降 LTspice 側で再シミュレーションするたびに自動更新される。
+    _LTSPICE_CANDIDATES = (
+        r"C:\Program Files\ADI\LTspice\LTspice.exe",
+        r"C:\Program Files\LTC\LTspiceXVII\XVIIx64.exe",
+        r"C:\Program Files (x86)\LTC\LTspiceIV\scad3.exe",
+    )
+
+    def _ltspice_exe(self):
+        """LTspice実行ファイルの場所（設定→既知パス→spicelib検出→PATHの順で探す）。"""
+        p = self._ui_settings().value("ltspice/exe")
+        if p and os.path.isfile(str(p)):
+            return str(p)
+        cands = list(self._LTSPICE_CANDIDATES) + [
+            os.path.expanduser(r"~\AppData\Local\Programs\ADI\LTspice\LTspice.exe")]
+        for c in cands:
+            if os.path.isfile(c):
+                return c
+        try:   # spicelib が入っていればその自動検出も利用する
+            from spicelib.simulators.ltspice_simulator import LTspice
+            for c in LTspice.spice_exe:
+                if os.path.isfile(str(c)):
+                    return str(c)
+        except Exception:
+            pass
+        import shutil
+        return shutil.which("LTspice") or shutil.which("XVIIx64")
+
+    def set_ltspice_path(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "LTspice実行ファイルの場所", r"C:\Program Files",
+            "LTspice (*.exe)")
+        if path:
+            self._ui_settings().setValue("ltspice/exe", path)
+            self._set_status(f"LTspiceの場所を設定しました: {path}")
+
+    def run_ltspice_asc(self, path=None):
+        """LTspice回路(.asc)をバッチ実行し、生成された .raw を読み込んで描画する。"""
+        if getattr(self, "_lt_proc", None) is not None \
+                and self._lt_proc.state() != QtCore.QProcess.ProcessState.NotRunning:
+            self._set_status("LTspiceシミュレーションを実行中です。完了までお待ちください。")
+            return
+        if not path:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "LTspice回路を実行", self.last_dir,
+                "LTspice回路/ネットリスト (*.asc *.net)")
+            if not path:
+                return
+        exe = self._ltspice_exe()
+        if not exe:
+            ret = QtWidgets.QMessageBox.question(
+                self, "LTspiceが見つかりません",
+                "LTspice の実行ファイルが見つかりませんでした。\n場所を指定しますか？")
+            if ret == QtWidgets.QMessageBox.StandardButton.Yes:
+                self.set_ltspice_path()
+                exe = self._ltspice_exe()
+            if not exe:
+                return
+        self.last_dir = os.path.dirname(path)
+        raw = os.path.splitext(path)[0] + ".raw"
+        proc = QtCore.QProcess(self)
+        self._lt_proc = proc
+        proc.finished.connect(
+            lambda code, _st, p=path, r=raw: self._on_ltspice_finished(code, p, r))
+        proc.start(exe, ["-b", path])   # -b: バッチ実行（.rawを回路と同じ場所に生成）
+        if not proc.waitForStarted(5000):
+            self._lt_proc = None
+            QtWidgets.QMessageBox.critical(self, "LTspice", f"起動できませんでした: {exe}")
+            return
+        self._set_status(f"LTspiceシミュレーション実行中… {os.path.basename(path)}"
+                         "（完了すると自動で波形を読み込みます）")
+
+    def _on_ltspice_finished(self, code, asc_path, raw_path):
+        self._lt_proc = None
+        if not os.path.isfile(raw_path):
+            QtWidgets.QMessageBox.warning(
+                self, "LTspice",
+                f"シミュレーションは終了しましたが .raw が見つかりません（終了コード {code}）。\n"
+                f"回路にエラーがないか LTspice で確認してください:\n{asc_path}")
+            return
+        self._load_file(raw_path)
+        self._refresh_columns()
+        if self._has_drawn:
+            self.draw_graph()
+        note = ("（ファイル監視ONなので、LTspice側で再実行すると自動更新されます）"
+                if self._watch_enabled() else
+                "（メニュー『ファイル→ファイルの変更を監視』をONにすると、"
+                "LTspice側の再実行で自動更新されます）")
+        self._set_status(f"LTspice完了: {os.path.basename(raw_path)} を読み込みました {note}")
 
     # ------------------------------------------------------------ ファイル監視（自動再読込）
     # 測定器やロガーが書き続けるCSVを監視し、更新されたら自動で読み直して再描画する。
@@ -160,6 +309,17 @@ class DataIOMixin:
                 self.draw_graph()
             self._set_status("自動再読込: " + ", ".join(reloaded))
 
+    def _reload_all_files(self):
+        """全ファイルをディスクの最新内容で読み直す（並び・チェックは維持）。"""
+        reloaded = [l for l in list(self.datasets) if self._reload_label_inplace(l)]
+        if reloaded:
+            self._refresh_columns()
+            if self._has_drawn:
+                self.draw_graph()
+            self._set_status(f"再読込しました: {len(reloaded)}ファイル")
+        else:
+            self._set_status("再読込できるファイルがありません（貼り付け・生成データのみ）。")
+
     def _reload_label_inplace(self, label):
         """一覧の並びと選択を保ったまま、保存済みの読み込み条件でデータだけ差し替える。"""
         meta = self.meta.get(label) or {}
@@ -170,11 +330,13 @@ class DataIOMixin:
         enc = None if (not enc or str(enc).startswith(("自動", "clipboard"))) else enc
         try:
             df, used_enc, used_delim = data_loader.load_table(
-                path, encoding=enc, delimiter=meta.get("delim"))
+                path, encoding=enc, delimiter=meta.get("delim"),
+                sheet=meta.get("sheet"))
         except Exception:  # noqa: BLE001  書き込み途中で開けない等は次の変更イベントに任せる
             return False
         self.datasets[label] = df
-        self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim}
+        self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim,
+                            "sheet": meta.get("sheet")}
         if getattr(self, "_preview_label", None) == label:
             self._populate_preview(df, label=label)
         return True
@@ -262,6 +424,7 @@ class DataIOMixin:
         # 削除したデータに紐づく解析注記・解析表をクリア（古い注記が次の描画に残らないように）
         self._meas_annotations = []
         self._ds_annotations = []
+        self._proto_annotations = None
         if hasattr(self, "meas_table"):
             self.meas_table.setRowCount(0)
         if hasattr(self, "ds_table"):

@@ -323,6 +323,7 @@ class PlotMixin:
         self._reset_figure_axes()   # スペクトログラム等のカラーバー軸を除去
         self._cursor_pts = []; self._cursor_artists = []  # 再描画で軸がクリアされる
         self._cursors = []; self._cursor_drag = None; self._cursor_text = None
+        self._link_artists = []   # リンク選択のリング強調も軸クリアで消える
         try:
             series, categories = self._build_series(ctype)
             swap_on = (getattr(self, "swap_xy_check", None) and self.swap_xy_check.isChecked()
@@ -385,6 +386,7 @@ class PlotMixin:
                 self._apply_tick_spacing(ctype, scope)   # 目盛り間隔（指定時）
                 self._apply_fill_between(ctype, series)   # 系列間の塗りつぶし（選択時）
                 self._draw_ds_annotations()              # データサイエンス注記（選択時）
+                self._draw_proto_overlay(ctype)          # プロトコル解読の波形上注記
                 try:
                     self.fig.tight_layout()
                 except Exception:
@@ -417,6 +419,81 @@ class PlotMixin:
         except Exception as e:  # noqa: BLE001
             applog.get_logger().exception("描画エラー")
             QtWidgets.QMessageBox.critical(self, "描画エラー", str(e))
+
+    def open_graph_window(self):
+        """現在のグラフを独立ウィンドウとして複製する（Igor Pro風）。
+
+        何枚でも開けるので、選択・書式を変えながら複数のグラフを並べて比較できる。
+        各ウィンドウは自分のズームツールバーを持ち、「現在の設定で更新」で
+        メイン画面のいまの選択・書式を使って描き直せる。"""
+        if not self.datasets or not self._selected_series_items():
+            QtWidgets.QMessageBox.information(self, "情報", "先にY系列を選択してください。")
+            return
+        dlg = QtWidgets.QDialog(self)
+        # 通常ウィンドウ扱いにして、Windowsのスナップ（画面端ドラッグ・
+        # 最大化ボタンhoverのレイアウト選択・Win+矢印）を効かせる
+        dlg.setWindowFlags(QtCore.Qt.WindowType.Window)
+        n = len(getattr(self, "_graph_windows", [])) + 1
+        title = self.title_edit.text() or self.chart_combo.currentText()
+        dlg.setWindowTitle(f"グラフ {n}: {title}")
+        dlg.resize(760, 540)
+        v = QtWidgets.QVBoxLayout(dlg)
+        fig = Figure(figsize=(6, 4), dpi=100)
+        canvas = FigureCanvas(fig)
+        tb = NavigationToolbar(canvas, dlg)
+        v.addWidget(tb)
+        v.addWidget(canvas, 1)
+        brow = QtWidgets.QHBoxLayout()
+        b_upd = QtWidgets.QPushButton("現在の設定で更新")
+        b_upd.setToolTip("メイン画面のいまの系列選択・書式でこのウィンドウを描き直します。")
+        brow.addWidget(b_upd)
+        brow.addStretch(1)
+        v.addLayout(brow)
+
+        def render():
+            try:
+                ctype = self.chart_combo.currentText()
+                series, categories = self._build_series(ctype)
+                fig.clf()
+                if self._want_3d():
+                    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+                    ax = fig.add_subplot(111, projection="3d")
+                else:
+                    ax = fig.add_subplot(111)
+                ax._twin_secondary = None
+                plotter.plot_series(
+                    ax, series, ctype, categories=categories,
+                    title=self.title_edit.text(),
+                    xlabel=self.xlabel_edit.text() or self._effective_x_label(),
+                    ylabel=self.ylabel_edit.text() or self._effective_y_label(),
+                    xlim=self._range_pair(self.xmin, self.xmax, "X", []),
+                    ylim=self._range_pair(self.ymin, self.ymax, "Y", []),
+                    scope=None, markers=None, max_points=DECIMATE_TARGET,
+                    secondary_label="",
+                    zlabel=(self.z_combo.currentText() if self._want_3d() else ""),
+                    view_init=(self._view_angles() if self._want_3d() else None),
+                    threed=self._want_3d(),
+                    **self._plot_format_kwargs())
+                dlg.setWindowTitle(f"グラフ {n}: "
+                                   f"{self.title_edit.text() or self.chart_combo.currentText()}")
+                try:
+                    fig.tight_layout()
+                except Exception:
+                    pass
+                canvas.draw()
+            except Exception as e:  # noqa: BLE001
+                QtWidgets.QMessageBox.critical(dlg, "描画エラー", str(e))
+
+        b_upd.clicked.connect(render)
+        render()
+        if not hasattr(self, "_graph_windows"):
+            self._graph_windows = []
+        self._graph_windows.append(dlg)
+        dlg.finished.connect(lambda *_: self._graph_windows.remove(dlg)
+                             if dlg in self._graph_windows else None)
+        dlg.show()
+        self._set_status(f"グラフウィンドウ {n} を開きました"
+                         "（メイン画面で選択・書式を変えて複数枚並べられます）。")
 
     def _draw_stacked(self, series, ctype, xlim, ylim, max_points):
         """系列ごとに上下の段（サブプロット・X軸共有）へ分けて描画する。
@@ -463,6 +540,45 @@ class PlotMixin:
         self._regate()
         self._stacked = True
 
+    def _draw_proto_overlay(self, ctype):
+        """プロトコル解読イベントを波形の上部に注記する（Saleae風・最大80件）。
+
+        値（hex）を交互の高さの小さなボックスで並べ、イベント位置に薄い縦線を引く。
+        ⚠付き（CRC/パリティ等の不一致）は赤で表示する。"""
+        info = getattr(self, "_proto_annotations", None)
+        chk = getattr(self, "proto_overlay_check", None)
+        if (not info or not info.get("rows") or chk is None or not chk.isChecked()
+                or self._is_3d() or getattr(self, "_stacked", False)
+                or ctype not in ("折れ線", "散布図")
+                or (getattr(self, "swap_xy_check", None)
+                    and self.swap_xy_check.isChecked())):
+            return
+        import numpy as np
+        from matplotlib import transforms as mtrans
+        from matplotlib.lines import Line2D
+        rows = info["rows"][:80]
+        xs = mathchan.axis_scale(np.array([r[0] for r in rows], dtype=float),
+                                 self.xscale_edit.text())
+        trans = mtrans.blended_transform_factory(self.ax.transData, self.ax.transAxes)
+        fs = max((self.fs_annot.value() if hasattr(self, "fs_annot") else 9) - 1, 6)
+        marker_kinds = {"START", "STOP", "BREAK", "SYNC", "RESET", "PRESENCE"}
+        for i, ((_tm, kind, hexv, note), x) in enumerate(zip(rows, xs)):
+            warn = "⚠" in str(note)
+            color = ("#d02020" if warn
+                     else "#0a7a55" if str(kind) in marker_kinds else "#2b6cb0")
+            label = str(hexv) if str(hexv) else str(kind)
+            ytxt = 0.99 if i % 2 == 0 else 0.92   # 交互に段をずらして重なりを軽減
+            self.ax.text(x, ytxt, label, transform=trans, ha="center", va="top",
+                         fontsize=fs, color=color, zorder=25, clip_on=True,
+                         bbox=dict(facecolor="white", alpha=0.78,
+                                   edgecolor=color, lw=0.5, pad=1.2))
+            self.ax.add_line(Line2D([x, x], [0.0, 0.86], transform=trans,
+                                    color=color, lw=0.6, alpha=0.35, zorder=24))
+        if len(info["rows"]) > 80:
+            self.ax.text(0.99, 0.84, f"解読 {len(info['rows'])}件中 先頭80件を注記",
+                         transform=self.ax.transAxes, ha="right", va="top",
+                         fontsize=fs, color="#666", zorder=25)
+
     def _wire_legend_picking(self):
         """凡例の項目（線・文字）をクリックすると系列の表示/非表示が切り替わるようにする。
         凡例ラベル→(ファイル, 列) の対応が取れた項目だけ有効（複数X時の変種などは対象外）。"""
@@ -486,16 +602,90 @@ class PlotMixin:
                     self._legend_pick_map[art] = key
                 except Exception:
                     pass
+        # データ線のクリック → プレビュー表の行を選択（JMP風リンク選択）。
+        # skey→Line2D の即時反映マップがある単純な折れ線のみ（間引き時は行対応が崩れるため無効）
+        self._line_pick_map = {}
+        for skey, ln in (self._style_artists or {}).items():
+            try:
+                ln.set_picker(5)
+                self._line_pick_map[ln] = skey
+            except Exception:
+                pass
 
     def _on_legend_pick(self, event):
         key = getattr(self, "_legend_pick_map", {}).get(event.artist)
-        if key is None:
+        if key is not None:
+            yit = self._find_y_item(*key)
+            if yit is not None:
+                ck = QtCore.Qt.CheckState.Checked
+                yit.setCheckState(QtCore.Qt.CheckState.Unchecked
+                                  if yit.checkState() == ck else ck)
             return
-        yit = self._find_y_item(*key)
-        if yit is not None:
-            ck = QtCore.Qt.CheckState.Checked
-            yit.setCheckState(QtCore.Qt.CheckState.Unchecked
-                              if yit.checkState() == ck else ck)
+        # データ線のクリック（リンク選択）
+        skey = getattr(self, "_line_pick_map", {}).get(event.artist)
+        if skey is None:
+            return
+        if (self._scope_active() or getattr(self.toolbar, "mode", "")
+                or self._cursor_cid is not None
+                or (getattr(self, "gate_btn", None) and self.gate_btn.isChecked())):
+            return   # ドラッグ操作系のモード中は誤選択を避ける
+        ind = getattr(event, "ind", None)
+        if ind is None or not len(ind):
+            return
+        row = int(ind[0])
+        fl = skey.split("\t", 1)[0]
+        it = self._find_file_item(fl)
+        if it is not None and self.file_list.currentItem() is not it:
+            self.file_list.setCurrentRow(self.file_list.row(it))   # プレビューを切替
+        if row < self.table.rowCount():
+            self.table.selectRow(row)   # → itemSelectionChanged でリング強調も付く
+            cell = self.table.item(row, 0)
+            if cell is not None:
+                self.table.scrollToItem(cell)
+            self._set_status(f"グラフの点 → データ編集表の行 {row} を選択（{fl}）")
+        else:
+            self._set_status(f"クリックした点は行 {row}"
+                             f"（プレビューは先頭{PREVIEW_ROWS}行のみ表示）")
+
+    def _on_preview_selection_changed(self):
+        """プレビュー表の行選択をグラフ上のリング強調へ反映する（JMP風リンク選択）。"""
+        if (getattr(self, "_preview_loading", False)
+                or not getattr(self, "_has_drawn", False)
+                or self._is_3d() or getattr(self, "_stacked", False)):
+            return
+        ctype = self.chart_combo.currentText()
+        if (ctype not in ("折れ線", "散布図")
+                or (getattr(self, "swap_xy_check", None)
+                    and self.swap_xy_check.isChecked())):
+            return
+        for a in getattr(self, "_link_artists", None) or []:
+            try:
+                a.remove()
+            except Exception:
+                pass
+        self._link_artists = []
+        lbl = getattr(self, "_preview_label", None)
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        if lbl and lbl in self.datasets and rows:
+            import pandas as pd
+            df = self.datasets[lbl]
+            rows = [r for r in rows if r < len(df)][:500]   # 強調は最大500点
+            xspec, yspec = self.xscale_edit.text(), self.yscale_edit.text()
+            xraw = pd.to_numeric(pd.Series(self._x_values(df)),
+                                 errors="coerce").to_numpy(dtype=float)
+            for fl, col, _d in self._selected_series_items():
+                if fl != lbl or col not in df.columns:
+                    continue
+                st = self.series_styles.get(self._style_key(fl, col)) or {}
+                if st.get("axis") == "secondary":
+                    continue   # 第2軸は座標系が異なるためスキップ
+                y = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+                xv = mathchan.axis_scale(xraw[rows], xspec)
+                yv = mathchan.axis_scale(y[rows], yspec)
+                art, = self.ax.plot(xv, yv, "o", ms=11, mfc="none", mec="#e6194b",
+                                    mew=1.8, ls="none", zorder=26, label="_link_sel")
+                self._link_artists.append(art)
+        self.canvas.draw_idle()
 
     def _apply_tick_spacing(self, ctype, scope):
         """目盛り間隔（メモリ間隔）の手動指定を適用する。

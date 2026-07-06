@@ -125,7 +125,9 @@ class BatchMixin:
                                 "軸名・凡例・近似曲線・縦横比などは右の書式パネルの値を使います。")
         info.setStyleSheet("color:#666;"); form.addRow(info)
         title_edit = QtWidgets.QLineEdit(self.title_edit.text() or "{name}")
-        title_edit.setToolTip("グラフタイトル。{name} はファイル名（拡張子なし）に置き換わります。")
+        title_edit.setToolTip("グラフタイトル。{name} はファイル名（拡張子なし）に置き換わります。\n"
+                              "空欄にするとタイトルなしで出力します。")
+        title_edit.setPlaceholderText("（空欄=タイトルなし）")
         form.addRow("グラフタイトル", title_edit)
         fmt_combo = QtWidgets.QComboBox(); fmt_combo.addItems(["png", "jpg", "pdf", "svg"])
         form.addRow("出力形式", fmt_combo)
@@ -142,8 +144,8 @@ class BatchMixin:
         form.addRow(bb)
         if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return None
-        title = title_edit.text().strip() or "{name}"
-        return {"title": title, "fmt": fmt_combo.currentText(),
+        # 空欄はそのまま「タイトルなし」として扱う（勝手に {name} へ戻さない）
+        return {"title": title_edit.text().strip(), "fmt": fmt_combo.currentText(),
                 "dpi": dpi_spin.value(), "transparent": trans.isChecked()}
 
     def batch_export(self):

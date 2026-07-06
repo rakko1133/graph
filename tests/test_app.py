@@ -444,6 +444,268 @@ def test_new_ux_features():
     assert len(w.datasets[lbl]) == n0 + 1
 
 
+def test_new_loaders():
+    """WAV / LTspice raw / Excelシート指定の読み込み。"""
+    import struct
+    import tempfile
+    import wave as wavmod
+    import data_loader
+    d = tempfile.gettempdir()
+    # WAV (16bit mono)
+    wp = os.path.join(d, "t_load.wav")
+    with wavmod.open(wp, "w") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(1000)
+        w.writeframes(struct.pack("<4h", 0, 100, -100, 50))
+    df, enc, _ = data_loader.load_table(wp)
+    assert enc == "wav" and len(df) == 4 and str(df.columns[0]).startswith("時間")
+    assert abs(df.iloc[1, 1] - 100) < 1e-9
+    # LTspice .raw（バイナリ・time=f64/値=f32）
+    rp = os.path.join(d, "t_load.raw")
+    hdr = ("Title: * test\nDate: x\nPlotname: Transient Analysis\nFlags: real\n"
+           "No. Variables: 2\nNo. Points: 3\nVariables:\n"
+           "\t0\ttime\ttime\n\t1\tV(out)\tvoltage\nBinary:\n")
+    body = b"".join(struct.pack("<d", i * 1e-3) + struct.pack("<f", float(v))
+                    for i, v in enumerate([1.0, 2.0, 3.0]))
+    with open(rp, "wb") as fh:
+        fh.write(hdr.encode("ascii") + body)
+    df3, enc3, _ = data_loader.load_table(rp)
+    assert enc3 == "ltspice" and df3.shape == (3, 2)
+    assert abs(df3.iloc[2, 1] - 3.0) < 1e-6 and abs(df3.iloc[2, 0] - 2e-3) < 1e-12
+    # Excel（シート指定）
+    xp = os.path.join(d, "t_load.xlsx")
+    with pd.ExcelWriter(xp) as w:
+        pd.DataFrame({"a": [1, 2]}).to_excel(w, sheet_name="S1", index=False)
+        pd.DataFrame({"b": [3, 4, 5]}).to_excel(w, sheet_name="S2", index=False)
+    assert data_loader.excel_sheet_names(xp) == ["S1", "S2"]
+    df2, enc2, _ = data_loader.load_table(xp, sheet="S2")
+    assert enc2 == "excel" and len(df2) == 3 and "b" in df2.columns
+
+
+def _stuff_can(bits):
+    out, rv, rn = [], None, 0
+    for b in bits:
+        out.append(b)
+        rn = rn + 1 if b == rv else 1
+        rv = b
+        if rn == 5:
+            out.append(1 - b)
+            rv, rn = 1 - b, 1
+    return out
+
+
+def test_protocol_decoders_can_lin_onewire():
+    """CAN（CRC15/スタッフィング）・LIN（チェックサム）・1-Wire の解読。"""
+    import advanced
+    # --- CAN 標準フレーム ---
+    fid, data = 0x123, [0xDE, 0xAD]
+    bits = [0] + [(fid >> i) & 1 for i in range(10, -1, -1)] + [0, 0, 0]
+    bits += [(len(data) >> i) & 1 for i in range(3, -1, -1)]
+    for dd in data:
+        bits += [(dd >> i) & 1 for i in range(7, -1, -1)]
+    crc = advanced._can_crc15(bits)
+    stuffed = _stuff_can(bits + [(crc >> i) & 1 for i in range(14, -1, -1)])
+    wave_bits = [1] * 30 + stuffed + [1, 0, 1] + [1] * 30
+    sig = np.repeat(wave_bits, 20).astype(float) * 3.3
+    t = np.arange(len(sig)) / (500e3 * 20)
+    fr = advanced.decode_can(t, sig, bitrate=500e3)
+    assert len(fr) == 1 and fr[0]["id"] == 0x123 and fr[0]["data"] == data
+    assert fr[0]["crc_ok"] and not fr[0]["ext"]
+    # --- LIN ---
+    def uart(v):
+        return [0] + [(v >> i) & 1 for i in range(8)] + [1]
+    def lin_sum(vals):
+        s = 0
+        for v in vals:
+            s += v
+            if s > 0xFF:
+                s = (s & 0xFF) + 1
+        return (~s) & 0xFF
+    pid, ldata = 0x50, [1, 2]   # fid=0x10 の正しいPID
+    lbits = [1] * 20 + [0] * 14 + [1] * 2
+    for b in [0x55, pid] + ldata + [lin_sum([pid] + ldata)]:
+        lbits += uart(b) + [1]
+    lsig = np.repeat(lbits + [1] * 20, 16).astype(float) * 12
+    lt = np.arange(len(lsig)) / (19200 * 16)
+    ev = advanced.decode_lin(lt, lsig, baud=19200)
+    kinds = [e["type"] for e in ev]
+    assert kinds[:3] == ["BREAK", "SYNC", "PID"]
+    assert [e["value"] for e in ev if e["type"] == "data"] == ldata
+    assert [e for e in ev if e["type"] == "CSUM"][0]["ok"]
+    # --- 1-Wire（リセット＋プレゼンス＋0xA5） ---
+    w = [5.0] * 100 + [0.0] * 500 + [5.0] * 30 + [0.0] * 100 + [5.0] * 100
+    for i in range(8):
+        bit = (0xA5 >> i) & 1
+        w += ([0.0] * 6 + [5.0] * 64) if bit else ([0.0] * 60 + [5.0] * 10)
+    sig1w = np.array(w + [5.0] * 100)
+    t1w = np.arange(len(sig1w)) / 1e6
+    ev4 = advanced.decode_onewire(t1w, sig1w)
+    assert [e["type"] for e in ev4] == ["RESET", "PRESENCE", "data"]
+    assert ev4[-1]["value"] == 0xA5
+
+
+def test_custom_fit_and_stats():
+    """任意関数フィット・t検定・ANOVA（scipy）。"""
+    import datasci
+    x = np.linspace(0, 1, 200)
+    y = 2.5 * np.exp(-x / 0.3) + 1.0
+    d = datasci.fit_custom(x, y, "a*exp(-x/b)+c", ["a", "b", "c"], [1.0, 1.0, 0.0])
+    assert d and abs(d["params"][0][1] - 2.5) < 1e-3
+    assert abs(d["params"][1][1] - 0.3) < 1e-3 and d["r2"] > 0.9999
+    tt = datasci.t_test(np.r_[np.zeros(50) + 0.5, 0.4, 0.6], mu=0.0)
+    assert tt and tt["sig_5pct"] and tt["p_value"] < 1e-6
+    tt2 = datasci.t_test([1, 2, 3, 2, 1, 2], b=[1.1, 2.1, 2.9, 2.0, 1.2, 2.1], paired=True)
+    assert tt2 and "p_value" in tt2
+    an = datasci.anova_oneway([("g1", [1, 2, 3, 2, 1]), ("g2", [5, 6, 7, 6, 5])])
+    assert an and an["sig_5pct"]
+
+
+def test_waterfall_smoke():
+    """FFTウォーターフォール（3D）の表示と通常表示への復帰。"""
+    w = _make_app(_wave())
+    w.draw_graph()
+    w.show_waterfall()
+    assert w.ax.name == "3d" and len(w.ax.lines) > 5
+    w.draw_graph()
+    assert w.ax.name != "3d"
+
+
+def test_gui_interactions():
+    """全系列ホバー値・D&D系列追加・解読オーバーレイ・リンク選択の回帰。"""
+    ck, un = QtCore.Qt.CheckState.Checked, QtCore.Qt.CheckState.Unchecked
+    w = _make_app(_wave())
+    w.draw_graph()
+    # 1) ホバー: 表示X座標での全系列値（電圧・電流の2系列分）
+    vals = w._hover_values(w.ax, 0.005)
+    assert len(vals) == 2 and all(len(v) == 4 for v in vals)
+    # 2) D&D: ペイロードを直接ドロップ → 未選択の系列が追加され描画される
+    w._find_y_item("t.csv", "電圧").setCheckState(un)
+    assert len(w._selected_series_items()) == 1
+    w._drop_series("t.csv\t電圧")
+    assert len(w._selected_series_items()) == 2
+    node = w.explorer.topLevelItem(0)
+    leaf = next(node.child(j) for j in range(node.childCount())
+                if node.child(j).data(0, graph_app.UserRole)[2] == "電圧")
+    assert "t.csv\t電圧" in w.explorer._drag_payload(leaf)
+    assert w.explorer._drag_payload(node).count("\t") == 3   # ファイル行=全列
+    # 3) 解読オーバーレイ: 注記データ＋チェックONで波形上にテキストが載る
+    n_before = len(w.ax.texts)
+    w._proto_annotations = {"rows": [(0.001, "data", "0x41", ""),
+                                     (0.002, "data", "0x42", "CRC⚠")],
+                            "proto": "UART"}
+    w.proto_overlay_check.setChecked(True)   # → 再描画で注記
+    w.draw_graph()
+    assert len(w.ax.texts) >= n_before + 2
+    w.proto_overlay_check.setChecked(False)
+    w.draw_graph()
+    # 4) リンク選択: 表の行選択 → リング強調 ／ 線ピック → 行選択
+    w.table.selectRow(3)
+    assert len(w._link_artists) == 2   # チェック中の2系列ぶんのリング
+    assert w._line_pick_map            # 単純折れ線なのでピック配線がある
+
+    class _PickEv:
+        artist = next(iter(w._line_pick_map))
+        ind = [7]
+    w.table.clearSelection()
+    w._on_legend_pick(_PickEv())
+    sel = {i.row() for i in w.table.selectedIndexes()}
+    assert sel == {7}
+
+
+def test_layout_presets_and_ltspice_plumbing():
+    """レイアウトプリセットの切替と、LTspice連携の配管（実行はしない）。"""
+    w = _make_app(_wave())
+    w.resize(1280, 800)
+    w._apply_layout_preset("graph")
+    assert all(d.isHidden() for d in [*w.left_docks, w.format_dock])
+    assert w.center_splitter.sizes()[1] == 0
+    w._apply_layout_preset("analysis")
+    assert not w.left_docks[1].isHidden() and w.left_docks[0].isHidden()
+    w._apply_layout_preset("standard")
+    assert all(not d.isHidden() for d in [*w.left_docks, w.format_dock])
+    # .asc/.net は読み込みではなくシミュレーション実行へディスパッチされる
+    called = []
+    w.run_ltspice_asc = lambda p=None: called.append(p)
+    w._load_file(r"C:\tmp\x.asc")
+    w._load_file(r"C:\tmp\y.net")
+    assert called == [r"C:\tmp\x.asc", r"C:\tmp\y.net"]
+    w._ltspice_exe()   # exe探索がどの環境でも例外なく動く
+
+
+def test_folder_tree_and_graph_windows():
+    """フォルダ階層ツリー・複数グラフウィンドウ・レイアウトプリセットの回帰。"""
+    import tempfile
+    w = _make_app(_wave())
+    w.draw_graph()
+    # 複数グラフウィンドウ（開く→描画済み→閉じると参照が消える）
+    w.open_graph_window()
+    assert len(w._graph_windows) == 1
+    axs = w._graph_windows[0].findChild(type(w.canvas)).figure.axes
+    assert axs and len(axs[0].get_lines()) >= 2
+    w._graph_windows[0].close()
+    assert not w._graph_windows
+    # フォルダ読込 → 2フォルダでツリーが フォルダ→ファイル→列 に階層化
+    base = os.path.join(tempfile.gettempdir(), "gtest_tree")
+    for sub, col in (("A", "v1"), ("B", "v2")):
+        os.makedirs(os.path.join(base, sub), exist_ok=True)
+        pd.DataFrame({"t": [0, 1], col: [1.0, 2.0]}).to_csv(
+            os.path.join(base, sub, f"{col}.csv"), index=False)
+    w._load_folder(os.path.join(base, "A"))
+    w._load_folder(os.path.join(base, "B"))
+    kinds = [w.explorer.topLevelItem(i).data(0, graph_app.UserRole)[0]
+             for i in range(w.explorer.topLevelItemCount())]
+    assert kinds.count("folder") == 2
+    assert len(list(w._iter_file_nodes())) == 3   # t.csv + v1.csv + v2.csv
+    # 階層があっても列チェックが y_list と同期する
+    fnode = next(n for n in w._iter_file_nodes()
+                 if n.data(0, graph_app.UserRole)[1] == "v1.csv")
+    fnode.child(1).setCheckState(0, QtCore.Qt.CheckState.Checked)
+    assert ("v1.csv", "v1") in {it.data(graph_app.UserRole)
+                                for it in (w.y_list.item(i) for i in range(w.y_list.count()))
+                                if it.checkState() == QtCore.Qt.CheckState.Checked}
+    # レイアウトプリセット4種（配置＋外観が両方変わる）→標準復帰
+    w.resize(1280, 800)
+    w._apply_layout_preset("labplot")   # データ+統計がタブ化・プレビュー表示
+    assert (w.left_docks[3] in w.tabifiedDockWidgets(w.left_docks[0])
+            or w.left_docks[0] in w.tabifiedDockWidgets(w.left_docks[3]))
+    w._apply_layout_preset("veusz")     # ツールバーが左縦に移動
+    assert w.toolBarArea(w.main_toolbar) == QtCore.Qt.ToolBarArea.LeftToolBarArea
+    w._apply_layout_preset("kst")       # ファイルツリーがフロート小窓
+    assert w.files_dock.isFloating() and w.format_dock.isHidden()
+    w._apply_layout_preset("igor")      # 3枚カスケードフロート
+    assert all(d.isFloating() for d in (w.files_dock, w.left_docks[1], w.format_dock))
+    w._apply_layout_preset("standard")
+    assert all(not d.isHidden() and not d.isFloating()
+               for d in [*w.left_docks, w.format_dock])
+    assert w.files_dock.isFloating()    # 読み込み済みファイルの既定は独立ウィンドウ
+    assert not w.files_dock.isHidden()
+    assert w.toolBarArea(w.main_toolbar) == QtCore.Qt.ToolBarArea.TopToolBarArea
+    assert w._ui_style_name == "standard"
+    # 内部の幅・高さが実際に変えられる（最小サイズ制約が復活していないこと）
+    w.show()
+    app = QtWidgets.QApplication.instance()
+    w.resizeDocks([w.left_docks[0]], [150], QtCore.Qt.Orientation.Horizontal)
+    app.processEvents()
+    assert abs(w.left_docks[0].width() - 150) <= 30
+    w.resizeDocks([w.format_dock], [160], QtCore.Qt.Orientation.Horizontal)
+    app.processEvents()
+    assert abs(w.format_dock.width() - 160) <= 30
+    # ファイルウィンドウ（フロート）は自由にリサイズできる
+    w.files_dock.resize(560, 700)
+    app.processEvents()
+    assert abs(w.files_dock.width() - 560) <= 10
+    w.files_dock.resize(260, 320)
+    app.processEvents()
+    assert abs(w.files_dock.width() - 260) <= 10
+    # UIスタイル単体切替: QSS・ツールバー・ツリー字下げが変わり、機能は生きている
+    w._apply_ui_style("veusz")
+    assert w.main_toolbar.iconSize().width() == 16 and w.explorer.indentation() == 14
+    w.draw_graph()
+    assert len(w.ax.get_lines()) >= 1
+    w._apply_ui_style("standard")
+    # 標準でも基準QSS（ボタン高さ統一）が入り、ツールバーは既定に戻る
+    assert "min-height" in w.styleSheet() and w.main_toolbar.iconSize().width() == 24
+
+
 def test_undo_redo():
     w = _make_app(_wave())
     for s in ("A", "B", "C"):

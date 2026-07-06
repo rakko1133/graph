@@ -318,38 +318,24 @@ class ScopeCursorMixin:
         self.draw_graph()
         self._set_status("全体表示に戻しました（ダブルクリックでいつでも戻れます）。")
 
-    def _hover_readout(self, event):
-        """マウス近傍のデータ点（系列名・X・Y）をステータスバー右端に常時表示する。
-        ピクセル座標で最近傍を探すので、対数軸・単位換算後の表示座標でも正しい。"""
-        lbl = getattr(self, "_hover_label", None)
-        if lbl is None:
-            return
-        ax = event.inaxes
-        if (ax is None or ax not in self.fig.axes or event.x is None
-                or not getattr(self, "_has_drawn", False)
-                or getattr(ax, "name", None) == "3d"
-                or self._scope_drag or self._cursor_drag is not None):
-            if lbl.text():
-                lbl.setText("")
-            return
-        import time
-        now = time.monotonic()
-        if now - getattr(self, "_hover_t", 0.0) < 0.05:   # 20Hzに間引き（負荷対策）
-            return
-        self._hover_t = now
-        import numpy as np
-        # イベントの軸（段分け中は各段）と、重なっている第2軸/主軸を対象にする
+    def _hover_lines(self, ax):
+        """ホバー対象の (系列名, Line2D) 候補（対象軸＋重なる第2軸/主軸）。"""
         axs = [ax]
         twin = getattr(ax, "_twin_secondary", None)
         if twin is not None:
             axs.append(twin)
         if ax is getattr(self.ax, "_twin_secondary", None):
             axs.append(self.ax)
-        cands = [(ln.get_label(), ln) for a in axs for ln in a.get_lines()
-                 if not str(ln.get_label()).startswith("_")
-                 and "近似" not in str(ln.get_label())]
-        best = None   # (画面距離^2, 系列名, x, y)
-        for label, ln in cands:
+        return [(str(ln.get_label()), ln) for a in axs for ln in a.get_lines()
+                if not str(ln.get_label()).startswith("_")
+                and "近似" not in str(ln.get_label())]
+
+    def _hover_values(self, ax, x_disp):
+        """表示X座標 x_disp における各系列の値 [(名前, 色, x, y), ...] を返す。
+        各系列の最近傍点を採用する（Grafana風の全系列読み出し）。"""
+        import numpy as np
+        out = []
+        for label, ln in self._hover_lines(ax):
             try:
                 xd = np.asarray(ln.get_xdata(), float)
                 yd = np.asarray(ln.get_ydata(), float)
@@ -360,16 +346,123 @@ class ScopeCursorMixin:
             m = np.isfinite(xd) & np.isfinite(yd)
             if not m.any():
                 continue
-            pts = ln.axes.transData.transform(np.column_stack([xd[m], yd[m]]))
-            d2 = (pts[:, 0] - event.x) ** 2 + (pts[:, 1] - event.y) ** 2
-            i = int(np.argmin(d2))
-            if best is None or d2[i] < best[0]:
-                best = (float(d2[i]), str(label), float(xd[m][i]), float(yd[m][i]))
-        if best is not None and best[0] <= 20.0 ** 2:   # 20px以内の点だけ表示
+            xs, ys = xd[m], yd[m]
+            i = int(np.argmin(np.abs(xs - x_disp)))
+            out.append((label, ln.get_color(), float(xs[i]), float(ys[i])))
+        return out
+
+    def _hover_readout(self, event):
+        """ホバー位置の全系列の値をツールチップに、最近傍点をステータスバーに表示し、
+        十字カーソルを重ねる（Grafana風）。対数軸・単位換算後の表示座標でも正しい。"""
+        lbl = getattr(self, "_hover_label", None)
+        if lbl is None:
+            return
+        ax = event.inaxes
+        if (ax is None or ax not in self.fig.axes or event.x is None
+                or event.xdata is None
+                or not getattr(self, "_has_drawn", False)
+                or getattr(ax, "name", None) == "3d"
+                or ax.get_label() == "<colorbar>"
+                or self._scope_drag or self._cursor_drag is not None):
+            if lbl.text():
+                lbl.setText("")
+            self._hide_hover_ui()
+            return
+        import time
+        now = time.monotonic()
+        if now - getattr(self, "_hover_t", 0.0) < 0.05:   # 20Hzに間引き（負荷対策）
+            return
+        self._hover_t = now
+        import numpy as np
+        vals = self._hover_values(ax, float(event.xdata))
+        # ステータスバー右には従来どおり「最近傍1点」を出す
+        best = None
+        for label, _c, x, y in vals:
+            pt = ax.transData.transform([[x, y]])[0]
+            d2 = (pt[0] - event.x) ** 2 + (pt[1] - event.y) ** 2
+            if best is None or d2 < best[0]:
+                best = (d2, label, x, y)
+        if best is not None and best[0] <= 20.0 ** 2:
             _, label, x, y = best
             lbl.setText(f"{label}:  X={plotter.format_eng(x)}  Y={plotter.format_eng(y)}  ")
         elif lbl.text():
             lbl.setText("")
+        # 全系列ツールチップ（色付き・最大12系列）
+        if vals:
+            rows = [f"<b>X = {plotter.format_eng(float(event.xdata))}</b>"]
+            for label, color, _x, y in vals[:12]:
+                rows.append(f"<span style='color:{color}'>■</span> "
+                            f"{label}: <b>{plotter.format_eng(y)}</b>")
+            if len(vals) > 12:
+                rows.append(f"…他 {len(vals) - 12} 系列")
+            QtWidgets.QToolTip.showText(QtGui.QCursor.pos(),
+                                        "<br>".join(rows), self.canvas)
+        else:
+            QtWidgets.QToolTip.hideText()
+        self._draw_crosshair(ax, event.xdata, event.ydata)
+
+    # ---- 十字カーソル（blit描画。通常の再描画には含まれない animated アーティスト）----
+    def _hide_hover_ui(self):
+        QtWidgets.QToolTip.hideText()
+        if getattr(self, "_xhair_bg", None) is None:
+            return
+        size = (int(self.fig.bbox.width), int(self.fig.bbox.height),
+                self.canvas.width(), self.canvas.height())
+        if getattr(self, "_xhair_size", None) != size or getattr(self, "_drawing", False):
+            self._xhair_bg = None   # サイズ不一致の背景は書き戻さない（クラッシュ対策）
+            return
+        try:
+            self.canvas.restore_region(self._xhair_bg)
+            self.canvas.blit(self.fig.bbox)
+        except Exception:
+            pass
+        self._xhair_bg = None
+
+    def _invalidate_crosshair(self, *_):
+        """本描画のたびに背景キャッシュを捨てる（draw_eventで呼ばれる）。"""
+        self._xhair_bg = None
+
+    def _draw_crosshair(self, ax, x, y):
+        # 区間測定(SpanSelector)やカーソル測定は独自のblit/ドラッグを持つため干渉を避ける
+        if (x is None or y is None
+                or (getattr(self, "gate_btn", None) and self.gate_btn.isChecked())
+                or self._cursor_cid is not None
+                or getattr(self.toolbar, "mode", "")):
+            return
+        xh = getattr(self, "_xhair", None)
+        if not xh or xh[0].axes is not ax:   # 軸が変わった/消えたら作り直す
+            if xh:
+                for a in xh:
+                    try:
+                        a.remove()
+                    except Exception:
+                        pass
+            v = ax.axvline(x, color="#888", lw=0.7, ls="--", animated=True, zorder=30)
+            h = ax.axhline(y, color="#888", lw=0.7, ls="--", animated=True, zorder=30)
+            self._xhair = (v, h)
+            self._xhair_bg = None
+        # キャンバスサイズが変わっていたら背景キャッシュを捨てる。サイズ違いの
+        # 背景を restore_region で書き戻すとネイティブレベルで落ちることがある
+        # （起動直後の初回描画・リサイズ中にマウスが乗っていたときの間欠クラッシュ対策。
+        # アクセス違反は Python の except では捕まらないため、事前チェックが必須）。
+        size = (int(self.fig.bbox.width), int(self.fig.bbox.height),
+                self.canvas.width(), self.canvas.height())
+        if getattr(self, "_xhair_size", None) != size:
+            self._xhair_bg = None
+        if getattr(self, "_drawing", False):
+            return   # 本描画の最中はblitしない（バッファが確定していない）
+        try:
+            if getattr(self, "_xhair_bg", None) is None:
+                self._xhair_bg = self.canvas.copy_from_bbox(self.fig.bbox)
+                self._xhair_size = size
+            self.canvas.restore_region(self._xhair_bg)
+            self._xhair[0].set_xdata([x, x])
+            self._xhair[1].set_ydata([y, y])
+            ax.draw_artist(self._xhair[0])
+            ax.draw_artist(self._xhair[1])
+            self.canvas.blit(self.fig.bbox)
+        except Exception:   # バックエンド差異等では静かに諦める（ツールチップは生きる）
+            self._xhair_bg = None
 
     @staticmethod
     def _zoom_pair(lo, hi, center, factor, log=False):

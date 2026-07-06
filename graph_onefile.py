@@ -38,6 +38,7 @@ app.log に残るようにするのが目的。
 LOG_DIR = os.path.join(os.path.expanduser("~"), ".csv_graph_tool")
 LOG_FILE = os.path.join(LOG_DIR, "app.log")
 _logger = None
+_crash_file = None   # faulthandler の出力先（GCで閉じないよう保持）
 
 
 def setup_logging(level=logging.INFO):
@@ -61,6 +62,17 @@ def setup_logging(level=logging.INFO):
     ch.setFormatter(fmt)
     logger.addHandler(ch)
     logger.propagate = False
+    # ネイティブクラッシュ（アクセス違反等）でもPythonスタックが crash.log に残るように。
+    # 通常の例外フックでは捕まらない 0xC0000005 系の事後解析用。
+    try:
+        import faulthandler
+        global _crash_file
+        _crash_file = open(os.path.join(LOG_DIR, "crash.log"), "a", encoding="utf-8")
+        _crash_file.write("\n==== 起動 ====\n")
+        _crash_file.flush()
+        faulthandler.enable(file=_crash_file)
+    except OSError:
+        pass
     _logger = logger
     return logger
 
@@ -211,11 +223,14 @@ def setup_japanese_font(preferred=None):
 # ======================================================================
 # ↑ py
 # ======================================================================
-"""CSV / TSV ファイルの読み込み。
+"""表・波形データファイルの読み込み。
 
-文字コード（UTF-8 / UTF-8 BOM付き / Shift_JIS(CP932) など）と
-区切り文字（カンマ / タブ / セミコロン）を自動判定して
-pandas.DataFrame として読み込む。日本語 CSV を想定。
+- CSV/TSV/TXT: 文字コード（UTF-8 / BOM付き / CP932 など）と区切り文字を自動判定
+- Excel (.xlsx/.xlsm/.xls): シート指定可（既定は先頭シート）
+- WAV (.wav): 音声波形を 時間[s]＋ch列 として読む（標準ライブラリのみ）
+- LTspice (.raw): 過渡解析のバイナリ/ASCII波形（AC複素・fastaccessは未対応）
+- TDMS (.tdms): 要 npTDMS ／ MDF (.mf4/.mdf): 要 asammdf ／ HDF5 (.h5/.hdf5): 要 tables か h5py
+  （任意依存。未インストール時は pip コマンド入りの分かりやすいエラーを出す）
 """
 
 
@@ -356,19 +371,189 @@ def _normalize_columns(df):
     return df
 
 
-def load_table(path, encoding=None, delimiter=None):
-    """CSV/TSV/Excel を読み込み (DataFrame, 使用した encoding, 使用した delimiter) を返す。
+def excel_sheet_names(path):
+    """Excelブックのシート名一覧を返す（読めない場合は空リスト）。"""
+    try:
+        return list(pd.ExcelFile(path).sheet_names)
+    except Exception:
+        return []
 
-    encoding / delimiter を None にすると自動判定する。.xlsx/.xls/.xlsm は Excel として読む。
+
+def _load_wav(path):
+    """WAV音声を 時間[s]＋ch1..chN のDataFrameにする（8/16/32bit PCM対応）。"""
+    import wave
+    import numpy as np
+    with wave.open(path, "rb") as w:
+        ch, sw, fr, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+        raw = w.readframes(n)
+    dtype = {1: np.uint8, 2: np.dtype("<i2"), 4: np.dtype("<i4")}.get(sw)
+    if dtype is None:
+        raise ValueError(f"未対応のサンプル幅です: {sw * 8}bit（8/16/32bit PCMに対応）")
+    a = np.frombuffer(raw, dtype=dtype).astype(float)
+    if sw == 1:
+        a -= 128.0   # 8bitは無符号なので中心を0に
+    a = a.reshape(-1, ch)
+    cols = {"時間[s]": np.arange(a.shape[0], dtype=float) / fr}
+    for i in range(ch):
+        cols[f"ch{i + 1}"] = a[:, i]
+    return pd.DataFrame(cols)
+
+
+def _load_ltspice_raw(path):
+    """LTspice の .raw 波形（過渡解析）を読む。バイナリ/ASCII両対応。
+
+    ヘッダはASCIIまたはUTF-16LE（LTspice XVII）。複素数（AC解析）と
+    fastaccess形式は未対応で、その旨を案内するエラーを出す。"""
+    import numpy as np
+    with open(path, "rb") as f:
+        data = f.read()
+    enc = "utf-16-le" if (data[:2] == b"\xff\xfe" or data[1:2] == b"\x00") else "latin-1"
+    marker = body = None
+    for m in ("Binary:", "Values:"):
+        mb = (m + "\n").encode(enc)
+        i = data.find(mb)
+        if i < 0:
+            mb = (m + "\r\n").encode(enc)
+            i = data.find(mb)
+        if i >= 0:
+            marker, hdr_end, body = m, i, i + len(mb)
+            break
+    if marker is None:
+        raise ValueError("LTspiceの .raw 形式として解釈できません（Binary:/Values: が見つかりません）。")
+    header = data[:hdr_end].decode(enc, errors="replace")
+    nvars = npts = 0
+    flags = ""
+    names = []
+    in_vars = False
+    for line in header.splitlines():
+        low = line.strip()
+        if low.startswith("No. Variables:"):
+            nvars = int(low.split(":")[1])
+        elif low.startswith("No. Points:"):
+            npts = int(low.split(":")[1])
+        elif low.startswith("Flags:"):
+            flags = low.split(":", 1)[1].lower()
+        elif low.startswith("Variables:"):
+            in_vars = True
+        elif in_vars and low:
+            parts = low.split("\t") if "\t" in line else low.split()
+            if len(parts) >= 2 and parts[0].strip().isdigit():
+                names.append(parts[1].strip())
+    if not nvars or not npts or len(names) != nvars:
+        raise ValueError("LTspice .raw のヘッダを解釈できませんでした。")
+    if "complex" in flags:
+        raise ValueError("AC解析（複素数）の .raw は未対応です。過渡解析(.tran)の .raw を読み込んでください。")
+    if "fastaccess" in flags:
+        raise ValueError(".raw が fastaccess 形式です。LTspiceの設定で fastaccess を無効にして再保存してください。")
+    if marker == "Binary:":
+        if "double" in flags:   # 全変数 float64
+            arr = np.frombuffer(data[body:body + 8 * nvars * npts], dtype="<f8")
+            table = arr.reshape(npts, nvars)
+        else:                    # 時間=float64、他=float32（LTspice標準）
+            rec = np.dtype([("t", "<f8")] + [(f"v{i}", "<f4") for i in range(1, nvars)])
+            arr = np.frombuffer(data[body:body + rec.itemsize * npts], dtype=rec)
+            table = np.column_stack([arr["t"]] + [arr[f"v{i}"] for i in range(1, nvars)])
+    else:                        # ASCII (Values:)
+        text = data[body:].decode(enc, errors="replace")
+        vals = [float(tok) for tok in text.split() if _is_float(tok)]
+        # 各点は「点番号 v0 v1 ...」の並び。点番号を除いて詰め直す
+        table = np.array(vals, dtype=float).reshape(npts, nvars + 1)[:, 1:]
+    table[:, 0] = np.abs(table[:, 0])   # LTspiceは圧縮マーカーで時間が負になることがある
+    return pd.DataFrame({names[i]: table[:, i] for i in range(nvars)})
+
+
+def _is_float(tok):
+    try:
+        float(tok)
+        return True
+    except ValueError:
+        return False
+
+
+def _load_tdms(path):
+    """NI TDMS を読む（要 npTDMS）。グループ/チャンネルを列に展開する。"""
+    try:
+        from nptdms import TdmsFile
+    except ImportError as e:
+        raise ValueError("TDMS の読み込みには npTDMS が必要です（pip install npTDMS）。") from e
+    td = TdmsFile.read(path)
+    groups = td.groups()
+    cols = {}
+    for g in groups:
+        for chan in g.channels():
+            name = f"{g.name}/{chan.name}" if len(groups) > 1 else str(chan.name)
+            try:   # 波形属性があれば時間軸も作る（最初の1本だけ）
+                if "時間[s]" not in cols:
+                    cols["時間[s]"] = chan.time_track()
+            except (KeyError, ValueError):
+                pass
+            cols[name] = chan[:]
+    if not cols:
+        raise ValueError("TDMS内にチャンネルが見つかりません。")
+    return pd.DataFrame({k: pd.Series(v) for k, v in cols.items()})
+
+
+def _load_mdf(path):
+    """車載計測 MDF (.mf4/.mdf) を読む（要 asammdf）。"""
+    try:
+        from asammdf import MDF
+    except ImportError as e:
+        raise ValueError("MDF の読み込みには asammdf が必要です（pip install asammdf）。") from e
+    with MDF(path) as m:
+        df = m.to_dataframe()
+    df = df.reset_index()
+    if df.columns[0] in ("timestamps", "time", "index"):
+        df = df.rename(columns={df.columns[0]: "時間[s]"})
+    return df
+
+
+def _load_hdf5(path):
+    """HDF5 を読む。pandas形式（要 tables）→ 汎用h5py（1D/2D数値データセット）の順に試す。"""
+    try:
+        df = pd.read_hdf(path)
+        if hasattr(df, "to_frame"):
+            df = df.to_frame()
+        return df.reset_index(drop=False)
+    except Exception:
+        pass
+    try:
+        import h5py
+    except ImportError as e:
+        raise ValueError("HDF5 の読み込みには tables または h5py が必要です"
+                         "（pip install h5py）。") from e
+    cols = {}
+    with h5py.File(path, "r") as f:
+        def visit(name, obj):
+            if not isinstance(obj, h5py.Dataset) or obj.dtype.kind not in "fiu":
+                return
+            short = name.split("/")[-1]
+            key = short if short not in cols else name
+            if obj.ndim == 1:
+                cols[key] = obj[...]
+            elif obj.ndim == 2 and obj.shape[1] <= 64:   # 2Dは列に展開
+                arr = obj[...]
+                for j in range(arr.shape[1]):
+                    cols[f"{key}[{j}]"] = arr[:, j]
+        f.visititems(visit)
+    if not cols:
+        raise ValueError("HDF5 内に数値データセット（1D/2D）が見つかりません。")
+    return pd.DataFrame({k: pd.Series(v) for k, v in cols.items()})
+
+
+def load_table(path, encoding=None, delimiter=None, sheet=None):
+    """表・波形ファイルを読み込み (DataFrame, 使用encoding, 使用delimiter) を返す。
+
+    encoding / delimiter は CSV/TSV系のみ意味を持ち、None なら自動判定。
+    sheet は Excel のシート名/番号（None=先頭）。その他の形式は拡張子で自動判別。
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"ファイルが見つかりません: {path}")
 
-    # --- Excel（先頭シート）---
     ext = os.path.splitext(path)[1].lower()
+    # --- Excel ---
     if ext in (".xlsx", ".xlsm", ".xls"):
         try:
-            df = pd.read_excel(path)
+            df = pd.read_excel(path, sheet_name=sheet if sheet is not None else 0)
         except ImportError as e:
             if ext == ".xls":   # 旧形式 .xls は openpyxl では読めず xlrd が必要
                 raise ValueError('.xls の読み込みには xlrd が必要です'
@@ -378,6 +563,17 @@ def load_table(path, encoding=None, delimiter=None):
         if df.shape[1] == 0:
             raise ValueError("シートから列を読み取れませんでした。")
         return _normalize_columns(df), "excel", "excel"
+    # --- 波形・計測形式 ---
+    if ext == ".wav":
+        return _normalize_columns(_load_wav(path)), "wav", ""
+    if ext == ".raw":
+        return _normalize_columns(_load_ltspice_raw(path)), "ltspice", ""
+    if ext == ".tdms":
+        return _normalize_columns(_load_tdms(path)), "tdms", ""
+    if ext in (".mf4", ".mdf"):
+        return _normalize_columns(_load_mdf(path)), "mdf", ""
+    if ext in (".h5", ".hdf5"):
+        return _normalize_columns(_load_hdf5(path)), "hdf5", ""
 
     if encoding is None:
         encoding = detect_encoding(path)
@@ -2398,7 +2594,9 @@ def analyze(t, y, n_peaks=5, smooth=0):
 """高度解析：マスク/リミット合否、アイダイアグラム、ジッタ、シリアルプロトコル解読。
 
 ハイエンドオシロ相当の解析機能を後処理で提供する。プロトコル解読は
-UART（1線）、I2C（SCL/SDA）、SPI（SCK/MOSI[/CS]）に対応。
+UART（1線）、I2C（SCL/SDA）、SPI（SCK/MOSI[/CS]）、
+CAN（1線・標準/拡張ID・デスタッフィング・CRC15検証）、
+LIN（1線・break/sync/PID/チェックサム検証）、1-Wire（1線・標準速度）に対応。
 """
 
 
@@ -2673,6 +2871,293 @@ def decode_i2c(t, scl, sda, threshold=None):
         flush_byte()
         events.append({"time": float(t[idx]),
                        "type": "START" if kind == "S" else "STOP"})
+    return events
+
+
+# ----------------------------------------------------------------- CAN
+def _can_crc15(bits):
+    """CAN の CRC-15（多項式 0x4599）。SOF〜データ末尾のデスタッフ後ビット列に対して計算。"""
+    crc = 0
+    for b in bits:
+        inv = (b & 1) ^ ((crc >> 14) & 1)
+        crc = (crc << 1) & 0x7FFF
+        if inv:
+            crc ^= 0x4599
+    return crc
+
+
+def decode_can(t, y, bitrate, threshold=None, dominant="low"):
+    """CAN（1線）を解読してフレーム一覧を返す。
+
+    dominant="low": RXピン等でドミナント=Low の信号（既定）。
+    dominant="high": CANH-CANL の差動などドミナント=High の信号。
+    標準(11bit)・拡張(29bit)ID、ビットスタッフィング除去、CRC-15検証に対応。
+    各要素 {time, id, ext, rtr, dlc, data(list), hex, crc_ok}。
+    """
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if threshold is None:
+        threshold = auto_threshold(y)
+    logic = _logic(y, threshold)
+    dom = (1 - logic) if dominant == "low" else logic   # 1=ドミナント
+    bit_t = 1.0 / float(bitrate)
+    tend = t[-1]
+    n = len(t)
+    frames = []
+    i = 0
+    while i < n - 1:
+        if not (dom[i] == 0 and dom[i + 1] == 1):   # recessive→dominant = SOF候補
+            i += 1
+            continue
+        sof_t = t[i + 1]
+        frame, end_t = _read_can_frame(t, dom, sof_t, bit_t, tend)
+        if frame is not None:
+            frames.append(frame)
+            i = max(int(np.searchsorted(t, end_t)), i + 1)
+        else:
+            i += 1
+    return frames
+
+
+def _read_can_frame(t, dom, sof_t, bit_t, tend):
+    """SOF位置から1フレームを読む。失敗時は (None, _)。戻り値 (frame, フレーム終端時刻)。"""
+    state = {"k": 0, "run_val": None, "run_len": 0}
+    crc_bits = []   # CRC計算対象（SOF〜データ末尾のデスタッフ後ビット）
+
+    def read_raw():
+        bt = sof_t + (state["k"] + 0.5) * bit_t
+        state["k"] += 1
+        if bt > tend:
+            return None
+        idx = min(int(np.searchsorted(t, bt)), len(dom) - 1)
+        return 0 if dom[idx] else 1   # CAN値（0=ドミナント）
+
+    def next_bit():
+        """デスタッフィング付きで1ビット読む（スタッフ相はSOF〜CRC末尾）。"""
+        b = read_raw()
+        if b is None:
+            return None
+        if state["run_len"] == 5:      # 直前5連続 → これはスタッフビット
+            if b == state["run_val"]:
+                return None            # スタッフエラー（フォーム崩れ）
+            state["run_val"], state["run_len"] = b, 1
+            b = read_raw()
+            if b is None:
+                return None
+        if b == state["run_val"]:
+            state["run_len"] += 1
+        else:
+            state["run_val"], state["run_len"] = b, 1
+        return b
+
+    def take(nbits, into_crc=True):
+        v = 0
+        for _ in range(nbits):
+            b = next_bit()
+            if b is None:
+                return None
+            if into_crc:
+                crc_bits.append(b)
+            v = (v << 1) | b
+        return v
+
+    # SOF（ドミナント=0）はビット位置0。読み出しはID先頭（位置1）から始める
+    state["k"] = 1
+    state["run_val"], state["run_len"] = 0, 1
+    crc_bits.append(0)
+    ident = take(11)
+    b1 = take(1)          # RTR（標準）または SRR（拡張）
+    ide = take(1)
+    if None in (ident, b1, ide):
+        return None, sof_t
+    if ide:               # 拡張フレーム
+        id_ext = take(18)
+        rtr = take(1)
+        take(2)           # r1, r0
+        if None in (id_ext, rtr):
+            return None, sof_t
+        full_id = (ident << 18) | id_ext
+    else:
+        rtr = b1
+        take(1)           # r0
+        full_id = ident
+    dlc = take(4)
+    if dlc is None:
+        return None, sof_t
+    ndata = 0 if rtr else min(dlc, 8)
+    data = []
+    for _ in range(ndata):
+        v = take(8)
+        if v is None:
+            return None, sof_t
+        data.append(v)
+    crc_calc = _can_crc15(crc_bits)
+    crc = take(15, into_crc=False)
+    if crc is None:
+        return None, sof_t
+    read_raw()            # CRCデリミタ（以降スタッフなし）
+    read_raw()            # ACKスロット（受信ノードが居ないと recessive のまま＝判定しない）
+    end_t = sof_t + (state["k"] + 10) * bit_t   # ACKデリミタ＋EOF(7)+IFS(3)ぶん進める
+    frame = {"time": float(sof_t), "id": int(full_id), "ext": bool(ide),
+             "rtr": bool(rtr), "dlc": int(dlc), "data": [int(d) for d in data],
+             "hex": " ".join(f"{d:02X}" for d in data),
+             "crc_ok": bool(crc_calc == crc)}
+    return frame, end_t
+
+
+# ----------------------------------------------------------------- LIN
+def decode_lin(t, y, baud=19200, threshold=None):
+    """LIN（1線）を解読。break→sync(0x55)→PID→データ→チェックサムを返す。
+
+    チェックサムは classic（データのみ）/ enhanced（PID込み）の両方式で照合し、
+    どちらかが一致すれば ok とする。各要素 {time, type, ...}。
+    """
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if threshold is None:
+        threshold = auto_threshold(y)
+    logic = _logic(y, threshold)
+    bit_t = 1.0 / float(baud)
+    events = []
+    n = len(t)
+    i = 0
+    while i < n - 1:
+        if not (logic[i] == 1 and logic[i + 1] == 0):
+            i += 1
+            continue
+        low_start = t[i + 1]
+        j = i + 1
+        while j < n - 1 and logic[j + 1] == 0:
+            j += 1
+        low_len = t[min(j + 1, n - 1)] - low_start
+        if low_len < 11 * bit_t:      # breakは11ビット時間以上のLow
+            i += 1
+            continue
+        events.append({"time": float(low_start), "type": "BREAK"})
+        # break後のバイト列をUARTとして読む（次のbreakまたは終端まで）
+        seg_start = t[min(j + 1, n - 1)]
+        seg_bytes = _lin_read_bytes(t, logic, seg_start, bit_t)
+        if not seg_bytes:
+            i = j + 1
+            continue
+        vals = [b["value"] for b in seg_bytes]
+        k = 0
+        if vals and vals[0] == 0x55:
+            events.append({"time": seg_bytes[0]["time"], "type": "SYNC", "value": 0x55})
+            k = 1
+        if k < len(vals):
+            pid = vals[k]
+            fid = pid & 0x3F
+            p0 = (fid ^ (fid >> 1) ^ (fid >> 2) ^ (fid >> 4)) & 1
+            p1 = (~((fid >> 1) ^ (fid >> 3) ^ (fid >> 4) ^ (fid >> 5))) & 1
+            pid_ok = pid == (fid | (p0 << 6) | (p1 << 7))
+            events.append({"time": seg_bytes[k]["time"], "type": "PID",
+                           "value": fid, "ok": bool(pid_ok)})
+            data = vals[k + 1:-1]
+            if data or len(vals) > k + 1:
+                csum = vals[-1]
+
+                def _lin_sum(vals0):
+                    """LINのチェックサム＝キャリー巻き込み加算の反転。"""
+                    s = 0
+                    for v in vals0:
+                        s += v
+                        if s > 0xFF:
+                            s = (s & 0xFF) + 1
+                    return (~s) & 0xFF
+
+                classic = _lin_sum(data) if data else None
+                enhanced = _lin_sum([pid] + data)
+                ok = csum in (classic, enhanced)
+                for bi, v in zip(seg_bytes[k + 1:-1], data):
+                    events.append({"time": bi["time"], "type": "data", "value": v})
+                events.append({"time": seg_bytes[-1]["time"], "type": "CSUM",
+                               "value": csum, "ok": bool(ok)})
+        i = max(int(np.searchsorted(t, seg_bytes[-1]["time"] + 10 * bit_t)), j + 1)
+    return events
+
+
+def _lin_read_bytes(t, logic, start_t, bit_t, max_bytes=12):
+    """start_t 以降のUART(8N1)バイトを、アイドルが2バイト時間続くまで読む。"""
+    out = []
+    tend = t[-1]
+    cur = start_t
+    n = len(t)
+    while len(out) < max_bytes:
+        # 次のスタートビット（立下り）を探す
+        i = int(np.searchsorted(t, cur))
+        while i < n - 1 and not (logic[i] == 1 and logic[i + 1] == 0):
+            i += 1
+        if i >= n - 1:
+            break
+        st = t[i + 1]
+        if st - cur > 20 * bit_t and out:   # フレーム間ギャップで打ち切り
+            break
+        if st + 10 * bit_t > tend:
+            break
+        val = 0
+        for k in range(8):
+            idx = min(int(np.searchsorted(t, st + (1.5 + k) * bit_t)), n - 1)
+            val |= (int(logic[idx]) & 1) << k
+        out.append({"time": float(st), "value": val})
+        cur = st + 10 * bit_t
+    return out
+
+
+# ----------------------------------------------------------------- 1-Wire
+def decode_onewire(t, y, threshold=None, time_scale=1.0):
+    """1-Wire（標準速度）を解読。リセット/プレゼンス/バイト列を返す。
+
+    Lowパルス幅で判定: >480µs=リセット、<20µs=1、20〜120µs=0（LSBファースト）。
+    time_scale: 時間軸が秒でない場合の倍率（例: msの列なら1e-3）。
+    """
+    t = np.asarray(t, dtype=float) * float(time_scale)
+    y = np.asarray(y, dtype=float)
+    if threshold is None:
+        threshold = auto_threshold(y)
+    logic = _logic(y, threshold)
+    n = len(t)
+    # Lowパルス（立下り→立上り）を列挙
+    pulses = []
+    i = 0
+    while i < n - 1:
+        if logic[i] == 1 and logic[i + 1] == 0:
+            start = t[i + 1]
+            j = i + 1
+            while j < n - 1 and logic[j + 1] == 0:
+                j += 1
+            end = t[min(j + 1, n - 1)]
+            pulses.append((start, end - start))
+            i = j + 1
+        else:
+            i += 1
+    events = []
+    bits, bit_t0 = [], None
+    last_reset_end = None
+    for start, width in pulses:
+        if width >= 480e-6:              # リセットパルス
+            if bits:                      # 中途半端なビットは破棄
+                bits, bit_t0 = [], None
+            events.append({"time": float(start), "type": "RESET"})
+            last_reset_end = start + width
+            continue
+        # リセット直後の最初のLow（60µs級）はスレーブのプレゼンス応答
+        if (last_reset_end is not None and not bits
+                and start - last_reset_end < 500e-6 and width >= 40e-6):
+            events.append({"time": float(start), "type": "PRESENCE"})
+            last_reset_end = None
+            continue
+        last_reset_end = None
+        bit = 1 if width < 20e-6 else 0   # スロットのLow幅で0/1判定
+        if not bits:
+            bit_t0 = start
+        bits.append(bit)
+        if len(bits) == 8:
+            val = 0
+            for k, b in enumerate(bits):  # LSBファースト
+                val |= (b & 1) << k
+            events.append({"time": float(bit_t0), "type": "data", "value": int(val)})
+            bits, bit_t0 = [], None
     return events
 
 
@@ -3198,6 +3683,84 @@ def normality(y):
     except Exception:
         return {}
 
+
+def fit_custom(x, y, expr, params, p0):
+    """任意式 expr（変数 x とパラメータ names）を y に非線形フィットする（要 scipy）。
+
+    expr は eval_expr の安全評価を使う（sin/exp/log 等の許可関数のみ）。
+    戻り dict: params=[(名前, 値, 標準誤差)...], r2, rmse, n, x, yfit。失敗時は {}。
+    """
+    try:
+        from scipy.optimize import curve_fit
+    except ImportError:
+        return {}
+    x, y = _clean_xy(x, y)
+    if x.size < len(params) + 2:
+        return {}
+
+    def f(xx, *vals):
+        env = {"x": xx, "t": xx}
+        env.update(dict(zip(params, vals)))
+        return np.asarray(eval_expr(expr, env), dtype=float) * np.ones_like(xx)
+
+    popt, pcov = curve_fit(f, x, y, p0=p0, maxfev=20000)
+    yfit = f(x, *popt)
+    ss_res = float(np.sum((y - yfit) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    perr = np.sqrt(np.abs(np.diag(pcov)))
+    return {"params": [(nm, float(v), float(e)) for nm, v, e in zip(params, popt, perr)],
+            "r2": (1.0 - ss_res / ss_tot) if ss_tot > 0 else None,
+            "rmse": float(np.sqrt(ss_res / x.size)),
+            "n": int(x.size), "x": x, "yfit": yfit}
+
+
+def t_test(a, b=None, mu=0.0, paired=False):
+    """t検定（要 scipy）。b=None なら1標本（母平均mu）、paired=True なら対応あり、
+    それ以外は Welch の対応なし2標本。戻り dict: t, p_value, df, mean_a, mean_b。"""
+    try:
+        from scipy import stats
+    except ImportError:
+        return {}
+    a = _clean(a)
+    if a.size < 2:
+        return {}
+    if b is None:
+        res = stats.ttest_1samp(a, float(mu))
+        mb = None
+    else:
+        b = _clean(b)
+        if b.size < 2:
+            return {}
+        if paired:
+            n = min(a.size, b.size)
+            res = stats.ttest_rel(a[:n], b[:n])
+            mb = float(np.mean(b[:n]))
+        else:
+            res = stats.ttest_ind(a, b, equal_var=False)   # Welch
+            mb = float(np.mean(b))
+    df = getattr(res, "df", None)
+    return {"t": float(res.statistic), "p_value": float(res.pvalue),
+            "df": (float(df) if df is not None else None),
+            "mean_a": float(np.mean(a)), "mean_b": mb,
+            "sig_5pct": bool(res.pvalue < 0.05)}
+
+
+def anova_oneway(groups):
+    """一元配置分散分析（要 scipy）。groups=[(名前, 配列), ...]。
+    戻り dict: F, p_value, groups=[(名前, n, 平均, σ)...], sig_5pct。"""
+    try:
+        from scipy import stats
+    except ImportError:
+        return {}
+    arrs = [(_clean(g)) for _n, g in groups]
+    named = [(str(n), a) for (n, _g), a in zip(groups, arrs) if a.size >= 2]
+    if len(named) < 2:
+        return {}
+    f, p = stats.f_oneway(*[a for _n, a in named])
+    return {"F": float(f), "p_value": float(p), "sig_5pct": bool(p < 0.05),
+            "groups": [(n, int(a.size), float(a.mean()), float(a.std(ddof=1)))
+                       for n, a in named]}
+
 # ======================================================================
 # ↑ py
 # ======================================================================
@@ -3387,34 +3950,133 @@ class LazyColumnCombo(QtWidgets.QComboBox):
             self.blockSignals(False)
         super().showPopup()
 
+SERIES_MIME = "application/x-graphapp-series"   # ツリー→グラフD&Dの系列ペイロード
+
+
 class ExplorerTree(QtWidgets.QTreeWidget):
     """VS Code のエクスプローラー風ツリー（ファイル → 列）。
 
-    チェック可能な子行（列）は行のどこを左クリックしてもチェックがトグルする
-    （CheckListWidget と同じ操作感）。ファイル行（トップレベル）は通常の
-    クリック＝選択・展開。列行かどうかは「親を持つか」で判定する
-    （childCount()==0 だと列ゼロのファイル行まで葉扱いになり選択できなくなる）。
+    VS Code 互換のキーボード操作: F2=名前の変更（renameRequested を発火）、
+    Delete=削除（deleteRequested を発火）、文字入力=その名前へジャンプ（Qt標準）。
+    描画はインデントガイド線（薄い縦線）付き。
 
-    ダブルクリックは自前で itemDoubleClicked を発火する: mousePressEvent が
-    イベントを消費すると Qt 内部の pressedIndex が更新されず、標準の
-    doubleClicked 判定（pressedIndex == index）が成立しないため。
+    - 列行（親を持つチェック可能行）: クリック＝チェックのトグル（リリース時に確定）、
+      **ドラッグ＝グラフへドロップして系列追加**（PlotJuggler風）。
+    - ファイル行: クリック＝選択・展開（標準動作）、ドラッグ＝全列をまとめて追加。
+    - 列行かどうかは「親を持つか」で判定する（childCount()==0 だと列ゼロの
+      ファイル行まで葉扱いになり選択できなくなる）。
+    - ダブルクリックは自前で itemDoubleClicked を発火する: press を消費すると
+      Qt 内部の pressedIndex が更新されず標準の判定が成立しないため。
     """
+
+    renameRequested = QtCore.Signal(object)   # F2: 対象アイテム
+    deleteRequested = QtCore.Signal()         # Delete: 選択中ファイルの削除要求
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._press_item = None
+        self._press_pos = None
+        self._dragged = False
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key.Key_F2 and self.currentItem() is not None:
+            self.renameRequested.emit(self.currentItem())
+            event.accept()
+            return
+        if event.key() == QtCore.Qt.Key.Key_Delete:
+            self.deleteRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        # VS Code風のインデントガイド（階層ごとの薄い縦線）
+        painter = QtGui.QPainter(self.viewport())
+        painter.setPen(QtGui.QColor(128, 128, 128, 60))
+        ind = max(self.indentation(), 1)
+        idx = self.indexAt(QtCore.QPoint(0, 0))
+        limit = self.viewport().height()
+        while idx.isValid():
+            rect = self.visualRect(idx)
+            if rect.top() > limit:
+                break
+            depth, p = 0, idx.parent()
+            while p.isValid():
+                depth += 1
+                p = p.parent()
+            for lv in range(depth):
+                x = lv * ind + ind // 2
+                painter.drawLine(x, rect.top(), x, rect.bottom())
+            idx = self.indexBelow(idx)
+        painter.end()
 
     @staticmethod
     def _is_check_leaf(item):
-        return (item is not None and item.parent() is not None
-                and item.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+        """列行（チェックトグル対象）か。UserRole の種別で判定する
+        （フォルダ階層があると「親を持つ＝列」の判定は成立しないため）。"""
+        if item is None:
+            return False
+        d = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        return bool(d and d[0] == "col"
+                    and item.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+
+    @classmethod
+    def _drag_payload(cls, item):
+        """ドラッグする (ファイル, 列) 行のリストを 'fl\\tcol' 行テキストで返す。
+        列=1行／ファイル=全列／フォルダ=配下の全ファイルの全列。"""
+        data = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        if data and data[0] == "col":
+            return f"{data[1]}\t{data[2]}"
+        rows = []
+        if data and data[0] in ("file", "folder"):
+            for j in range(item.childCount()):
+                sub = cls._drag_payload(item.child(j))
+                if sub:
+                    rows.append(sub)
+        return "\n".join(rows)
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
             item = self.itemAt(event.position().toPoint())
+            self._press_item = item
+            self._press_pos = event.position().toPoint()
+            self._dragged = False
             if self._is_check_leaf(item):
-                checked = item.checkState(0) == QtCore.Qt.CheckState.Checked
-                item.setCheckState(0, QtCore.Qt.CheckState.Unchecked if checked
-                                   else QtCore.Qt.CheckState.Checked)
-                event.accept()
+                event.accept()   # トグルはリリース時（ドラッグと区別するため）
                 return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._press_item is not None and not self._dragged
+                and event.buttons() & QtCore.Qt.MouseButton.LeftButton
+                and (event.position().toPoint() - self._press_pos).manhattanLength()
+                >= QtWidgets.QApplication.startDragDistance()):
+            payload = self._drag_payload(self._press_item)
+            if payload:
+                self._dragged = True
+                drag = QtGui.QDrag(self)
+                mime = QtCore.QMimeData()
+                mime.setData(SERIES_MIME, payload.encode("utf-8"))
+                mime.setText(self._press_item.text(0))
+                drag.setMimeData(mime)
+                drag.exec(QtCore.Qt.DropAction.CopyAction)
+                self._press_item = None
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        item, dragged = self._press_item, self._dragged
+        self._press_item = None
+        if (event.button() == QtCore.Qt.MouseButton.LeftButton
+                and not dragged and self._is_check_leaf(item)
+                and item is self.itemAt(event.position().toPoint())):
+            checked = item.checkState(0) == QtCore.Qt.CheckState.Checked
+            item.setCheckState(0, QtCore.Qt.CheckState.Unchecked if checked
+                               else QtCore.Qt.CheckState.Checked)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
@@ -3498,6 +4160,7 @@ __all__ = [
     "LazyColumnCombo",
     "CollapsibleBox",
     "ExplorerTree",
+    "SERIES_MIME",
 ]
 
 # ======================================================================
@@ -3535,6 +4198,9 @@ class UIBuildMixin:
         # ファイル
         fm = m.addMenu("ファイル(&F)")
         self._menu_action(fm, "ファイル追加...", self.add_file, "Ctrl+O")
+        self._menu_action(fm, "フォルダを開く...", self.add_folder, "Ctrl+Shift+O",
+                          tip="フォルダ内の対応データファイルを一括読み込み。"
+                              "複数フォルダを開くとツリーがフォルダごとにグループ化されます")
         self._menu_action(fm, "クリップボードから貼り付け", self.paste_from_clipboard, "Ctrl+Shift+V",
                           tip="Excel等からコピーした表を新規データとして読み込む")
         self.recent_menu = fm.addMenu("最近使ったファイル")
@@ -3569,12 +4235,22 @@ class UIBuildMixin:
                           tip="すべてのメニュー操作を名前で検索して実行")
         vm.addSeparator()
         self._menu_action(vm, "グラフを描画", self.draw_graph, "F5")
+        self._menu_action(vm, "新しいグラフウィンドウ（現在のグラフを複製）",
+                          self.open_graph_window, "Ctrl+G",
+                          tip="現在のグラフを独立ウィンドウに複製。選択・書式を変えて何枚も並べて比較できます")
         self._menu_action(vm, "全データに合わせる（オートスケール）", self.auto_scale_scope, None)
         # 解析
         am = m.addMenu("解析(&A)")
         self._menu_action(am, "解析実行（ピーク・測定）", self.run_analysis, "Ctrl+R",
                           tip="選択中の解析対象系列のピーク・測定値を計算")
         self._menu_action(am, "FFTスペクトル表示", self.show_fft, None)
+        # ツール
+        tm = m.addMenu("ツール(&T)")
+        self._menu_action(tm, "LTspiceシミュレーション実行(.asc)...", self.run_ltspice_asc,
+                          tip="LTspice回路をバッチ実行し、生成された .raw 波形を自動で読み込みます。"
+                              "回路(.asc)のドラッグ&ドロップでも実行できます")
+        self._menu_action(tm, "LTspiceの場所を設定...", self.set_ltspice_path,
+                          tip="LTspice実行ファイル（LTspice.exe / XVIIx64.exe）の場所を指定")
         # ヘルプ
         hm = m.addMenu("ヘルプ(&H)")
         self._menu_action(hm, "使い方", self.show_help, "F1")
@@ -3644,12 +4320,116 @@ class UIBuildMixin:
         self._palette_dlg = dlg   # テスト・再入から参照できるように保持
         dlg.exec()
 
+    # ---- UIスタイル（外観テーマ）----
+    # ウィジェット構成は一切変えず、QSS＋ツールバー設定で密度・大きさ・配色だけを
+    # 変える。機能は全スタイルで同一（見た目の再現のみ）。
+    _UI_STYLES = {
+        # 標準にも「基準QSS」を持たせ、ボタン/入力欄の高さを統一して見切れを防ぐ
+        "standard": {
+            "qss": """
+QPushButton { padding: 4px 10px; min-height: 22px; }
+QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
+""",
+            "tb_style": "beside", "tb_icon": 24, "indent": 20},
+        "labplot": {   # KDE Breeze調: ゆったり・角丸・青アクセント
+            "qss": """
+QWidget { font-size: 10pt; }
+QPushButton { background:#fcfcfc; border:1px solid #bfc4c9; border-radius:3px;
+              padding:5px 12px; }
+QPushButton:hover { border-color:#3daee9; }
+QPushButton:pressed, QPushButton:checked { background:#d6ecf8; border-color:#3daee9; }
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+    border:1px solid #bfc4c9; border-radius:3px; padding:3px 6px; background:white; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+    border-color:#3daee9; }
+QTreeWidget, QListWidget, QTableWidget { border:1px solid #cfd4d9; border-radius:3px; }
+QTreeWidget::item { min-height:24px; }
+QTabBar::tab { padding:6px 14px; }
+QToolBar { spacing:4px; padding:3px; }
+QToolButton { padding:4px; border-radius:3px; }
+QToolButton:hover { background:#d6ecf8; }
+QDockWidget::title { background:#eff0f1; padding:5px; }
+""",
+            "tb_style": "beside", "tb_icon": 22, "indent": 20},
+        "veusz": {     # 実用主義コンパクト: 小さく詰めて情報密度を上げる
+            "qss": """
+QWidget { font-size: 8pt; }
+QPushButton { padding:2px 8px; min-height:18px; }
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { padding:1px 3px; min-height:18px; }
+QTreeWidget::item { min-height:18px; }
+QTabBar::tab { padding:3px 8px; }
+QToolBar { spacing:1px; padding:1px; }
+QToolButton { padding:2px; }
+QDockWidget::title { padding:2px; }
+""",
+            "tb_style": "icon", "tb_icon": 16, "indent": 14},
+        "kst": {       # ミニマル: 枠・装飾を減らしプロットに集中
+            "qss": """
+QWidget { font-size: 9pt; }
+QToolBar { border:0; spacing:2px; padding:2px; background:transparent; }
+QDockWidget::title { background:transparent; padding:3px; }
+QPushButton { padding:3px 10px; border:1px solid #c9c9c9; border-radius:2px;
+              background:#f7f7f7; }
+QPushButton:checked { background:#e2e2e2; }
+QTreeWidget, QListWidget, QTableWidget { border:1px solid #dddddd; }
+QTreeWidget::item { min-height:20px; }
+QTabBar::tab { padding:4px 10px; }
+""",
+            "tb_style": "icon", "tb_icon": 18, "indent": 16},
+        "igor": {      # クラシック高密度: グレー基調・小さな立体ボタン
+            "qss": """
+QWidget { font-size: 8pt; }
+QMainWindow, QDockWidget, QTabWidget::pane { background-color:#ececec; }
+QPushButton { background:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                                         stop:0 #fdfdfd, stop:1 #dcdcdc);
+              border:1px solid #8f8f8f; border-radius:2px; padding:2px 9px;
+              min-height:18px; }
+QPushButton:pressed, QPushButton:checked { background:#cfcfcf; }
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+    background:white; border:1px solid #9a9a9a; padding:1px 3px; }
+QTreeWidget, QListWidget, QTableWidget { background:white; border:1px solid #9a9a9a; }
+QTreeWidget::item { min-height:18px; }
+QDockWidget::title { background:#dcdcdc; border:1px solid #b0b0b0; padding:3px; }
+QTabBar::tab { padding:3px 10px; background:#dcdcdc; border:1px solid #b0b0b0; }
+QTabBar::tab:selected { background:#ececec; }
+QToolBar { background:#e4e4e4; spacing:1px; }
+""",
+            "tb_style": "icon", "tb_icon": 20, "indent": 14},
+    }
+
+    def _set_ui_style(self, name):
+        """メニューからのUIスタイル切替（ステータス案内つき）。"""
+        self._apply_ui_style(name)
+        names = {"standard": "標準", "labplot": "LabPlot風", "veusz": "Veusz風",
+                 "kst": "KST2風", "igor": "Igor Pro風"}
+        self._set_status(f"UIスタイル: {names.get(name, name)}"
+                         "（配置も合わせるなら 表示→レイアウト を併用）")
+
+    def _apply_ui_style(self, name):
+        """UIスタイル（外観テーマ）を適用する。ウィジェット・機能は変えない。"""
+        style = self._UI_STYLES.get(name)
+        if style is None:
+            return
+        self.setStyleSheet(style["qss"])
+        tb = getattr(self, "main_toolbar", None)
+        if tb is not None:
+            tb.setIconSize(QtCore.QSize(style["tb_icon"], style["tb_icon"]))
+            tb.setToolButtonStyle(
+                QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+                if style["tb_style"] == "beside"
+                else QtCore.Qt.ToolButtonStyle.ToolButtonIconOnly)
+        if hasattr(self, "explorer"):
+            self.explorer.setIndentation(style["indent"])
+        self._ui_settings().setValue("ui/style", name)
+        self._ui_style_name = name
+
     def _build_toolbar(self):
         """よく使う操作をワンクリックで呼べるツールバー（メニューと同じ機能）。"""
         tb = QtWidgets.QToolBar("メイン")
         tb.setObjectName("main_toolbar")
         tb.setMovable(False)
         tb.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.main_toolbar = tb
         self.addToolBar(tb)
         SP = QtWidgets.QStyle.StandardPixmap
 
@@ -3666,10 +4446,14 @@ class UIBuildMixin:
         act("ファイル追加", self.add_file,
             "CSV/TSV/波形ファイルを読み込む（Ctrl+O）。ウィンドウへのドラッグ&ドロップも可",
             SP.SP_DialogOpenButton)
+        act("フォルダ", self.add_folder,
+            "フォルダ内のデータファイルを一括読み込み（Ctrl+Shift+O）", SP.SP_DirOpenIcon)
         act("貼り付け", self.paste_from_clipboard,
             "Excel等からコピーした表を新規データとして読み込む（Ctrl+Shift+V）")
         tb.addSeparator()
         act("描画", self.draw_graph, "グラフを描画（F5）", SP.SP_BrowserReload)
+        act("＋グラフ", self.open_graph_window,
+            "現在のグラフを独立ウィンドウに複製（Ctrl+G）。何枚も並べて比較できます")
         tb.addSeparator()
         act("画像保存", self.save_figure, "グラフを画像ファイルに保存（Ctrl+S）",
             SP.SP_DialogSaveButton)
@@ -3692,8 +4476,15 @@ class UIBuildMixin:
         self.setTabPosition(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea,
                             QtWidgets.QTabWidget.TabPosition.North)
 
-        # 左：入力・解析パネル（データ読込 / オシロ / 高度解析 / 統計解析）
+        # 読み込み済みファイル＝専用パネル（既定でフロートの独立ウィンドウ）
         left = QtCore.Qt.DockWidgetArea.LeftDockWidgetArea
+        files_dock = QtWidgets.QDockWidget("読み込み済みファイル", self)
+        files_dock.setObjectName("dock_files")   # saveState に必須
+        files_dock.setWidget(self._scrollable(self._build_files_panel()))
+        self.addDockWidget(left, files_dock)
+        self.files_dock = files_dock
+
+        # 左：入力・解析パネル（軸の選択 / オシロ / 高度解析 / 統計解析）
         self.left_docks = []
         for key, title, builder in (
                 ("data", "1. データ", self._build_tab_data),
@@ -3703,7 +4494,10 @@ class UIBuildMixin:
             dock = QtWidgets.QDockWidget(title, self)
             dock.setObjectName("dock_" + key)   # saveState に必須
             w = builder()
-            w.setMinimumWidth(220)   # 下限を下げ、境界線ドラッグで幅を調整しやすく
+            # 中身をスクロール可能にして、ドックを好きな幅まで狭められるようにする
+            # （中身の最小サイズがドックの縮小を妨げないように。既にスクロール式ならそのまま）
+            if not isinstance(w, QtWidgets.QScrollArea):
+                w = self._scrollable(w)
             dock.setWidget(w)
             self.addDockWidget(left, dock)
             self.left_docks.append(dock)
@@ -3734,7 +4528,7 @@ class UIBuildMixin:
         # 表示メニューへ各パネルの表示/非表示と配置リセットを追加
         vm = self.view_menu
         vm.addSeparator()
-        for d in [*self.left_docks, fdock]:
+        for d in [self.files_dock, *self.left_docks, fdock]:
             act = d.toggleViewAction()
             act.setStatusTip(f"{d.windowTitle()} パネルの表示/非表示")
             vm.addAction(act)
@@ -3743,26 +4537,170 @@ class UIBuildMixin:
         vm.addSeparator()
         float_menu = vm.addMenu("別ウィンドウで表示（切り離し）")
         self._float_actions = {}
-        for d in [*self.left_docks, fdock]:
+        for d in [self.files_dock, *self.left_docks, fdock]:
             a = QtGui.QAction(d.windowTitle(), self)
             a.setCheckable(True)
             a.setStatusTip(f"{d.windowTitle()} を独立ウィンドウとして切り離す／チェックを外すと元の位置へ戻す")
             a.toggled.connect(lambda on, dd=d: self._set_dock_floating(dd, on))
             d.topLevelChanged.connect(lambda floating, aa=a: self._sync_float_action(aa, floating))
+            # 切り離したらOSネイティブ枠にして、Windowsのスナップを効かせる
+            d.topLevelChanged.connect(lambda floating, dd=d: self._native_float_frame(dd, floating))
+            # タイトルのダブルクリック=戻す／メイン左右端へのドロップ=ドッキング
+            self._install_dock_native_filter(d)
             # ドックの移動でタブバーが作り直されることがあるため、そのたびに配線し直す
             d.topLevelChanged.connect(self._wire_dock_tabbars)
             d.dockLocationChanged.connect(self._wire_dock_tabbars)
             float_menu.addAction(a)
             self._palette_register("表示", f"{d.windowTitle()} を別ウィンドウで表示", a)
             self._float_actions[d.objectName()] = a
+        # ワンクリックのレイアウトプリセット（GUIが評価の高いツールの配置を再現）
+        lay_menu = vm.addMenu("レイアウト")
+        self._menu_action(lay_menu, "標準（3ペイン）", lambda: self._apply_layout_preset("standard"),
+                          tip="左パネル＋中央グラフ＋右書式の標準配置に戻す")
+        self._menu_action(lay_menu, "グラフ集中（Saleae風）",
+                          lambda: self._apply_layout_preset("graph"),
+                          tip="パネルを全部たたみ、グラフをほぼ全画面に（波形をじっくり見る）")
+        self._menu_action(lay_menu, "解析中心（オシロ）",
+                          lambda: self._apply_layout_preset("analysis"),
+                          tip="オシロ/解析パネル＋大きなグラフ＋データ表（測定作業向け）")
+        self._menu_action(lay_menu, "データ整備",
+                          lambda: self._apply_layout_preset("data"),
+                          tip="データパネル＋大きなデータ編集表（読み込み・クレンジング向け）")
+        lay_menu.addSeparator()
+        self._menu_action(lay_menu, "LabPlot風（配置＋外観）",
+                          lambda: self._apply_layout_preset("labplot"),
+                          tip="左にプロジェクトツリー＋統計解析タブ・右にプロパティ・下にスプレッドシート、"
+                              "外観はBreeze調（LabPlotの標準画面）")
+        self._menu_action(lay_menu, "Veusz風（配置＋外観）",
+                          lambda: self._apply_layout_preset("veusz"),
+                          tip="ツールバーを左縦に移し、左にデータツリー（上）＋書式（下）の縦積み、"
+                              "右は大きなグラフ。外観はコンパクト（Veuszの編集画面）")
+        self._menu_action(lay_menu, "KST2風（配置＋外観）",
+                          lambda: self._apply_layout_preset("kst"),
+                          tip="プロットを全画面にし、データはフロートの小窓（データマネージャ風）。"
+                              "外観はミニマル（KST2のライブ監視画面）")
+        self._menu_action(lay_menu, "Igor Pro風（配置＋外観）",
+                          lambda: self._apply_layout_preset("igor"),
+                          tip="データ・オシロ解析・書式の3枚をカスケードのフロートウィンドウにし、"
+                              "メインはグラフ専用。外観はクラシック高密度（IgorのMDI風）")
+        # 外観テーマ（配置は保ったまま、ボタンの大きさ・余白・密度・配色だけ切り替える）
+        style_menu = vm.addMenu("UIスタイル（外観のみ）")
+        self._menu_action(style_menu, "標準", lambda: self._set_ui_style("standard"),
+                          tip="既定の外観に戻す（配置はそのまま）")
+        self._menu_action(style_menu, "LabPlot風（ゆったりモダン）",
+                          lambda: self._set_ui_style("labplot"),
+                          tip="外観のみ: Breeze調の大きめボタン・角丸・青アクセント。配置も変えるなら レイアウト→LabPlot風")
+        self._menu_action(style_menu, "Veusz風（コンパクト）",
+                          lambda: self._set_ui_style("veusz"),
+                          tip="外観のみ: 小さいフォントと詰めた余白。配置も変えるなら レイアウト→Veusz風")
+        self._menu_action(style_menu, "KST2風（ミニマル）",
+                          lambda: self._set_ui_style("kst"),
+                          tip="外観のみ: 枠線・装飾を減らした薄いクローム。配置も変えるなら レイアウト→KST2風")
+        self._menu_action(style_menu, "Igor Pro風（クラシック高密度）",
+                          lambda: self._set_ui_style("igor"),
+                          tip="外観のみ: グレー基調・小さな立体ボタン。配置も変えるなら レイアウト→Igor Pro風")
         vm.addSeparator()
         self._menu_action(vm, "パネル配置をリセット", self._reset_panel_layout,
                           tip="パネルのドッキング配置・表示状態を初期状態に戻す")
+        # 読み込み済みファイルは既定で独立ウィンドウとして浮かべる
+        # （topLevelChanged→_native_float_frame でOSネイティブ枠＝スナップ対応になる）
+        self.files_dock.setFloating(True)
+        self.files_dock.resize(400, 620)
+        self.files_dock.move(self.x() + 40, self.y() + 120)
         self._default_window_state = self.saveState()   # リセット用に既定配置を記憶
         self._wire_dock_tabbars()   # タブのダブルクリック=切り離し
 
         self._wire_live_signals()
         self._add_tooltips()
+
+    # ---- ネイティブ枠フロートの「戻す」操作（スナップと両立させる）----
+    # OSスナップ=画面の端／ドッキング=メインウィンドウの左右端ゾーン、と場所で
+    # 意図を分けることで両立する。さらにタイトルバーのダブルクリックで即ドッキング。
+    def _install_dock_native_filter(self, dock):
+        if not hasattr(self, "_dock_native_filter"):
+            app = self
+
+            class _F(QtCore.QObject):
+                def eventFilter(self, obj, ev):
+                    t = ev.type()
+                    if (t == QtCore.QEvent.Type.NonClientAreaMouseButtonDblClick
+                            and isinstance(obj, QtWidgets.QDockWidget)
+                            and obj.isFloating()):
+                        app._redock(obj)     # タイトルバーのダブルクリック=戻す
+                        return True
+                    if (t == QtCore.QEvent.Type.Move
+                            and isinstance(obj, QtWidgets.QDockWidget)
+                            and obj.isFloating()):
+                        app._note_float_move(obj)
+                    return False
+
+            self._dock_native_filter = _F(self)
+        dock.installEventFilter(self._dock_native_filter)
+
+    def _redock(self, dock):
+        area = self.dockWidgetArea(dock)
+        if area == QtCore.Qt.DockWidgetArea.NoDockWidgetArea:
+            area = QtCore.Qt.DockWidgetArea.LeftDockWidgetArea
+        self.addDockWidget(area, dock)
+        dock.setFloating(False)
+        self._set_status(f"{dock.windowTitle()} をドッキングに戻しました。")
+
+    def _note_float_move(self, dock):
+        """フロート窓の移動を監視し、ドラッグ終了時に置き場所で意図を判別する。
+        連続したMove（ドラッグ）だけを対象にし、プリセット等の単発移動では発動しない。"""
+        if getattr(self, "_float_move_dock", None) is not dock:
+            self._float_move_dock = dock
+            self._float_move_count = 0
+        self._float_move_count += 1
+        if not hasattr(self, "_float_move_timer"):
+            self._float_move_timer = QtCore.QTimer(self)
+            self._float_move_timer.setSingleShot(True)
+            self._float_move_timer.timeout.connect(
+                lambda: self._maybe_dock_on_drop(self._float_move_dock,
+                                                 QtGui.QCursor.pos()))
+        self._float_move_timer.start(300)
+
+    def _maybe_dock_on_drop(self, dock, pos):
+        """ドラッグ終了位置がメインウィンドウの左右端ゾーンならドッキングする。
+        画面の端（12px以内）はWindowsスナップの領分なので何もしない。"""
+        if (dock is None or not dock.isFloating()
+                or getattr(self, "_float_move_count", 0) < 3):   # 単発移動は無視
+            self._float_move_count = 0
+            return
+        self._float_move_count = 0
+        screen = QtGui.QGuiApplication.screenAt(pos)
+        if screen is not None:
+            sg = screen.geometry()
+            if (pos.x() - sg.left() <= 12 or sg.right() - pos.x() <= 12
+                    or pos.y() - sg.top() <= 12 or sg.bottom() - pos.y() <= 12):
+                return   # 画面端＝OSスナップの意図
+        fg = self.frameGeometry()
+        if not fg.contains(pos):
+            return       # メインウィンドウの外＝ただの移動
+        if pos.x() - fg.left() <= 160:
+            self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        elif fg.right() - pos.x() <= 160:
+            self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        else:
+            return       # 中央への移動はドッキングしない（誤爆防止）
+        dock.setFloating(False)
+        self._set_status(f"{dock.windowTitle()} をドッキングしました"
+                         "（切り離しはタブのダブルクリック／表示メニューから）。")
+
+    def _native_float_frame(self, dock, floating):
+        """切り離したパネルをOSネイティブ枠の通常ウィンドウにする。
+
+        Windows 11 のスナップ（画面端へのドラッグ・最大化ボタンにマウスを載せた
+        ときのレイアウト選択・Win+矢印）が Chrome 等と同じように効くようになる。
+        代わりにタイトルバーのドラッグ/ダブルクリックでの再ドッキングは使えない
+        （戻すのは 表示メニューのチェックを外す か パネル配置をリセット）。"""
+        if floating:
+            size = dock.size()   # フラグ変更でサイズが失われるため引き継ぐ
+            dock.setWindowFlags(QtCore.Qt.WindowType.Window)
+            dock.show()   # フラグ変更後は再表示が必要
+            if size.width() < 220 or size.height() < 180:
+                size = QtCore.QSize(380, 520)   # 極小で浮かないよう既定サイズを保証
+            dock.resize(size)
 
     def _set_dock_floating(self, dock, on):
         """メニューからの切り離し/復帰。非表示なら表示してから切り替える。"""
@@ -3773,7 +4711,8 @@ class UIBuildMixin:
         if on:
             dock.raise_()
             self._set_status(f"{dock.windowTitle()} を別ウィンドウにしました。"
-                             "（ウィンドウのタイトルをダブルクリックすると元に戻ります）")
+                             "画面端へドラッグ=Windowsスナップ／メインウィンドウの左右端へ"
+                             "ドロップ or タイトルをダブルクリック=ドッキングに戻す")
 
     @staticmethod
     def _sync_float_action(action, floating):
@@ -3797,13 +4736,117 @@ class UIBuildMixin:
 
     def _float_dock_by_tab(self, bar, index):
         title = bar.tabText(index)
-        for d in [*self.left_docks, self.format_dock]:
+        for d in [self.files_dock, *self.left_docks, self.format_dock]:
             if d.windowTitle() == title:
                 d.setFloating(True)
                 d.raise_()
                 self._set_status(f"{title} を別ウィンドウにしました。"
-                                 "（ウィンドウのタイトルをダブルクリックすると元に戻ります）")
+                                 "画面端へドラッグ=Windowsスナップ／メインウィンドウの左右端へ"
+                                 "ドロップ or タイトルをダブルクリック=ドッキングに戻す")
                 return
+
+    def _apply_layout_preset(self, name):
+        """ワンクリックのレイアウトプリセット。
+
+        graph=Saleae風（グラフほぼ全画面）／analysis=オシロ作業／data=データ整備。
+        隠したパネルは表示メニュー（またはレイアウト→標準）でいつでも戻せる。"""
+        total = max(sum(self.center_splitter.sizes()), 400)
+        for d in [self.files_dock, *self.left_docks, self.format_dock]:
+            d.setFloating(False)
+        # ツールバーは既定の上配置へ戻す（Veusz風だけが左縦に移す）
+        tb = getattr(self, "main_toolbar", None)
+        if tb is not None:
+            self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, tb)
+        # 「◯◯風」プリセットは配置だけでなく外観（ボタンの大きさ・密度・配色）も適用する
+        if name in self._UI_STYLES:
+            self._apply_ui_style(name)
+        if name == "standard":
+            self._reset_panel_layout()
+            self.center_splitter.setSizes([int(total * 0.8), int(total * 0.2)])
+            return
+        if name == "graph":          # Saleae風: 波形が主役、他は全部たたむ
+            for d in [self.files_dock, *self.left_docks, self.format_dock]:
+                d.hide()
+            self.center_splitter.setSizes([total, 0])
+            self._set_status("レイアウト: グラフ集中（パネルは表示メニュー、または"
+                             "レイアウト→標準 で戻せます）")
+        elif name == "analysis":     # オシロ/解析＋大きなグラフ＋下に測定結果の表
+            for d in [self.files_dock, *self.left_docks, self.format_dock]:
+                d.hide()
+            scope = self.left_docks[1]
+            scope.show()
+            self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, scope)
+            self.resizeDocks([scope], [330], QtCore.Qt.Orientation.Horizontal)
+            self.center_splitter.setSizes([int(total * 0.85), int(total * 0.15)])
+            self._set_status("レイアウト: 解析中心（オシロ/解析＋グラフ）")
+        elif name == "data":         # データ整備: ファイルツリー＋大きな編集表
+            for d in [*self.left_docks, self.format_dock]:
+                d.hide()
+            self.files_dock.show()
+            self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.files_dock)
+            self.resizeDocks([self.files_dock], [380], QtCore.Qt.Orientation.Horizontal)
+            self.center_splitter.setSizes([int(total * 0.45), int(total * 0.55)])
+            self._set_status("レイアウト: データ整備（ファイルツリー＋データ編集表）")
+        elif name == "labplot":
+            # LabPlot: 左=ファイルツリー＋軸＋統計のタブ、右=プロパティ、
+            # 下=スプレッドシート（データ表）という4区画のワークベンチ配置
+            for d in (self.left_docks[1], self.left_docks[2]):
+                d.hide()
+            files, data, ds = self.files_dock, self.left_docks[0], self.left_docks[3]
+            for d in (files, data, ds):
+                d.show()
+                self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, d)
+            self.tabifyDockWidget(files, data)   # ファイル/軸/統計をタブで切替
+            self.tabifyDockWidget(data, ds)
+            files.raise_()
+            self.format_dock.show()
+            self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.format_dock)
+            self.resizeDocks([files], [330], QtCore.Qt.Orientation.Horizontal)
+            self.resizeDocks([self.format_dock], [390], QtCore.Qt.Orientation.Horizontal)
+            self.center_splitter.setSizes([int(total * 0.75), int(total * 0.25)])
+            self._set_status("レイアウト: LabPlot風（ファイル+軸+統計タブ／グラフ＋スプレッドシート／プロパティ）")
+        elif name == "veusz":
+            # Veusz: ツールバーは左縦、左列にファイルツリー(上)＋書式(下)の縦積み
+            if tb is not None:
+                self.addToolBar(QtCore.Qt.ToolBarArea.LeftToolBarArea, tb)
+            for d in self.left_docks:
+                d.hide()
+            files = self.files_dock
+            files.show()
+            self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, files)
+            self.format_dock.show()
+            self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.format_dock)
+            self.splitDockWidget(files, self.format_dock, QtCore.Qt.Orientation.Vertical)
+            self.resizeDocks([files, self.format_dock], [370, 370],
+                             QtCore.Qt.Orientation.Horizontal)
+            self.center_splitter.setSizes([total, 0])
+            self._set_status("レイアウト: Veusz風（左縦ツールバー＋編集パネル縦積み＋大きなグラフ）")
+        elif name == "kst":
+            # KST2: プロット全画面＋データマネージャ風のフロート小窓（=ファイルツリー）
+            for d in [*self.left_docks, self.format_dock]:
+                d.hide()
+            files = self.files_dock
+            files.show()
+            files.setFloating(True)
+            files.resize(300, 430)
+            files.move(self.x() + max(self.width() - 340, 80), self.y() + 110)
+            self.center_splitter.setSizes([total, 0])
+            self._set_status("レイアウト: KST2風（プロット全画面＋データマネージャの小窓）")
+        elif name == "igor":
+            # Igor Pro: ファイル・オシロ解析・書式の3枚をカスケードのツールウィンドウに
+            for d in (self.left_docks[0], self.left_docks[2], self.left_docks[3]):
+                d.hide()
+            casc = [(self.files_dock, (340, 480)),
+                    (self.left_docks[1], (360, 460)),
+                    (self.format_dock, (400, 540))]
+            for i, (d, size) in enumerate(casc):
+                d.show()
+                d.setFloating(True)
+                d.resize(*size)
+                d.move(self.x() + 50 + i * 48, self.y() + 100 + i * 42)
+            self.center_splitter.setSizes([total, 0])
+            self._set_status("レイアウト: Igor Pro風（データ/オシロ/書式をカスケードのウィンドウに。"
+                             "『新しいグラフウィンドウ』(Ctrl+G)と組み合わせるとMDI風になります）")
 
     def _reset_panel_layout(self):
         """ドッキングパネルの配置・表示状態を初期状態に戻す。"""
@@ -3812,22 +4855,44 @@ class UIBuildMixin:
         for d in [*self.left_docks, self.format_dock]:
             d.setFloating(False)
             d.setVisible(True)
+        # 読み込み済みファイルの既定は「独立ウィンドウ」（restoreStateがフロートへ戻す）
+        self.files_dock.setVisible(True)
+        tb = getattr(self, "main_toolbar", None)
+        if tb is not None:   # Veusz風で左縦に移したツールバーも上へ戻す
+            self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, tb)
+            tb.show()
         self.left_docks[0].raise_()
         self._set_status("パネル配置を初期状態に戻しました。")
 
-    # ---- データタブ ----
-    def _build_tab_data(self):
-        w = QtWidgets.QWidget()
-        outer = QtWidgets.QVBoxLayout(w); outer.setContentsMargins(0, 0, 0, 0)
-        vsplit = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        outer.addWidget(vsplit)
-
-        # === 上段：読み込み済みファイル（VS Code風エクスプローラー：ファイル→列ツリー）===
+    # ---- 読み込み済みファイル（専用ウィンドウ）----
+    def _build_files_panel(self):
+        """「読み込み済みファイル」専用パネル。ツリー＋ファイル操作＋系列選択＋読み込み設定。
+        既定ではフロートの独立ウィンドウとして表示される（ドッキングも可能）。"""
         top = QtWidgets.QWidget(); tv = QtWidgets.QVBoxLayout(top)
-        tv.setContentsMargins(2, 2, 2, 2)
-        tv.addWidget(self._bold("読み込み済みファイル（▶で列を展開）"))
-        hint = QtWidgets.QLabel("ファイルを追加（ここにドラッグ&ドロップも可）→ "
-                                "描きたい列（Y軸）をチェック →「グラフを描画」")
+        tv.setContentsMargins(4, 4, 4, 4)
+        # VS Code風のセクションヘッダー（右側にアクションボタン）
+        head = QtWidgets.QHBoxLayout()
+        head.addWidget(self._bold("エクスプローラー"))
+        head.addStretch(1)
+        SP = QtWidgets.QStyle.StandardPixmap
+
+        def tool(icon, tip, slot):
+            b = QtWidgets.QToolButton()
+            b.setIcon(self.style().standardIcon(icon))
+            b.setToolTip(tip)
+            b.setAutoRaise(True)
+            b.clicked.connect(slot)
+            head.addWidget(b)
+
+        tool(SP.SP_FileIcon, "ファイルを追加（Ctrl+O）", self.add_file)
+        tool(SP.SP_DirOpenIcon, "フォルダを開く（Ctrl+Shift+O）", self.add_folder)
+        tool(SP.SP_BrowserReload, "すべてのファイルを再読込（ディスクの最新内容に更新）",
+             self._reload_all_files)
+        tool(SP.SP_TitleBarShadeButton, "すべて折りたたむ",
+             lambda: self.explorer.collapseAll())
+        tv.addLayout(head)
+        hint = QtWidgets.QLabel("ファイルを追加（ここにドラッグ&ドロップも可）→ 描きたい列（Y軸）を"
+                                "チェック、または列をグラフへドラッグ →「グラフを描画」")
         hint.setWordWrap(True); hint.setStyleSheet("color:#666;")
         tv.addWidget(hint)
         # 旧ファイル一覧は非表示のまま「選択・削除・プレビューの土台」として保持する。
@@ -3848,17 +4913,24 @@ class UIBuildMixin:
         self.explorer.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.explorer.setAllColumnsShowFocus(True)
-        self.explorer.setMinimumHeight(120)
+        self.explorer.setMinimumHeight(60)   # 境界線ドラッグでかなり小さくもできる
         hdr = self.explorer.header()
         hdr.setStretchLastSection(False)
         hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.explorer.setToolTip(
             "読み込んだファイルの一覧。▶で展開すると列（Y系列）が出ます。\n"
-            "列の行クリック=チェックON/OFF／ダブルクリック=その列だけ表示。\n"
+            "列の行クリック=チェックON/OFF／ダブルクリック=その列だけ表示／\n"
+            "列やファイルを【グラフへドラッグ】=系列を追加して描画。\n"
             "ファイルのチェック=全列を一括ON/OFF。右クリックでメニュー\n"
             "（X軸にする・再読込・削除・エクスプローラーで表示など）。\n"
-            "ファイル行はCtrl/Shift＋クリックで複数選択→「削除」でまとめて削除。")
+            "ファイル行はCtrl/Shift＋クリックで複数選択→「削除」でまとめて削除。\n"
+            "F2=名前の変更／Delete=一覧から削除（ディスクのファイルは消しません）。")
+        # VS Code互換のキーボード操作とホバー表示
+        self.explorer.renameRequested.connect(self._on_tree_rename)
+        self.explorer.deleteRequested.connect(self.remove_file)   # 一覧から削除（ディスクは消さない）
+        self.explorer.setStyleSheet(
+            "QTreeWidget::item:hover { background: rgba(90, 93, 94, 0.10); }")
         self.explorer.itemChanged.connect(self._on_explorer_item_changed)
         self.explorer.itemDoubleClicked.connect(self._on_explorer_double_clicked)
         self.explorer.itemSelectionChanged.connect(self._on_explorer_selection_changed)
@@ -3868,7 +4940,9 @@ class UIBuildMixin:
         tv.addWidget(self.explorer, 1)
 
         row = QtWidgets.QHBoxLayout()
-        b_add = QtWidgets.QPushButton("ファイル追加...")
+        b_add = QtWidgets.QPushButton("追加...")
+        b_add.setToolTip("ファイル追加（Ctrl+O）。CSV/Excel/波形などを複数選択で読み込みます。\n"
+                         "ウィンドウへのドラッグ&ドロップ、フォルダごと開く（Ctrl+Shift+O）も可。")
         b_add.clicked.connect(self.add_file)
         b_paste = QtWidgets.QPushButton("貼り付け")
         b_paste.setToolTip("Excel等からコピーした表を新規データとして読み込む（Ctrl+Shift+V）")
@@ -3879,11 +4953,10 @@ class UIBuildMixin:
         b_clear = QtWidgets.QPushButton("全削除")
         b_clear.setToolTip("読み込み済みファイルをすべて一覧から削除します。")
         b_clear.clicked.connect(self.clear_all_files)
+        # ファイル操作は1行にまとめる（追加系を左・削除系を右に）
         row.addWidget(b_add); row.addWidget(b_paste)
+        row.addWidget(b_del); row.addWidget(b_clear)
         tv.addLayout(row)
-        row_b = QtWidgets.QHBoxLayout()
-        row_b.addWidget(b_del); row_b.addWidget(b_clear)
-        tv.addLayout(row_b)
         # 名前で選択（入力した名前を含む系列だけをチェックし、他は解除）
         yf = QtWidgets.QHBoxLayout()
         self.y_filter = QtWidgets.QLineEdit()
@@ -3901,12 +4974,9 @@ class UIBuildMixin:
             btn = QtWidgets.QPushButton(text); btn.clicked.connect(fn)
             ybtns.addWidget(btn)
         tv.addLayout(ybtns)
-        vsplit.addWidget(top)
-
-        # === 下段：読み込み設定・X/Y選択・描画 ===
-        bottom = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(bottom)
-        v.setContentsMargins(2, 2, 2, 2)
-        # 区切り・文字コード（自動含む）
+        # 読み込み設定（区切り・文字コード・再読込）。使用頻度が低いので畳んで置く
+        sec_load = self._fmt_section("読み込み設定（区切り・文字コード）", "file_ops", False)
+        file_v = QtWidgets.QVBoxLayout()
         grid = QtWidgets.QGridLayout()
         grid.addWidget(QtWidgets.QLabel("区切り:"), 0, 0)
         self.delim_combo = QtWidgets.QComboBox()
@@ -3925,21 +4995,36 @@ class UIBuildMixin:
         b_reload.setToolTip("区切り・文字コードの変更を反映して読み直します。")
         b_reload.clicked.connect(self.reload_current)
         grid.addWidget(b_reload, 2, 0, 1, 2)
-        v.addLayout(grid)
+        file_v.addLayout(grid)
+        sec_load.set_content_layout(file_v)
+        tv.addWidget(sec_load)
+        return top
 
-        v.addWidget(self._hline())
-        v.addWidget(QtWidgets.QLabel("X軸（横軸 / ラベル）"))
+    # ---- データタブ（軸の選択）----
+    def _build_tab_data(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(2, 2, 2, 2)
+        note = QtWidgets.QLabel("Y系列の選択は「読み込み済みファイル」ウィンドウで行います"
+                                "（表示メニューから再表示できます）。")
+        note.setWordWrap(True); note.setStyleSheet("color:#666;")
+        v.addWidget(note)
+        # 軸の選択（X/Y/Z と 3D表示）。「何をプロットするか」をここに集約する
+        sec_axes = self._fmt_section("軸の選択（X・Z・3D）", "axes_sel", True)
+        v.addWidget(sec_axes)
+        av = QtWidgets.QVBoxLayout()
+        av.addWidget(QtWidgets.QLabel("X軸（横軸 / ラベル）"))
         self.xleft_check = QtWidgets.QCheckBox("一番左の列をX軸にする（位置で固定）")
         self.xleft_check.setToolTip(
             "ONにすると各ファイルの『一番左の列』をX軸に使います（列名が違っても適用）。\n"
             "複数ファイル／バッチ出力でX軸を固定したいときに便利。\n"
             "OFFなら下のコンボで列名を指定します。")
         self.xleft_check.toggled.connect(self._on_xleft_toggled)
-        v.addWidget(self.xleft_check)
+        av.addWidget(self.xleft_check)
         self.x_combo = QtWidgets.QComboBox()
         self.x_combo.setToolTip("横軸に使う列（列名で指定）。波形なら時間列を選びます。")
         self.x_combo.currentTextChanged.connect(self._on_x_changed)
-        v.addWidget(self.x_combo)
+        av.addWidget(self.x_combo)
 
         # X↔Y 入れ替え／X軸を複数選択（散布図などの 2D xy 種別で有効）
         xrow = QtWidgets.QHBoxLayout()
@@ -3954,7 +5039,7 @@ class UIBuildMixin:
         self.multix_check.setEnabled(False)
         self.multix_check.toggled.connect(self._on_multix_toggled)
         xrow.addWidget(self.multix_check); xrow.addStretch(1)
-        v.addLayout(xrow)
+        av.addLayout(xrow)
         self.x_list = CheckListWidget()
         self.x_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self.x_list.setToolTip("『X軸を複数選択』ON時に、Xに使う列をチェックします。")
@@ -3962,49 +5047,49 @@ class UIBuildMixin:
         self.x_list.setMaximumHeight(90)
         self.x_list.itemChanged.connect(self._request_redraw)
         self.x_list.setEnabled(False)
-        v.addWidget(self.x_list)
+        av.addWidget(self.x_list)
 
         self.z_label = QtWidgets.QLabel("Z軸（3Dの奥行き）")
-        v.addWidget(self.z_label)
+        av.addWidget(self.z_label)
         self.z_combo = QtWidgets.QComboBox()
         self.z_combo.setToolTip("3Dグラフの奥行き（Z軸）に使う列。3D種別のときだけ有効になります。")
         self.z_combo.currentTextChanged.connect(self._on_x_changed)
         self.z_combo.setEnabled(False)
-        v.addWidget(self.z_combo)
+        av.addWidget(self.z_combo)
 
-        # 旧Yリストは非表示の「選択モデル」として保持（上のツリー・系列バー・
+        # 3D表示はZ軸とセットの「何をプロットするか」の設定なので、ここ（軸の選択）に置く
+        self.threed_check = QtWidgets.QCheckBox("3D表示（Z軸を使う・ドラッグで回転）")
+        self.threed_check.setToolTip(
+            "散布図・折れ線・棒でONにするとZ軸を使った3D描画になります。\n"
+            "曲面は常に3Dです。3D対応でない種別では選べません（種別は書式パネルで選択）。")
+        self.threed_check.setEnabled(False)
+        self.threed_check.toggled.connect(self._on_3d_toggled)
+        av.addWidget(self.threed_check)
+        view = QtWidgets.QHBoxLayout()
+        view.addWidget(QtWidgets.QLabel("3D視点 仰角"))
+        self.elev_spin = QtWidgets.QSpinBox(); self.elev_spin.setRange(-90, 90)
+        self.elev_spin.setValue(30)
+        self.elev_spin.setToolTip("3Dグラフの仰角（上下の見おろし角）。ドラッグでも回転できます。")
+        self.elev_spin.valueChanged.connect(self._on_view_angle_changed)
+        view.addWidget(self.elev_spin)
+        view.addWidget(QtWidgets.QLabel("方位"))
+        self.azim_spin = QtWidgets.QSpinBox(); self.azim_spin.setRange(-180, 180)
+        self.azim_spin.setValue(-60)
+        self.azim_spin.setToolTip("3Dグラフの方位（左右の回転角）。ドラッグでも回転できます。")
+        self.azim_spin.valueChanged.connect(self._on_view_angle_changed)
+        view.addWidget(self.azim_spin)
+        view.addStretch(1)
+        self.elev_spin.setEnabled(False); self.azim_spin.setEnabled(False)
+        av.addLayout(view)
+        sec_axes.set_content_layout(av)
+
+        # 旧Yリストは非表示の「選択モデル」として保持（ツリー・系列バー・
         # 設定復元・テストが (ファイル, 列) 単位でここを読む）。レイアウトには足さない。
         self.y_list = CheckListWidget()
         self.y_list.setVisible(False)
         self.y_list.itemChanged.connect(self._on_y_check_changed)
         self.y_list.itemDoubleClicked.connect(self._on_y_double_clicked)
-
-        # リアルタイム更新 / 間引き / 描画ボタン（データタブからも描けるように）
-        self.live_check = QtWidgets.QCheckBox("リアルタイム更新（変更を即反映）")
-        self.live_check.setChecked(True)
-        self.live_check.setToolTip("オンにすると設定変更が自動で描画に反映されます。大容量データではオフ推奨。")
-        v.addWidget(self.live_check)
-        self.decimate_check = QtWidgets.QCheckBox("大容量データを間引き表示")
-        self.decimate_check.setChecked(True)
-        self.decimate_check.setToolTip("折れ線/散布図で点数が多いとき、見た目を保ったまま間引いて高速描画します"
-                                       "（ズーム時は自動で再サンプルします）。")
-        v.addWidget(self.decimate_check)
-        drow = QtWidgets.QHBoxLayout()
-        b_draw = QtWidgets.QPushButton("グラフを描画 (F5)")
-        b_draw.setStyleSheet("font-weight:bold; padding:6px;")
-        b_draw.clicked.connect(self.draw_graph)
-        b_batch2 = QtWidgets.QPushButton("一括画像保存...")
-        b_batch2.setStyleSheet("padding:6px;")
-        b_batch2.setToolTip("読み込んだ各ファイルを個別に描画し、ファイル名ごとの画像として一括保存します"
-                            "（タイトル・形式・DPI等は次の画面で調整できます）。")
-        b_batch2.clicked.connect(self.batch_export)
-        drow.addWidget(b_draw, 2); drow.addWidget(b_batch2, 1)
-        v.addLayout(drow)
-        vsplit.addWidget(bottom)
-        self.data_splitter = vsplit
-        vsplit.setStretchFactor(0, 1)   # 上のツリーが主役として伸びる
-        vsplit.setStretchFactor(1, 0)
-        vsplit.setSizes([380, 320])
+        v.addStretch(1)
         return w
 
     # ---- VS Code風エクスプローラー（ファイル → 列ツリー）----
@@ -4017,17 +5102,36 @@ class UIBuildMixin:
                 return it
         return None
 
+    def _iter_file_nodes(self):
+        """ツリー内の全ファイルノードを返す（フォルダ階層の有無に関わらず）。"""
+        tree = self.explorer
+        for i in range(tree.topLevelItemCount()):
+            top = tree.topLevelItem(i)
+            d = top.data(0, UserRole)
+            if d and d[0] == "file":
+                yield top
+            elif d and d[0] == "folder":
+                for j in range(top.childCount()):
+                    yield top.child(j)
+
     def _rebuild_explorer(self):
-        """ツリーの構造（ファイル→列）を file_list / y_list から作り直す。
+        """ツリーの構造を file_list / y_list から作り直す。
+
+        通常は ファイル→列 の2階層。読み込み元フォルダが2つ以上あるときは
+        VS Code のように フォルダ→ファイル→列 の3階層でグループ化する。
         チェック・色・現在ファイルは最後に _sync_explorer_* で確定する。"""
         if not hasattr(self, "explorer"):
             return
         tree = self.explorer
-        collapsed = set()   # 既定は展開。ユーザーが畳んだファイルだけ覚えて維持する
+        collapsed = set()   # 既定は展開。ユーザーが畳んだノードだけ覚えて維持する
+        def _collect_collapsed(item):
+            d = item.data(0, UserRole)
+            if d and not item.isExpanded():
+                collapsed.add(d[:2])
+            for j in range(item.childCount()):
+                _collect_collapsed(item.child(j))
         for i in range(tree.topLevelItemCount()):
-            node = tree.topLevelItem(i)
-            if not node.isExpanded():
-                collapsed.add(node.data(0, UserRole)[1])
+            _collect_collapsed(tree.topLevelItem(i))
         self._explorer_building = True
         tree.blockSignals(True)
         tree.clear()
@@ -4037,6 +5141,7 @@ class UIBuildMixin:
             fl, _c = it.data(UserRole)
             by_file.setdefault(fl, []).append(it)
         ficon = self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileIcon)
+        dicon = self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirIcon)
         gray = QtGui.QBrush(QtGui.QColor("#808080"))
         flags_file = (QtCore.Qt.ItemFlag.ItemIsEnabled
                       | QtCore.Qt.ItemFlag.ItemIsSelectable
@@ -4044,17 +5149,30 @@ class UIBuildMixin:
         # 列は選択不可（ファイル削除の対象にならない）。クリック＝チェックのトグル
         flags_col = (QtCore.Qt.ItemFlag.ItemIsEnabled
                      | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-        for row in range(self.file_list.count()):
-            label = self.file_list.item(row).text()
+        labels = [self.file_list.item(r).text() for r in range(self.file_list.count())]
+        dirs = {os.path.dirname(self.meta.get(l, {}).get("path", "")) for l in labels}
+        dirs.discard("")
+        grouped = len(dirs) >= 2   # フォルダが複数あるときだけ階層化
+
+        if not hasattr(self, "_icon_provider"):
+            self._icon_provider = QtWidgets.QFileIconProvider()
+
+        def make_file_node(label):
             df = self.datasets.get(label)
             path = self.meta.get(label, {}).get("path", "")
             node = QtWidgets.QTreeWidgetItem([label, ""])
             node.setData(0, UserRole, ("file", label))
-            node.setIcon(0, ficon)
+            icon = ficon
+            if path and os.path.isfile(path):
+                try:   # 種別ごとのOS実物アイコン（VS Code同様に拡張子で見分けられる）
+                    icon = self._icon_provider.icon(QtCore.QFileInfo(path))
+                except Exception:
+                    pass
+            node.setIcon(0, icon)
             node.setFlags(flags_file)
             node.setCheckState(0, QtCore.Qt.CheckState.Unchecked)
             info = f"{len(df):,}×{len(df.columns)}" if df is not None else ""
-            folder = os.path.basename(os.path.dirname(path)) if path else ""
+            folder = "" if grouped else (os.path.basename(os.path.dirname(path)) if path else "")
             node.setText(1, f"{info}  {folder}".strip())
             node.setForeground(1, gray)
             tip = (path or label) + (f"\n{info.replace('×', ' 行 × ')} 列" if info else "")
@@ -4066,10 +5184,48 @@ class UIBuildMixin:
                 child.setFlags(flags_col)
                 child.setCheckState(0, yit.checkState())
                 child.setToolTip(0, "クリック=チェックON/OFF／ダブルクリック=この列だけ表示／"
-                                    "右クリック=表示・X軸メニュー")
+                                    "ドラッグ=グラフへ追加／右クリック=表示・X軸メニュー")
                 node.addChild(child)
-            tree.addTopLevelItem(node)
-            node.setExpanded(label not in collapsed)
+            node.setExpanded(("file", label) not in collapsed)
+            return node
+
+        # VS Codeと同じ並び: フォルダを先にアルファベット順、ファイルもアルファベット順
+        def _dir_of(label):
+            return os.path.dirname(self.meta.get(label, {}).get("path", ""))
+
+        if grouped:
+            nodir = sorted([l for l in labels if not _dir_of(l)], key=str.lower)
+            bydir = {}
+            for label in labels:
+                dp = _dir_of(label)
+                if dp:
+                    bydir.setdefault(dp, []).append(label)
+            for dirpath in sorted(bydir, key=str.lower):
+                fold = QtWidgets.QTreeWidgetItem(
+                    [os.path.basename(dirpath) or dirpath, ""])
+                fold.setData(0, UserRole, ("folder", dirpath))
+                fold.setIcon(0, dicon)
+                fold.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled
+                              | QtCore.Qt.ItemFlag.ItemIsSelectable)
+                fold.setToolTip(0, dirpath)
+                fold.setForeground(1, gray)
+                tree.addTopLevelItem(fold)
+                for label in sorted(bydir[dirpath], key=str.lower):
+                    fnode = make_file_node(label)
+                    fold.addChild(fnode)
+                    fnode.setExpanded(("file", label) not in collapsed)
+                fold.setText(1, f"{fold.childCount()}ファイル")
+                fold.setExpanded(("folder", dirpath) not in collapsed)
+            for label in nodir:                    # 貼り付け・PCA等はフォルダの後ろに
+                node = make_file_node(label)
+                tree.addTopLevelItem(node)
+                node.setExpanded(("file", label) not in collapsed)
+        else:
+            for label in sorted(labels, key=str.lower):
+                node = make_file_node(label)
+                tree.addTopLevelItem(node)
+                # addTopLevelItem後でないと展開が効かないため設定し直す
+                node.setExpanded(("file", label) not in collapsed)
         tree.blockSignals(False)
         self._explorer_building = False
         self._sync_explorer_checks()
@@ -4089,8 +5245,7 @@ class UIBuildMixin:
                 it = self.y_list.item(i)
                 ymap[it.data(UserRole)] = it
             ck = QtCore.Qt.CheckState.Checked
-            for i in range(self.explorer.topLevelItemCount()):
-                node = self.explorer.topLevelItem(i)
+            for node in self._iter_file_nodes():
                 n_ck = 0
                 for j in range(node.childCount()):
                     child = node.child(j)
@@ -4122,8 +5277,7 @@ class UIBuildMixin:
         label = it.text() if it else None
         self._explorer_building = True
         try:
-            for i in range(self.explorer.topLevelItemCount()):
-                node = self.explorer.topLevelItem(i)
+            for node in self._iter_file_nodes():
                 if node.data(0, UserRole)[1] == label:
                     if self.explorer.currentItem() is not node:
                         self.explorer.setCurrentItem(node)
@@ -4198,6 +5352,25 @@ class UIBuildMixin:
             menu = self._series_menu(self._find_y_item(fl, col))
             menu.addSeparator()
             menu.addAction("この列をX軸にする", lambda: self._set_x_from_tree(col))
+            menu.addAction("名前の変更（凡例ラベル）\tF2", lambda: self._on_tree_rename(item))
+            menu.exec(gpos)
+            return
+        if data[0] == "folder":   # フォルダノードのメニュー
+            dirpath = data[1]
+            labels = [item.child(j).data(0, UserRole)[1]
+                      for j in range(item.childCount())]
+            menu = QtWidgets.QMenu(self)
+            menu.addAction("フォルダ内を全チェック",
+                           lambda: self._check_labels_cols(labels, True))
+            menu.addAction("フォルダ内を全解除",
+                           lambda: self._check_labels_cols(labels, False))
+            menu.addSeparator()
+            menu.addAction("フォルダ内のファイルを削除",
+                           lambda: (self._remove_labels(labels),
+                                    self._set_status(f"{len(labels)}ファイルを削除しました。")))
+            if os.path.isdir(dirpath):
+                menu.addAction("エクスプローラーで開く",
+                               lambda: self._reveal_in_explorer(dirpath))
             menu.exec(gpos)
             return
         label = data[1]
@@ -4206,9 +5379,11 @@ class UIBuildMixin:
         menu.addAction("全列をチェック", lambda: self._check_file_cols(label, True))
         menu.addAction("全列を解除", lambda: self._check_file_cols(label, False))
         menu.addSeparator()
+        menu.addAction("名前の変更...\tF2", lambda: self._on_tree_rename(item))
         menu.addAction("再読込", lambda: self._reload_label(label))
-        menu.addAction("削除", lambda: (self._remove_labels([label]),
-                                        self._set_status(f"{label} を削除しました。")))
+        menu.addAction("削除（一覧から）\tDel",
+                       lambda: (self._remove_labels([label]),
+                                self._set_status(f"{label} を削除しました。")))
         if path and os.path.isfile(path):
             menu.addSeparator()
             menu.addAction("エクスプローラーで表示", lambda: self._reveal_in_explorer(path))
@@ -4217,8 +5392,13 @@ class UIBuildMixin:
         menu.exec(gpos)
 
     def _check_file_cols(self, label, on):
+        self._check_labels_cols([label], on)
+
+    def _check_labels_cols(self, labels, on):
+        """複数ファイルの全列を一括ON/OFF（他ファイルの状態は維持）。"""
+        labelset = set(labels)
         ck = QtCore.Qt.CheckState.Checked
-        self._set_all_checks(lambda it: on if it.data(UserRole)[0] == label
+        self._set_all_checks(lambda it: on if it.data(UserRole)[0] in labelset
                              else it.checkState() == ck)
         self._maybe_draw()
 
@@ -4237,6 +5417,92 @@ class UIBuildMixin:
             self.x_combo.setCurrentIndex(i)
             self._set_status(f"X軸を「{col}」にしました。")
 
+    def _drop_series(self, payload):
+        """ツリーからグラフへドロップされた系列（'fl\\tcol' 行）をチェックして描画する。"""
+        added = []
+        ck = QtCore.Qt.CheckState.Checked
+        for line in payload.splitlines():
+            if "\t" not in line:
+                continue
+            fl, col = line.split("\t", 1)
+            yit = self._find_y_item(fl, col)
+            if yit is not None and yit.checkState() != ck:
+                yit.setCheckState(ck)
+                added.append(str(col))
+        if added:
+            self.draw_graph()
+            self._set_status("ドロップで追加: " + ", ".join(added[:8])
+                             + (" ほか" if len(added) > 8 else ""))
+        else:
+            self._set_status("ドロップされた系列は既に表示されています。")
+
+    # ---- 名前の変更（F2 / 右クリック。VS Code互換）----
+    def _on_tree_rename(self, item):
+        """列=系列名（凡例ラベル）、ファイル=データセットの表示名を変更する。"""
+        data = item.data(0, UserRole)
+        if not data:
+            return
+        if data[0] == "col":
+            _k, fl, col = data
+            skey = self._style_key(fl, col)
+            st = self.series_styles.setdefault(skey, {})
+            cur = st.get("label") or str(col)
+            new, ok = QtWidgets.QInputDialog.getText(
+                self, "系列名の変更", "凡例に表示する名前:", text=cur)
+            new = (new or "").strip()
+            if not ok or not new:
+                return
+            if new == str(col):
+                st.pop("label", None)   # 列名と同じなら既定に戻す
+            else:
+                st["label"] = new
+            self._on_y_selection_changed()   # ツリー・系列バー・スタイル表へ反映
+            if self._has_drawn:
+                self.draw_graph()
+        elif data[0] == "file":
+            old = data[1]
+            new, ok = QtWidgets.QInputDialog.getText(
+                self, "名前の変更", "一覧に表示する名前（ディスクのファイル名は変わりません）:",
+                text=old)
+            new = (new or "").strip()
+            if ok and new and new != old:
+                self._rename_dataset_label(old, new)
+
+    def _rename_dataset_label(self, old, new):
+        """データセットの表示名を付け替える（スタイル・チェック・プレビューも追従）。
+        ディスク上のファイル名は変更しない（表示名のみ）。"""
+        if new in self.datasets:
+            QtWidgets.QMessageBox.warning(self, "名前の変更", "同名のデータが既にあります。")
+            return
+        if old not in self.datasets:
+            return
+        checked = {(fl, c) for fl, c, _d in self._selected_series_items()}
+        self.datasets[new] = self.datasets.pop(old)
+        self.meta[new] = self.meta.pop(old, {"path": new, "enc": "-", "delim": "-"})
+        prefix = old + "\t"
+        for k in [k for k in self.series_styles if k.startswith(prefix)]:
+            self.series_styles[new + "\t" + k.split("\t", 1)[1]] = self.series_styles.pop(k)
+        it = self._find_file_item(old)
+        if it is not None:
+            it.setText(new)
+        if getattr(self, "_preview_label", None) == old:
+            self._preview_label = new
+        self._refresh_columns()
+        # チェック状態を (旧名, 列)→(新名, 列) で引き継ぐ
+        ck = QtCore.Qt.CheckState.Checked
+        un = QtCore.Qt.CheckState.Unchecked
+        self.y_list.blockSignals(True)
+        for i in range(self.y_list.count()):
+            yit = self.y_list.item(i)
+            fl, c = yit.data(UserRole)
+            key = (old, c) if fl == new else (fl, c)
+            yit.setCheckState(ck if key in checked else un)
+        self.y_list.blockSignals(False)
+        self._on_y_selection_changed()
+        if self._has_drawn:
+            self.draw_graph()
+        self._set_status(f"名前を変更しました: {old} → {new}（表示名のみ）")
+
     def _reveal_in_explorer(self, path):
         import subprocess
         try:
@@ -4249,7 +5515,9 @@ class UIBuildMixin:
         """系列スタイル表（色/線種/軸/種別/誤差列）。書式調整パネルの下段に置く。"""
         box = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(box); v.setContentsMargins(4, 4, 4, 4)
-        v.addWidget(self._bold("系列スタイル（系列名はダブルクリックで変更可）"))
+        hdr = self._bold("系列スタイル（系列名はダブルクリックで変更可）")
+        hdr.setWordWrap(True)   # 折り返し可にして、パネルの最小幅を縛らないように
+        v.addWidget(hdr)
         self.style_table = QtWidgets.QTableWidget(0, 9)
         self.style_table.setHorizontalHeaderLabels(
             ["系列名", "色", "線種", "幅", "マーカー", "サイズ", "軸", "種別", "誤差列"])
@@ -4265,7 +5533,6 @@ class UIBuildMixin:
         """右端のグラフ書式調整パネル（上：グラフ書式コントロール／下：系列スタイル表）。"""
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.format_splitter = split
-        split.setMinimumWidth(360)
         scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         scroll.setWidget(self._build_tab_graph())   # 種別/タイトル/軸/近似曲線/縦横比/画像出力
@@ -4314,14 +5581,8 @@ class UIBuildMixin:
         self.hint_label.setStyleSheet("color:#0a7a55;")
         v.addWidget(self.hint_label)
 
-        # 3D 表示の指定（表示名ではなく、このチェックで2D/3Dを切り替える）
-        self.threed_check = QtWidgets.QCheckBox("3D表示（Z軸を使う・ドラッグで回転）")
-        self.threed_check.setToolTip(
-            "散布図・折れ線・棒でONにするとZ軸を使った3D描画になります。\n"
-            "曲面は常に3Dです。3D対応でない種別では選べません。")
-        self.threed_check.setEnabled(False)
-        self.threed_check.toggled.connect(self._on_3d_toggled)
-        v.addWidget(self.threed_check)
+        # 3D表示・視点角度は「軸の選択」（データパネル）へ移動済み
+        # （Z軸コンボとセットの“何をプロットするか”の設定のため）
 
         # 系列ごとに段を分けるサブプロット表示（折れ線/散布図の2Dのみ）
         self.stack_check = QtWidgets.QCheckBox("系列ごとに段を分ける（サブプロット）")
@@ -4332,24 +5593,6 @@ class UIBuildMixin:
             "一括画像出力には適用されません。")
         self.stack_check.setEnabled(False)
         v.addWidget(self.stack_check)
-
-        # 3D の視点角度（マウスドラッグでも回転可。ここで数値指定もできる）
-        view = QtWidgets.QHBoxLayout()
-        view.addWidget(QtWidgets.QLabel("3D視点 仰角"))
-        self.elev_spin = QtWidgets.QSpinBox(); self.elev_spin.setRange(-90, 90)
-        self.elev_spin.setValue(30)
-        self.elev_spin.setToolTip("3Dグラフの仰角（上下の見おろし角）。ドラッグでも回転できます。")
-        self.elev_spin.valueChanged.connect(self._on_view_angle_changed)
-        view.addWidget(self.elev_spin)
-        view.addWidget(QtWidgets.QLabel("方位"))
-        self.azim_spin = QtWidgets.QSpinBox(); self.azim_spin.setRange(-180, 180)
-        self.azim_spin.setValue(-60)
-        self.azim_spin.setToolTip("3Dグラフの方位（左右の回転角）。ドラッグでも回転できます。")
-        self.azim_spin.valueChanged.connect(self._on_view_angle_changed)
-        view.addWidget(self.azim_spin)
-        view.addStretch(1)
-        self.elev_spin.setEnabled(False); self.azim_spin.setEnabled(False)
-        v.addLayout(view)
 
         # タイトル・ラベル・フォント
         sec_labels = self._fmt_section("タイトル・軸ラベル・文字", "labels", True)
@@ -4572,8 +5815,8 @@ class UIBuildMixin:
         self.aspect_combo.currentTextChanged.connect(self._on_aspect_changed)
         self._on_aspect_changed()
 
-        # 画像出力（解像度・背景透過つき）
-        sec_exp = self._fmt_section("画像出力", "export", True)
+        # 出力（解像度・背景透過つき画像／Excelレポート）
+        sec_exp = self._fmt_section("出力（画像・Excelレポート）", "export", True)
         exp_v = QtWidgets.QVBoxLayout()
         exp = QtWidgets.QHBoxLayout()
         exp.addWidget(QtWidgets.QLabel("解像度 DPI"))
@@ -4596,6 +5839,11 @@ class UIBuildMixin:
                            "個別に描画し、ファイル名ごとの画像として一括保存します。")
         b_batch.clicked.connect(self.batch_export)
         exp_v.addWidget(b_batch)
+        b_xlsx = QtWidgets.QPushButton("Excelレポート出力...")
+        b_xlsx.setToolTip("現在のグラフ（ネイティブExcelグラフ）とデータ・解析結果の表を\n"
+                          "1つのExcelブックに出力します。")
+        b_xlsx.clicked.connect(self.export_excel_report)
+        exp_v.addWidget(b_xlsx)
         sec_exp.set_content_layout(exp_v)
         v.addWidget(sec_exp)
         v.addStretch(1)   # 余白を下にまとめ、各行の不自然な隙間をなくす
@@ -4667,25 +5915,25 @@ class UIBuildMixin:
         b_all = QtWidgets.QPushButton("全系列を解析…")
         b_all.setToolTip("選択中の全系列のピーク・測定を別ウィンドウに一覧表示（CSV保存可）")
         b_all.clicked.connect(self.analyze_all_series)
-        b_fft = QtWidgets.QPushButton("FFTスペクトル表示"); b_fft.clicked.connect(self.show_fft)
-        b_fft.setToolTip("選択中の全系列のFFTを1枚に重ね描き（系列ごとに色分け）")
+        b_fft = QtWidgets.QPushButton("FFT表示"); b_fft.clicked.connect(self.show_fft)
+        b_fft.setToolTip("FFTスペクトル表示：選択中の全系列のFFTを1枚に重ね描き（系列ごとに色分け）")
         b_cur = QtWidgets.QPushButton("カーソル測定"); b_cur.setCheckable(True)
         b_cur.setToolTip("グラフを2回クリックして Δt・ΔV・1/Δt を測ります")
         b_cur.toggled.connect(self.toggle_cursors)
         self.cursor_btn = b_cur
+        # 1行目=実行系（押すと計算して表を更新）、2行目=測定モード系（ON/OFFトグル）
         brow = QtWidgets.QHBoxLayout()
-        brow.addWidget(b_an); brow.addWidget(b_all)
+        brow.addWidget(b_an); brow.addWidget(b_all); brow.addWidget(b_fft)
         v.addLayout(brow)
-        brow2 = QtWidgets.QHBoxLayout()
-        brow2.addWidget(b_fft); brow2.addWidget(b_cur)
-        v.addLayout(brow2)
-        b_gate = QtWidgets.QPushButton("区間測定（ドラッグで範囲指定）")
+        b_gate = QtWidgets.QPushButton("区間測定")
         b_gate.setCheckable(True)
         b_gate.setToolTip("ONにしてグラフ上を横にドラッグすると、選んだX区間だけの\n"
                           "測定値（平均/RMS/周期など）を下の表に表示します。")
         b_gate.toggled.connect(self.toggle_gate)
         self.gate_btn = b_gate
-        v.addWidget(b_gate)
+        brow2 = QtWidgets.QHBoxLayout()
+        brow2.addWidget(b_cur); brow2.addWidget(b_gate)
+        v.addLayout(brow2)
 
         v.addWidget(self._bold("ピーク（第1=最大）"))
         self.peak_table = QtWidgets.QTableWidget(0, 3)
@@ -4774,6 +6022,11 @@ class UIBuildMixin:
         fg.addWidget(b_m, 1, 0, 1, 2)
         b_sp = QtWidgets.QPushButton("スペクトログラム"); b_sp.clicked.connect(self.show_spectrogram)
         fg.addWidget(b_sp, 1, 2, 1, 1)
+        b_wf = QtWidgets.QPushButton("ウォーターフォール")
+        b_wf.setToolTip("STFTの時間スライスを3Dに重ねて表示（周波数成分の時間変化を見る）。"
+                        "ドラッグで回転できます。")
+        b_wf.clicked.connect(self.show_waterfall)
+        fg.addWidget(b_wf, 1, 3, 1, 1)
         v.addLayout(fg)
         self.fft_metrics = QtWidgets.QTableWidget(0, 2)
         self.fft_metrics.setHorizontalHeaderLabels(["指標", "値"])
@@ -4810,7 +6063,8 @@ class UIBuildMixin:
         v.addWidget(self._bold("シリアルプロトコル解読"))
         pg = QtWidgets.QGridLayout()
         pg.addWidget(QtWidgets.QLabel("プロトコル"), 0, 0)
-        self.proto_combo = QtWidgets.QComboBox(); self.proto_combo.addItems(["UART", "I2C", "SPI"])
+        self.proto_combo = QtWidgets.QComboBox()
+        self.proto_combo.addItems(["UART", "I2C", "SPI", "CAN", "LIN", "1-Wire"])
         self.proto_combo.currentTextChanged.connect(self._on_proto_change)
         pg.addWidget(self.proto_combo, 0, 1)
         pg.addWidget(QtWidgets.QLabel("ボーレート/不使用"), 0, 2)
@@ -4822,6 +6076,12 @@ class UIBuildMixin:
             pg.addWidget(self.proto_ch[i], 1 + i, 1, 1, 3)
         b_dec = QtWidgets.QPushButton("解読"); b_dec.clicked.connect(self.decode_protocol)
         pg.addWidget(b_dec, 4, 0, 1, 4)
+        self.proto_overlay_check = QtWidgets.QCheckBox("解読結果をグラフに注記表示")
+        self.proto_overlay_check.setToolTip(
+            "解読したフレームの値を波形の上に直接注記します（Saleae風・先頭80件まで）。\n"
+            "CRC/パリティ等の不一致は赤で表示。折れ線/散布図の2D表示で有効。")
+        self.proto_overlay_check.toggled.connect(self._on_proto_overlay_toggled)
+        pg.addWidget(self.proto_overlay_check, 5, 0, 1, 4)
         v.addLayout(pg)
         self.proto_table = QtWidgets.QTableWidget(0, 4)
         self.proto_table.setHorizontalHeaderLabels(["時刻", "種別", "値(hex)", "備考"])
@@ -4856,7 +6116,7 @@ class UIBuildMixin:
         b_reg = QtWidgets.QPushButton("線形回帰（Y vs X）")
         b_reg.setToolTip("傾き・切片・R²・相関r・直線性誤差[%FS] を計算（線形性の評価）")
         b_reg.clicked.connect(self.run_regression)
-        self.ds_fit_check = QtWidgets.QCheckBox("回帰直線をグラフに重ねる")
+        self.ds_fit_check = QtWidgets.QCheckBox("回帰直線を重ねる")
         self.ds_fit_check.setToolTip("回帰実行時に近似曲線（線形）をグラフへ重ねて表示します")
         reg_row = QtWidgets.QHBoxLayout()
         reg_row.addWidget(b_reg); reg_row.addWidget(self.ds_fit_check); reg_row.addStretch(1)
@@ -4868,10 +6128,26 @@ class UIBuildMixin:
         b_desc.setToolTip("平均/中央値/標準偏差/分散/歪度/尖度/四分位 など")
         b_norm = QtWidgets.QPushButton("正規性検定"); b_norm.clicked.connect(self.run_normality)
         b_norm.setToolTip("Shapiro-Wilk 検定（scipy 必要）")
-        b_corr = QtWidgets.QPushButton("相関行列（選択系列）"); b_corr.clicked.connect(self.show_corr_matrix)
+        b_corr = QtWidgets.QPushButton("相関行列"); b_corr.clicked.connect(self.show_corr_matrix)
         b_corr.setToolTip("選択中の全Y系列どうしのピアソン相関を行列で表示")
         brow.addWidget(b_desc); brow.addWidget(b_norm); brow.addWidget(b_corr)
         v.addLayout(brow)
+
+        # 任意関数フィット・検定
+        brow2 = QtWidgets.QHBoxLayout()
+        b_cfit = QtWidgets.QPushButton("任意関数フィット…")
+        b_cfit.setToolTip("モデル式（例: a*exp(-x/b)+c）とパラメータ初期値を指定して\n"
+                          "非線形フィット。パラメータ±標準誤差とR²を表示し、\n"
+                          "フィット曲線を新データとして重ね描きできます（scipy 必要）。")
+        b_cfit.clicked.connect(self.run_custom_fit)
+        b_tt = QtWidgets.QPushButton("t検定…")
+        b_tt.setToolTip("1標本（母平均と比較）／対応なし2標本（Welch）／対応あり2標本（scipy 必要）")
+        b_tt.clicked.connect(self.run_t_test)
+        b_an = QtWidgets.QPushButton("ANOVA")
+        b_an.setToolTip("一元配置分散分析。選択中の全Y系列を群として比較します（scipy 必要）")
+        b_an.clicked.connect(self.run_anova)
+        brow2.addWidget(b_cfit); brow2.addWidget(b_tt); brow2.addWidget(b_an)
+        v.addLayout(brow2)
 
         # 主成分分析（PCA）: 選択系列を特徴量として次元圧縮 → 3D表示で確認できる
         v.addWidget(self._bold("主成分分析 (PCA)"))
@@ -4916,6 +6192,30 @@ class UIBuildMixin:
     def _build_plot_area(self):
         wrap = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(wrap); lay.setContentsMargins(0, 0, 0, 0)
+        # 描画コントロール（データの操作ではなく「表示の制御」なのでグラフ直上に常設。
+        # どのパネルを開いていても描画・リアルタイム・間引きへ即アクセスできる）
+        drawbar = QtWidgets.QHBoxLayout()
+        drawbar.setContentsMargins(6, 4, 6, 0)
+        b_draw = QtWidgets.QPushButton("グラフを描画 (F5)")
+        b_draw.setStyleSheet("font-weight:bold;")
+        b_draw.clicked.connect(self.draw_graph)
+        drawbar.addWidget(b_draw)
+        self.live_check = QtWidgets.QCheckBox("リアルタイム更新")
+        self.live_check.setChecked(True)
+        self.live_check.setToolTip("オンにすると設定変更が自動で描画に反映されます。大容量データではオフ推奨。")
+        drawbar.addWidget(self.live_check)
+        self.decimate_check = QtWidgets.QCheckBox("間引き表示")
+        self.decimate_check.setChecked(True)
+        self.decimate_check.setToolTip("折れ線/散布図で点数が多いとき、見た目を保ったまま間引いて高速描画します"
+                                       "（ズーム時は自動で再サンプルします）。")
+        drawbar.addWidget(self.decimate_check)
+        drawbar.addStretch(1)
+        b_batch2 = QtWidgets.QPushButton("一括画像保存...")
+        b_batch2.setToolTip("読み込んだ各ファイルを個別に描画し、ファイル名ごとの画像として一括保存します"
+                            "（タイトル・形式・DPI等は次の画面で調整できます）。")
+        b_batch2.clicked.connect(self.batch_export)
+        drawbar.addWidget(b_batch2)
+        lay.addLayout(drawbar)
         # グラフ上部の系列ON/OFFバー（折れ線/散布図の表示切替）
         self.series_bar = QtWidgets.QScrollArea()
         self.series_bar.setWidgetResizable(True)
@@ -4948,6 +6248,33 @@ class UIBuildMixin:
         self.canvas.mpl_connect("scroll_event", self._scope_on_scroll)
         self.canvas.mpl_connect("motion_notify_event", self._hover_readout)
         self.canvas.mpl_connect("pick_event", self._on_legend_pick)
+        self.canvas.mpl_connect("draw_event", self._invalidate_crosshair)
+        self.canvas.mpl_connect("resize_event", self._invalidate_crosshair)
+        self.canvas.mpl_connect("figure_leave_event", lambda e: self._hide_hover_ui())
+        # ツリーからの系列ドロップ（PlotJuggler風）とファイルドロップを受け付ける
+        self.canvas.setAcceptDrops(True)
+        app = self
+
+        class _CanvasDrop(QtCore.QObject):
+            def eventFilter(self, _obj, ev):
+                et = ev.type()
+                if et in (QtCore.QEvent.Type.DragEnter, QtCore.QEvent.Type.DragMove):
+                    if ev.mimeData().hasFormat(SERIES_MIME) or ev.mimeData().hasUrls():
+                        ev.acceptProposedAction()
+                        return True
+                elif et == QtCore.QEvent.Type.Drop:
+                    md = ev.mimeData()
+                    if md.hasFormat(SERIES_MIME):
+                        app._drop_series(bytes(md.data(SERIES_MIME)).decode("utf-8"))
+                        ev.acceptProposedAction()
+                        return True
+                    if md.hasUrls():          # ファイルはウィンドウ全体と同じ扱い
+                        app.dropEvent(ev)
+                        return True
+                return False
+
+        self._canvas_drop_filter = _CanvasDrop(self.canvas)
+        self.canvas.installEventFilter(self._canvas_drop_filter)
         self._draw_placeholder()
         return wrap
 
@@ -5024,6 +6351,10 @@ class UIBuildMixin:
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.itemChanged.connect(self._on_cell_edited)
+        # 行選択⇔グラフの点のリンク（JMP風）。グラフの点クリックでも行が選ばれる
+        self.table.setToolTip("行を選択するとグラフ上の対応する点がリングで強調されます。\n"
+                              "逆にグラフの点（単純な折れ線）をクリックするとこの表の行が選ばれます。")
+        self.table.itemSelectionChanged.connect(self._on_preview_selection_changed)
         lay.addWidget(self.table)
         return box
 
@@ -5092,6 +6423,16 @@ class UIBuildMixin:
             self._set_status(f"{name}を保存しました: {path}")
         except OSError as e:
             QtWidgets.QMessageBox.critical(self, "保存エラー", str(e))
+
+    @staticmethod
+    def _scrollable(w):
+        """ウィジェットをスクロールエリアに包む。パネルを狭くしても中身が
+        見切れず（スクロールバーが出る）、ドックの最小幅の制約も消える。"""
+        sc = QtWidgets.QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        sc.setWidget(w)
+        return sc
 
     @staticmethod
     def _bold(text):
@@ -5182,11 +6523,15 @@ class DataIOMixin:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
+    _ACCEPT_EXTS = (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls",
+                    ".wav", ".raw", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5",
+                    ".asc", ".net")   # LTspice回路/ネットリスト（実行→.raw読込）
+
     def dropEvent(self, event):
         paths = []
         for url in event.mimeData().urls():
             p = url.toLocalFile()
-            if p and os.path.splitext(p)[1].lower() in (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls"):
+            if p and os.path.splitext(p)[1].lower() in self._ACCEPT_EXTS:
                 paths.append(p)
         if not paths:
             return
@@ -5201,8 +6546,10 @@ class DataIOMixin:
     def add_file(self):
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "ファイルを追加（複数選択可）", self.last_dir,
-            "データ (*.csv *.tsv *.txt *.xlsx *.xls *.xlsm);;Excel (*.xlsx *.xls *.xlsm);;"
-            "CSV/TSV (*.csv *.tsv *.txt);;すべて (*.*)")
+            "データ (*.csv *.tsv *.txt *.xlsx *.xls *.xlsm *.wav *.raw *.tdms *.mf4 *.mdf *.h5 *.hdf5 *.asc);;"
+            "Excel (*.xlsx *.xls *.xlsm);;CSV/TSV (*.csv *.tsv *.txt);;"
+            "波形/計測 (*.wav *.raw *.tdms *.mf4 *.mdf *.h5 *.hdf5);;"
+            "LTspice回路 (*.asc *.net);;すべて (*.*)")
         for p in paths:
             self._load_file(p)
         if paths:
@@ -5239,6 +6586,9 @@ class DataIOMixin:
         self._set_status(f"クリップボードから {len(df)}行 × {len(df.columns)}列 を貼り付けました。")
 
     def _load_file(self, path):
+        if os.path.splitext(path)[1].lower() in (".asc", ".net"):
+            self.run_ltspice_asc(path)   # 回路図/ネットリストは実行→.raw読込
+            return
         enc = self.enc_combo.currentText()
         enc = None if enc.startswith("自動") else enc
         delim = None
@@ -5248,6 +6598,16 @@ class DataIOMixin:
                 if lbl == dt:
                     delim = ch
                     break
+        # Excelで複数シートがある場合はどのシートを読むか選んでもらう
+        sheet = None
+        if os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm", ".xls"):
+            sheets = excel_sheet_names(path)
+            if len(sheets) > 1:
+                sheet, ok = QtWidgets.QInputDialog.getItem(
+                    self, "シートの選択", f"{os.path.basename(path)} のシート:",
+                    sheets, 0, False)
+                if not ok:
+                    return
         size = os.path.getsize(path) if os.path.isfile(path) else 0
         busy = size > 5_000_000   # 5MB 超は待機カーソル＋進捗
         if busy:
@@ -5255,7 +6615,8 @@ class DataIOMixin:
             self._set_status(f"読み込み中… {os.path.basename(path)}")
             QtWidgets.QApplication.processEvents()
         try:
-            df, used_enc, used_delim = load_table(path, encoding=enc, delimiter=delim)
+            df, used_enc, used_delim = load_table(
+                path, encoding=enc, delimiter=delim, sheet=sheet)
         except Exception as e:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "読み込みエラー", f"{os.path.basename(path)}\n\n{e}")
             return
@@ -5263,15 +6624,144 @@ class DataIOMixin:
             if busy:
                 QtWidgets.QApplication.restoreOverrideCursor()
         label = os.path.basename(path)
+        if sheet:
+            label = f"{label}[{sheet}]"   # シート違いを別データとして区別できるように
         base, i = label, 2
         while label in self.datasets and self.meta.get(label, {}).get("path") != path:
             label = f"{base} ({i})"; i += 1
         self.datasets[label] = df
-        self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim}
+        self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim,
+                            "sheet": sheet}
         if not self._find_file_item(label):
             self._add_file_item(label)
         self._push_recent(path)
         self._set_status(f"{label} を読み込み（{len(df)}行 × {len(df.columns)}列, {used_enc}）")
+
+    # ------------------------------------------------------------ フォルダを開く
+    def add_folder(self):
+        """フォルダ内の対応データファイルを一括で読み込む（VS Codeの「フォルダを開く」相当）。"""
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "フォルダを開く", self.last_dir)
+        if d:
+            self._load_folder(d)
+
+    def _load_folder(self, d):
+        exts = set(self._ACCEPT_EXTS) - {".asc", ".net"}   # 回路は誤爆実行を避けて除外
+        try:
+            names = sorted(os.listdir(d))
+        except OSError as e:
+            QtWidgets.QMessageBox.critical(self, "フォルダを開く", str(e))
+            return
+        files = [os.path.join(d, f) for f in names
+                 if os.path.splitext(f)[1].lower() in exts
+                 and os.path.isfile(os.path.join(d, f))]
+        if not files:
+            QtWidgets.QMessageBox.information(
+                self, "情報", "このフォルダに読み込めるデータファイルがありません。")
+            return
+        if len(files) > 40:
+            ret = QtWidgets.QMessageBox.question(
+                self, "フォルダを開く",
+                f"{len(files)} 個のファイルが見つかりました。すべて読み込みますか？")
+            if ret != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        for p in files:
+            self._load_file(p)
+        self.last_dir = d
+        self._refresh_columns()
+        if self._has_drawn:
+            self.draw_graph()
+        self._set_status(f"フォルダを読み込みました: {os.path.basename(d)}（{len(files)}ファイル）")
+
+    # ------------------------------------------------------------ LTspice 連携
+    # .asc 回路をバッチ実行し、生成された .raw を自動で読み込む。ファイル監視を
+    # ONにしておけば、以降 LTspice 側で再シミュレーションするたびに自動更新される。
+    _LTSPICE_CANDIDATES = (
+        r"C:\Program Files\ADI\LTspice\LTspice.exe",
+        r"C:\Program Files\LTC\LTspiceXVII\XVIIx64.exe",
+        r"C:\Program Files (x86)\LTC\LTspiceIV\scad3.exe",
+    )
+
+    def _ltspice_exe(self):
+        """LTspice実行ファイルの場所（設定→既知パス→spicelib検出→PATHの順で探す）。"""
+        p = self._ui_settings().value("ltspice/exe")
+        if p and os.path.isfile(str(p)):
+            return str(p)
+        cands = list(self._LTSPICE_CANDIDATES) + [
+            os.path.expanduser(r"~\AppData\Local\Programs\ADI\LTspice\LTspice.exe")]
+        for c in cands:
+            if os.path.isfile(c):
+                return c
+        try:   # spicelib が入っていればその自動検出も利用する
+            from spicelib.simulators.ltspice_simulator import LTspice
+            for c in LTspice.spice_exe:
+                if os.path.isfile(str(c)):
+                    return str(c)
+        except Exception:
+            pass
+        import shutil
+        return shutil.which("LTspice") or shutil.which("XVIIx64")
+
+    def set_ltspice_path(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "LTspice実行ファイルの場所", r"C:\Program Files",
+            "LTspice (*.exe)")
+        if path:
+            self._ui_settings().setValue("ltspice/exe", path)
+            self._set_status(f"LTspiceの場所を設定しました: {path}")
+
+    def run_ltspice_asc(self, path=None):
+        """LTspice回路(.asc)をバッチ実行し、生成された .raw を読み込んで描画する。"""
+        if getattr(self, "_lt_proc", None) is not None \
+                and self._lt_proc.state() != QtCore.QProcess.ProcessState.NotRunning:
+            self._set_status("LTspiceシミュレーションを実行中です。完了までお待ちください。")
+            return
+        if not path:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "LTspice回路を実行", self.last_dir,
+                "LTspice回路/ネットリスト (*.asc *.net)")
+            if not path:
+                return
+        exe = self._ltspice_exe()
+        if not exe:
+            ret = QtWidgets.QMessageBox.question(
+                self, "LTspiceが見つかりません",
+                "LTspice の実行ファイルが見つかりませんでした。\n場所を指定しますか？")
+            if ret == QtWidgets.QMessageBox.StandardButton.Yes:
+                self.set_ltspice_path()
+                exe = self._ltspice_exe()
+            if not exe:
+                return
+        self.last_dir = os.path.dirname(path)
+        raw = os.path.splitext(path)[0] + ".raw"
+        proc = QtCore.QProcess(self)
+        self._lt_proc = proc
+        proc.finished.connect(
+            lambda code, _st, p=path, r=raw: self._on_ltspice_finished(code, p, r))
+        proc.start(exe, ["-b", path])   # -b: バッチ実行（.rawを回路と同じ場所に生成）
+        if not proc.waitForStarted(5000):
+            self._lt_proc = None
+            QtWidgets.QMessageBox.critical(self, "LTspice", f"起動できませんでした: {exe}")
+            return
+        self._set_status(f"LTspiceシミュレーション実行中… {os.path.basename(path)}"
+                         "（完了すると自動で波形を読み込みます）")
+
+    def _on_ltspice_finished(self, code, asc_path, raw_path):
+        self._lt_proc = None
+        if not os.path.isfile(raw_path):
+            QtWidgets.QMessageBox.warning(
+                self, "LTspice",
+                f"シミュレーションは終了しましたが .raw が見つかりません（終了コード {code}）。\n"
+                f"回路にエラーがないか LTspice で確認してください:\n{asc_path}")
+            return
+        self._load_file(raw_path)
+        self._refresh_columns()
+        if self._has_drawn:
+            self.draw_graph()
+        note = ("（ファイル監視ONなので、LTspice側で再実行すると自動更新されます）"
+                if self._watch_enabled() else
+                "（メニュー『ファイル→ファイルの変更を監視』をONにすると、"
+                "LTspice側の再実行で自動更新されます）")
+        self._set_status(f"LTspice完了: {os.path.basename(raw_path)} を読み込みました {note}")
 
     # ------------------------------------------------------------ ファイル監視（自動再読込）
     # 測定器やロガーが書き続けるCSVを監視し、更新されたら自動で読み直して再描画する。
@@ -5333,6 +6823,17 @@ class DataIOMixin:
                 self.draw_graph()
             self._set_status("自動再読込: " + ", ".join(reloaded))
 
+    def _reload_all_files(self):
+        """全ファイルをディスクの最新内容で読み直す（並び・チェックは維持）。"""
+        reloaded = [l for l in list(self.datasets) if self._reload_label_inplace(l)]
+        if reloaded:
+            self._refresh_columns()
+            if self._has_drawn:
+                self.draw_graph()
+            self._set_status(f"再読込しました: {len(reloaded)}ファイル")
+        else:
+            self._set_status("再読込できるファイルがありません（貼り付け・生成データのみ）。")
+
     def _reload_label_inplace(self, label):
         """一覧の並びと選択を保ったまま、保存済みの読み込み条件でデータだけ差し替える。"""
         meta = self.meta.get(label) or {}
@@ -5343,11 +6844,13 @@ class DataIOMixin:
         enc = None if (not enc or str(enc).startswith(("自動", "clipboard"))) else enc
         try:
             df, used_enc, used_delim = load_table(
-                path, encoding=enc, delimiter=meta.get("delim"))
+                path, encoding=enc, delimiter=meta.get("delim"),
+                sheet=meta.get("sheet"))
         except Exception:  # noqa: BLE001  書き込み途中で開けない等は次の変更イベントに任せる
             return False
         self.datasets[label] = df
-        self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim}
+        self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim,
+                            "sheet": meta.get("sheet")}
         if getattr(self, "_preview_label", None) == label:
             self._populate_preview(df, label=label)
         return True
@@ -5435,6 +6938,7 @@ class DataIOMixin:
         # 削除したデータに紐づく解析注記・解析表をクリア（古い注記が次の描画に残らないように）
         self._meas_annotations = []
         self._ds_annotations = []
+        self._proto_annotations = None
         if hasattr(self, "meas_table"):
             self.meas_table.setRowCount(0)
         if hasattr(self, "ds_table"):
@@ -6616,6 +8120,7 @@ class PlotMixin:
         self._reset_figure_axes()   # スペクトログラム等のカラーバー軸を除去
         self._cursor_pts = []; self._cursor_artists = []  # 再描画で軸がクリアされる
         self._cursors = []; self._cursor_drag = None; self._cursor_text = None
+        self._link_artists = []   # リンク選択のリング強調も軸クリアで消える
         try:
             series, categories = self._build_series(ctype)
             swap_on = (getattr(self, "swap_xy_check", None) and self.swap_xy_check.isChecked()
@@ -6678,6 +8183,7 @@ class PlotMixin:
                 self._apply_tick_spacing(ctype, scope)   # 目盛り間隔（指定時）
                 self._apply_fill_between(ctype, series)   # 系列間の塗りつぶし（選択時）
                 self._draw_ds_annotations()              # データサイエンス注記（選択時）
+                self._draw_proto_overlay(ctype)          # プロトコル解読の波形上注記
                 try:
                     self.fig.tight_layout()
                 except Exception:
@@ -6710,6 +8216,81 @@ class PlotMixin:
         except Exception as e:  # noqa: BLE001
             get_logger().exception("描画エラー")
             QtWidgets.QMessageBox.critical(self, "描画エラー", str(e))
+
+    def open_graph_window(self):
+        """現在のグラフを独立ウィンドウとして複製する（Igor Pro風）。
+
+        何枚でも開けるので、選択・書式を変えながら複数のグラフを並べて比較できる。
+        各ウィンドウは自分のズームツールバーを持ち、「現在の設定で更新」で
+        メイン画面のいまの選択・書式を使って描き直せる。"""
+        if not self.datasets or not self._selected_series_items():
+            QtWidgets.QMessageBox.information(self, "情報", "先にY系列を選択してください。")
+            return
+        dlg = QtWidgets.QDialog(self)
+        # 通常ウィンドウ扱いにして、Windowsのスナップ（画面端ドラッグ・
+        # 最大化ボタンhoverのレイアウト選択・Win+矢印）を効かせる
+        dlg.setWindowFlags(QtCore.Qt.WindowType.Window)
+        n = len(getattr(self, "_graph_windows", [])) + 1
+        title = self.title_edit.text() or self.chart_combo.currentText()
+        dlg.setWindowTitle(f"グラフ {n}: {title}")
+        dlg.resize(760, 540)
+        v = QtWidgets.QVBoxLayout(dlg)
+        fig = Figure(figsize=(6, 4), dpi=100)
+        canvas = FigureCanvas(fig)
+        tb = NavigationToolbar(canvas, dlg)
+        v.addWidget(tb)
+        v.addWidget(canvas, 1)
+        brow = QtWidgets.QHBoxLayout()
+        b_upd = QtWidgets.QPushButton("現在の設定で更新")
+        b_upd.setToolTip("メイン画面のいまの系列選択・書式でこのウィンドウを描き直します。")
+        brow.addWidget(b_upd)
+        brow.addStretch(1)
+        v.addLayout(brow)
+
+        def render():
+            try:
+                ctype = self.chart_combo.currentText()
+                series, categories = self._build_series(ctype)
+                fig.clf()
+                if self._want_3d():
+                    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+                    ax = fig.add_subplot(111, projection="3d")
+                else:
+                    ax = fig.add_subplot(111)
+                ax._twin_secondary = None
+                plot_series(
+                    ax, series, ctype, categories=categories,
+                    title=self.title_edit.text(),
+                    xlabel=self.xlabel_edit.text() or self._effective_x_label(),
+                    ylabel=self.ylabel_edit.text() or self._effective_y_label(),
+                    xlim=self._range_pair(self.xmin, self.xmax, "X", []),
+                    ylim=self._range_pair(self.ymin, self.ymax, "Y", []),
+                    scope=None, markers=None, max_points=DECIMATE_TARGET,
+                    secondary_label="",
+                    zlabel=(self.z_combo.currentText() if self._want_3d() else ""),
+                    view_init=(self._view_angles() if self._want_3d() else None),
+                    threed=self._want_3d(),
+                    **self._plot_format_kwargs())
+                dlg.setWindowTitle(f"グラフ {n}: "
+                                   f"{self.title_edit.text() or self.chart_combo.currentText()}")
+                try:
+                    fig.tight_layout()
+                except Exception:
+                    pass
+                canvas.draw()
+            except Exception as e:  # noqa: BLE001
+                QtWidgets.QMessageBox.critical(dlg, "描画エラー", str(e))
+
+        b_upd.clicked.connect(render)
+        render()
+        if not hasattr(self, "_graph_windows"):
+            self._graph_windows = []
+        self._graph_windows.append(dlg)
+        dlg.finished.connect(lambda *_: self._graph_windows.remove(dlg)
+                             if dlg in self._graph_windows else None)
+        dlg.show()
+        self._set_status(f"グラフウィンドウ {n} を開きました"
+                         "（メイン画面で選択・書式を変えて複数枚並べられます）。")
 
     def _draw_stacked(self, series, ctype, xlim, ylim, max_points):
         """系列ごとに上下の段（サブプロット・X軸共有）へ分けて描画する。
@@ -6756,6 +8337,45 @@ class PlotMixin:
         self._regate()
         self._stacked = True
 
+    def _draw_proto_overlay(self, ctype):
+        """プロトコル解読イベントを波形の上部に注記する（Saleae風・最大80件）。
+
+        値（hex）を交互の高さの小さなボックスで並べ、イベント位置に薄い縦線を引く。
+        ⚠付き（CRC/パリティ等の不一致）は赤で表示する。"""
+        info = getattr(self, "_proto_annotations", None)
+        chk = getattr(self, "proto_overlay_check", None)
+        if (not info or not info.get("rows") or chk is None or not chk.isChecked()
+                or self._is_3d() or getattr(self, "_stacked", False)
+                or ctype not in ("折れ線", "散布図")
+                or (getattr(self, "swap_xy_check", None)
+                    and self.swap_xy_check.isChecked())):
+            return
+        import numpy as np
+        from matplotlib import transforms as mtrans
+        from matplotlib.lines import Line2D
+        rows = info["rows"][:80]
+        xs = axis_scale(np.array([r[0] for r in rows], dtype=float),
+                                 self.xscale_edit.text())
+        trans = mtrans.blended_transform_factory(self.ax.transData, self.ax.transAxes)
+        fs = max((self.fs_annot.value() if hasattr(self, "fs_annot") else 9) - 1, 6)
+        marker_kinds = {"START", "STOP", "BREAK", "SYNC", "RESET", "PRESENCE"}
+        for i, ((_tm, kind, hexv, note), x) in enumerate(zip(rows, xs)):
+            warn = "⚠" in str(note)
+            color = ("#d02020" if warn
+                     else "#0a7a55" if str(kind) in marker_kinds else "#2b6cb0")
+            label = str(hexv) if str(hexv) else str(kind)
+            ytxt = 0.99 if i % 2 == 0 else 0.92   # 交互に段をずらして重なりを軽減
+            self.ax.text(x, ytxt, label, transform=trans, ha="center", va="top",
+                         fontsize=fs, color=color, zorder=25, clip_on=True,
+                         bbox=dict(facecolor="white", alpha=0.78,
+                                   edgecolor=color, lw=0.5, pad=1.2))
+            self.ax.add_line(Line2D([x, x], [0.0, 0.86], transform=trans,
+                                    color=color, lw=0.6, alpha=0.35, zorder=24))
+        if len(info["rows"]) > 80:
+            self.ax.text(0.99, 0.84, f"解読 {len(info['rows'])}件中 先頭80件を注記",
+                         transform=self.ax.transAxes, ha="right", va="top",
+                         fontsize=fs, color="#666", zorder=25)
+
     def _wire_legend_picking(self):
         """凡例の項目（線・文字）をクリックすると系列の表示/非表示が切り替わるようにする。
         凡例ラベル→(ファイル, 列) の対応が取れた項目だけ有効（複数X時の変種などは対象外）。"""
@@ -6779,16 +8399,90 @@ class PlotMixin:
                     self._legend_pick_map[art] = key
                 except Exception:
                     pass
+        # データ線のクリック → プレビュー表の行を選択（JMP風リンク選択）。
+        # skey→Line2D の即時反映マップがある単純な折れ線のみ（間引き時は行対応が崩れるため無効）
+        self._line_pick_map = {}
+        for skey, ln in (self._style_artists or {}).items():
+            try:
+                ln.set_picker(5)
+                self._line_pick_map[ln] = skey
+            except Exception:
+                pass
 
     def _on_legend_pick(self, event):
         key = getattr(self, "_legend_pick_map", {}).get(event.artist)
-        if key is None:
+        if key is not None:
+            yit = self._find_y_item(*key)
+            if yit is not None:
+                ck = QtCore.Qt.CheckState.Checked
+                yit.setCheckState(QtCore.Qt.CheckState.Unchecked
+                                  if yit.checkState() == ck else ck)
             return
-        yit = self._find_y_item(*key)
-        if yit is not None:
-            ck = QtCore.Qt.CheckState.Checked
-            yit.setCheckState(QtCore.Qt.CheckState.Unchecked
-                              if yit.checkState() == ck else ck)
+        # データ線のクリック（リンク選択）
+        skey = getattr(self, "_line_pick_map", {}).get(event.artist)
+        if skey is None:
+            return
+        if (self._scope_active() or getattr(self.toolbar, "mode", "")
+                or self._cursor_cid is not None
+                or (getattr(self, "gate_btn", None) and self.gate_btn.isChecked())):
+            return   # ドラッグ操作系のモード中は誤選択を避ける
+        ind = getattr(event, "ind", None)
+        if ind is None or not len(ind):
+            return
+        row = int(ind[0])
+        fl = skey.split("\t", 1)[0]
+        it = self._find_file_item(fl)
+        if it is not None and self.file_list.currentItem() is not it:
+            self.file_list.setCurrentRow(self.file_list.row(it))   # プレビューを切替
+        if row < self.table.rowCount():
+            self.table.selectRow(row)   # → itemSelectionChanged でリング強調も付く
+            cell = self.table.item(row, 0)
+            if cell is not None:
+                self.table.scrollToItem(cell)
+            self._set_status(f"グラフの点 → データ編集表の行 {row} を選択（{fl}）")
+        else:
+            self._set_status(f"クリックした点は行 {row}"
+                             f"（プレビューは先頭{PREVIEW_ROWS}行のみ表示）")
+
+    def _on_preview_selection_changed(self):
+        """プレビュー表の行選択をグラフ上のリング強調へ反映する（JMP風リンク選択）。"""
+        if (getattr(self, "_preview_loading", False)
+                or not getattr(self, "_has_drawn", False)
+                or self._is_3d() or getattr(self, "_stacked", False)):
+            return
+        ctype = self.chart_combo.currentText()
+        if (ctype not in ("折れ線", "散布図")
+                or (getattr(self, "swap_xy_check", None)
+                    and self.swap_xy_check.isChecked())):
+            return
+        for a in getattr(self, "_link_artists", None) or []:
+            try:
+                a.remove()
+            except Exception:
+                pass
+        self._link_artists = []
+        lbl = getattr(self, "_preview_label", None)
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        if lbl and lbl in self.datasets and rows:
+            import pandas as pd
+            df = self.datasets[lbl]
+            rows = [r for r in rows if r < len(df)][:500]   # 強調は最大500点
+            xspec, yspec = self.xscale_edit.text(), self.yscale_edit.text()
+            xraw = pd.to_numeric(pd.Series(self._x_values(df)),
+                                 errors="coerce").to_numpy(dtype=float)
+            for fl, col, _d in self._selected_series_items():
+                if fl != lbl or col not in df.columns:
+                    continue
+                st = self.series_styles.get(self._style_key(fl, col)) or {}
+                if st.get("axis") == "secondary":
+                    continue   # 第2軸は座標系が異なるためスキップ
+                y = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+                xv = axis_scale(xraw[rows], xspec)
+                yv = axis_scale(y[rows], yspec)
+                art, = self.ax.plot(xv, yv, "o", ms=11, mfc="none", mec="#e6194b",
+                                    mew=1.8, ls="none", zorder=26, label="_link_sel")
+                self._link_artists.append(art)
+        self.canvas.draw_idle()
 
     def _apply_tick_spacing(self, ctype, scope):
         """目盛り間隔（メモリ間隔）の手動指定を適用する。
@@ -7364,38 +9058,24 @@ class ScopeCursorMixin:
         self.draw_graph()
         self._set_status("全体表示に戻しました（ダブルクリックでいつでも戻れます）。")
 
-    def _hover_readout(self, event):
-        """マウス近傍のデータ点（系列名・X・Y）をステータスバー右端に常時表示する。
-        ピクセル座標で最近傍を探すので、対数軸・単位換算後の表示座標でも正しい。"""
-        lbl = getattr(self, "_hover_label", None)
-        if lbl is None:
-            return
-        ax = event.inaxes
-        if (ax is None or ax not in self.fig.axes or event.x is None
-                or not getattr(self, "_has_drawn", False)
-                or getattr(ax, "name", None) == "3d"
-                or self._scope_drag or self._cursor_drag is not None):
-            if lbl.text():
-                lbl.setText("")
-            return
-        import time
-        now = time.monotonic()
-        if now - getattr(self, "_hover_t", 0.0) < 0.05:   # 20Hzに間引き（負荷対策）
-            return
-        self._hover_t = now
-        import numpy as np
-        # イベントの軸（段分け中は各段）と、重なっている第2軸/主軸を対象にする
+    def _hover_lines(self, ax):
+        """ホバー対象の (系列名, Line2D) 候補（対象軸＋重なる第2軸/主軸）。"""
         axs = [ax]
         twin = getattr(ax, "_twin_secondary", None)
         if twin is not None:
             axs.append(twin)
         if ax is getattr(self.ax, "_twin_secondary", None):
             axs.append(self.ax)
-        cands = [(ln.get_label(), ln) for a in axs for ln in a.get_lines()
-                 if not str(ln.get_label()).startswith("_")
-                 and "近似" not in str(ln.get_label())]
-        best = None   # (画面距離^2, 系列名, x, y)
-        for label, ln in cands:
+        return [(str(ln.get_label()), ln) for a in axs for ln in a.get_lines()
+                if not str(ln.get_label()).startswith("_")
+                and "近似" not in str(ln.get_label())]
+
+    def _hover_values(self, ax, x_disp):
+        """表示X座標 x_disp における各系列の値 [(名前, 色, x, y), ...] を返す。
+        各系列の最近傍点を採用する（Grafana風の全系列読み出し）。"""
+        import numpy as np
+        out = []
+        for label, ln in self._hover_lines(ax):
             try:
                 xd = np.asarray(ln.get_xdata(), float)
                 yd = np.asarray(ln.get_ydata(), float)
@@ -7406,16 +9086,123 @@ class ScopeCursorMixin:
             m = np.isfinite(xd) & np.isfinite(yd)
             if not m.any():
                 continue
-            pts = ln.axes.transData.transform(np.column_stack([xd[m], yd[m]]))
-            d2 = (pts[:, 0] - event.x) ** 2 + (pts[:, 1] - event.y) ** 2
-            i = int(np.argmin(d2))
-            if best is None or d2[i] < best[0]:
-                best = (float(d2[i]), str(label), float(xd[m][i]), float(yd[m][i]))
-        if best is not None and best[0] <= 20.0 ** 2:   # 20px以内の点だけ表示
+            xs, ys = xd[m], yd[m]
+            i = int(np.argmin(np.abs(xs - x_disp)))
+            out.append((label, ln.get_color(), float(xs[i]), float(ys[i])))
+        return out
+
+    def _hover_readout(self, event):
+        """ホバー位置の全系列の値をツールチップに、最近傍点をステータスバーに表示し、
+        十字カーソルを重ねる（Grafana風）。対数軸・単位換算後の表示座標でも正しい。"""
+        lbl = getattr(self, "_hover_label", None)
+        if lbl is None:
+            return
+        ax = event.inaxes
+        if (ax is None or ax not in self.fig.axes or event.x is None
+                or event.xdata is None
+                or not getattr(self, "_has_drawn", False)
+                or getattr(ax, "name", None) == "3d"
+                or ax.get_label() == "<colorbar>"
+                or self._scope_drag or self._cursor_drag is not None):
+            if lbl.text():
+                lbl.setText("")
+            self._hide_hover_ui()
+            return
+        import time
+        now = time.monotonic()
+        if now - getattr(self, "_hover_t", 0.0) < 0.05:   # 20Hzに間引き（負荷対策）
+            return
+        self._hover_t = now
+        import numpy as np
+        vals = self._hover_values(ax, float(event.xdata))
+        # ステータスバー右には従来どおり「最近傍1点」を出す
+        best = None
+        for label, _c, x, y in vals:
+            pt = ax.transData.transform([[x, y]])[0]
+            d2 = (pt[0] - event.x) ** 2 + (pt[1] - event.y) ** 2
+            if best is None or d2 < best[0]:
+                best = (d2, label, x, y)
+        if best is not None and best[0] <= 20.0 ** 2:
             _, label, x, y = best
             lbl.setText(f"{label}:  X={format_eng(x)}  Y={format_eng(y)}  ")
         elif lbl.text():
             lbl.setText("")
+        # 全系列ツールチップ（色付き・最大12系列）
+        if vals:
+            rows = [f"<b>X = {format_eng(float(event.xdata))}</b>"]
+            for label, color, _x, y in vals[:12]:
+                rows.append(f"<span style='color:{color}'>■</span> "
+                            f"{label}: <b>{format_eng(y)}</b>")
+            if len(vals) > 12:
+                rows.append(f"…他 {len(vals) - 12} 系列")
+            QtWidgets.QToolTip.showText(QtGui.QCursor.pos(),
+                                        "<br>".join(rows), self.canvas)
+        else:
+            QtWidgets.QToolTip.hideText()
+        self._draw_crosshair(ax, event.xdata, event.ydata)
+
+    # ---- 十字カーソル（blit描画。通常の再描画には含まれない animated アーティスト）----
+    def _hide_hover_ui(self):
+        QtWidgets.QToolTip.hideText()
+        if getattr(self, "_xhair_bg", None) is None:
+            return
+        size = (int(self.fig.bbox.width), int(self.fig.bbox.height),
+                self.canvas.width(), self.canvas.height())
+        if getattr(self, "_xhair_size", None) != size or getattr(self, "_drawing", False):
+            self._xhair_bg = None   # サイズ不一致の背景は書き戻さない（クラッシュ対策）
+            return
+        try:
+            self.canvas.restore_region(self._xhair_bg)
+            self.canvas.blit(self.fig.bbox)
+        except Exception:
+            pass
+        self._xhair_bg = None
+
+    def _invalidate_crosshair(self, *_):
+        """本描画のたびに背景キャッシュを捨てる（draw_eventで呼ばれる）。"""
+        self._xhair_bg = None
+
+    def _draw_crosshair(self, ax, x, y):
+        # 区間測定(SpanSelector)やカーソル測定は独自のblit/ドラッグを持つため干渉を避ける
+        if (x is None or y is None
+                or (getattr(self, "gate_btn", None) and self.gate_btn.isChecked())
+                or self._cursor_cid is not None
+                or getattr(self.toolbar, "mode", "")):
+            return
+        xh = getattr(self, "_xhair", None)
+        if not xh or xh[0].axes is not ax:   # 軸が変わった/消えたら作り直す
+            if xh:
+                for a in xh:
+                    try:
+                        a.remove()
+                    except Exception:
+                        pass
+            v = ax.axvline(x, color="#888", lw=0.7, ls="--", animated=True, zorder=30)
+            h = ax.axhline(y, color="#888", lw=0.7, ls="--", animated=True, zorder=30)
+            self._xhair = (v, h)
+            self._xhair_bg = None
+        # キャンバスサイズが変わっていたら背景キャッシュを捨てる。サイズ違いの
+        # 背景を restore_region で書き戻すとネイティブレベルで落ちることがある
+        # （起動直後の初回描画・リサイズ中にマウスが乗っていたときの間欠クラッシュ対策。
+        # アクセス違反は Python の except では捕まらないため、事前チェックが必須）。
+        size = (int(self.fig.bbox.width), int(self.fig.bbox.height),
+                self.canvas.width(), self.canvas.height())
+        if getattr(self, "_xhair_size", None) != size:
+            self._xhair_bg = None
+        if getattr(self, "_drawing", False):
+            return   # 本描画の最中はblitしない（バッファが確定していない）
+        try:
+            if getattr(self, "_xhair_bg", None) is None:
+                self._xhair_bg = self.canvas.copy_from_bbox(self.fig.bbox)
+                self._xhair_size = size
+            self.canvas.restore_region(self._xhair_bg)
+            self._xhair[0].set_xdata([x, x])
+            self._xhair[1].set_ydata([y, y])
+            ax.draw_artist(self._xhair[0])
+            ax.draw_artist(self._xhair[1])
+            self.canvas.blit(self.fig.bbox)
+        except Exception:   # バックエンド差異等では静かに諦める（ツールチップは生きる）
+            self._xhair_bg = None
 
     @staticmethod
     def _zoom_pair(lo, hi, center, factor, log=False):
@@ -7954,6 +9741,45 @@ class AdvancedMixin:
         self._has_drawn = False  # カラーバー付き特殊表示。次のdrawで作り直す
         self._set_status(f"スペクトログラム表示: {label}")
 
+    def show_waterfall(self):
+        """FFTウォーターフォール: STFTの時間スライスを3Dに重ねて周波数変化を見る。"""
+        import numpy as np
+        t, y, label = self._analysis_xy()
+        if t is None:
+            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            return
+        f, tt, S = spectrogram(t, np.asarray(y, float),
+                                        window=self.fft_window.currentText())
+        if S is None:
+            QtWidgets.QMessageBox.warning(self, "ウォーターフォール", "計算できませんでした。")
+            return
+        self._ensure_axes_projection(True)   # 3D軸で描く
+        self._reset_figure_axes()
+        self.ax.clear()
+        from matplotlib import cm
+        n = S.shape[1]
+        step = max(1, n // 60)   # スライスは最大60本（視認性と速度のバランス）
+        f = np.asarray(f, float)
+        for i in range(0, n, step):
+            self.ax.plot(f, np.full_like(f, tt[i]), S[:, i], lw=0.8,
+                         color=cm.viridis(i / max(n - 1, 1)))
+        self.ax.set_xlabel("周波数 [Hz]")
+        self.ax.set_ylabel("時間 [s]")
+        self.ax.set_zlabel("振幅 [dB]")
+        self.ax.set_title(f"FFTウォーターフォール: {label}")
+        try:
+            self.ax.view_init(elev=self.elev_spin.value(), azim=self.azim_spin.value())
+        except Exception:
+            pass
+        try:
+            self.fig.tight_layout()
+        except Exception:
+            pass
+        self.canvas.draw()
+        self._has_drawn = False  # 特殊表示。次の「グラフを描画」で通常表示に戻る
+        self._set_status(f"FFTウォーターフォール表示: {label}（{(n + step - 1) // step}スライス・"
+                         "ドラッグで回転）")
+
     def run_mask_test(self):
         import numpy as np
         t, y, label = self._analysis_xy()
@@ -8102,13 +9928,16 @@ class AdvancedMixin:
             "UART": (["信号線", "", ""], "ボーレート", "115200"),
             "I2C": (["SCL", "SDA", ""], "不使用", ""),
             "SPI": (["SCK", "MOSI", "CS(任意)"], "不使用", ""),
+            "CAN": (["CAN(RXまたは差動)", "", ""], "ビットレート", "500k"),
+            "LIN": (["信号線", "", ""], "ボーレート", "19200"),
+            "1-Wire": (["信号線", "", ""], "不使用", ""),
         }[proto]
         labels, baud_lbl, baud_val = cfg
         for i in range(3):
             show = labels[i] != ""
             self.proto_ch_labels[i].setText(labels[i]); self.proto_ch_labels[i].setVisible(show)
             self.proto_ch[i].setVisible(show)
-        self.proto_baud.setEnabled(proto == "UART")
+        self.proto_baud.setEnabled(proto in ("UART", "CAN", "LIN"))
         if baud_val:
             self.proto_baud.setText(baud_val)
 
@@ -8136,7 +9965,7 @@ class AdvancedMixin:
                     else:
                         rows.append((e["time"], e["type"], e["hex"],
                                      f"{e.get('rw','')} {e.get('ack','')}".strip()))
-            else:  # SPI
+            elif proto == "SPI":
                 t2, y2 = self._xy_by_disp(self.proto_ch[1].currentText())
                 if t2 is None:
                     QtWidgets.QMessageBox.information(self, "情報", "MOSI(Ch2)も選択してください。"); return
@@ -8146,6 +9975,35 @@ class AdvancedMixin:
                     cs = np.asarray(cs, float) if cs is not None else None
                 ev = decode_spi(t1, np.asarray(y1, float), np.asarray(y2, float), cs=cs)
                 rows = [(e["time"], "data", e["hex"], "") for e in ev]
+            elif proto == "CAN":
+                rate = parse_eng(self.proto_baud.text(), 500e3)
+                ev = decode_can(t1, np.asarray(y1, float), bitrate=rate)
+                rows = []
+                for e in ev:
+                    idw = f"{e['id']:08X}" if e["ext"] else f"{e['id']:03X}"
+                    kind = ("CANx" if e["ext"] else "CAN") + ("/RTR" if e["rtr"] else "")
+                    note = f"DLC={e['dlc']}" + ("" if e["crc_ok"] else " CRC⚠")
+                    rows.append((e["time"], kind, f"ID={idw} [{e['hex']}]", note))
+            elif proto == "LIN":
+                baud = parse_eng(self.proto_baud.text(), 19200)
+                ev = decode_lin(t1, np.asarray(y1, float), baud=baud)
+                rows = []
+                for e in ev:
+                    if e["type"] == "BREAK":
+                        rows.append((e["time"], "BREAK", "", ""))
+                    elif e["type"] == "PID":
+                        rows.append((e["time"], "PID", f"0x{e['value']:02X}",
+                                     "" if e.get("ok") else "パリティ⚠"))
+                    elif e["type"] == "CSUM":
+                        rows.append((e["time"], "CSUM", f"0x{e['value']:02X}",
+                                     "OK" if e.get("ok") else "不一致⚠"))
+                    else:
+                        rows.append((e["time"], e["type"], f"0x{e['value']:02X}", ""))
+            else:  # 1-Wire
+                ev = decode_onewire(t1, np.asarray(y1, float))
+                rows = [(e["time"], e["type"],
+                         f"0x{e['value']:02X}" if e["type"] == "data" else "", "")
+                        for e in ev]
         except Exception as e:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "解読エラー", str(e)); return
 
@@ -8155,7 +10013,16 @@ class AdvancedMixin:
             self.proto_table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(kind)))
             self.proto_table.setItem(r, 2, QtWidgets.QTableWidgetItem(str(hexv)))
             self.proto_table.setItem(r, 3, QtWidgets.QTableWidgetItem(str(note)))
+        # 波形上の注記用に保持（「解読結果をグラフに注記表示」ON時に描画）
+        self._proto_annotations = {"rows": rows, "proto": proto}
+        if (getattr(self, "proto_overlay_check", None)
+                and self.proto_overlay_check.isChecked() and self._has_drawn):
+            self.draw_graph()
         self._set_status(f"{proto} 解読: {len(rows)} 件")
+
+    def _on_proto_overlay_toggled(self, *_):
+        if self.datasets and self._has_drawn:
+            self.draw_graph()
 
 # ======================================================================
 # ↑ graph_app_mixins/advanced_tools.py
@@ -8336,6 +10203,155 @@ class DataSciMixin:
         lay.addWidget(btn)
         dlg.exec()
 
+    # ---- 任意関数フィッティング ----
+    def run_custom_fit(self):
+        """モデル式とパラメータ初期値を指定して非線形フィット（scipy curve_fit）。"""
+        disp, t, y = self._ds_xy()
+        if t is None:
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"任意関数フィット: {disp}")
+        form = QtWidgets.QFormLayout(dlg)
+        last = getattr(self, "_fit_last", {})
+        e_expr = QtWidgets.QLineEdit(last.get("expr", "a*exp(-x/b)+c"))
+        e_expr.setToolTip("変数 x とパラメータ名で書くモデル式。\n"
+                          "使える関数: sin/cos/tan/exp/log/log10/sqrt/abs など"
+                          "（数学チャンネルの数式と同じ）。")
+        e_par = QtWidgets.QLineEdit(last.get("params", "a, b, c"))
+        e_par.setToolTip("フィットするパラメータ名（カンマ区切り）")
+        e_p0 = QtWidgets.QLineEdit(last.get("p0", "1, 1, 0"))
+        e_p0.setToolTip("各パラメータの初期値（カンマ区切り・パラメータ名と同順）")
+        c_add = QtWidgets.QCheckBox("フィット曲線を新しいデータとして追加（グラフに重ねられる）")
+        c_add.setChecked(True)
+        form.addRow("モデル式 f(x) =", e_expr)
+        form.addRow("パラメータ", e_par)
+        form.addRow("初期値", e_p0)
+        form.addRow(c_add)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok
+                                        | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if not dlg.exec():
+            return
+        expr = e_expr.text().strip()
+        params = [p.strip() for p in e_par.text().split(",") if p.strip()]
+        try:
+            p0 = [float(v) for v in e_p0.text().split(",")]
+        except ValueError:
+            QtWidgets.QMessageBox.warning(self, "任意関数フィット", "初期値は数値をカンマ区切りで入力してください。")
+            return
+        if not expr or not params or len(p0) != len(params):
+            QtWidgets.QMessageBox.warning(self, "任意関数フィット",
+                                          "式・パラメータ名・初期値（同数）を入力してください。")
+            return
+        self._fit_last = {"expr": expr, "params": e_par.text(), "p0": e_p0.text()}
+        try:
+            d = fit_custom(t, y, expr, params, p0)
+        except Exception as e:  # noqa: BLE001  収束失敗・式エラーなど
+            QtWidgets.QMessageBox.warning(self, "任意関数フィット",
+                                          f"フィットできませんでした:\n{e}\n\n"
+                                          "初期値を変える・式を見直すと収束することがあります。")
+            return
+        if not d:
+            QtWidgets.QMessageBox.information(self, "情報",
+                                              "フィットに十分なデータがありません（要scipy・点数>パラメータ数+1）。")
+            return
+        f = self._fmt
+        rows = [("モデル式", f"f(x) = {expr}"), ("点数 n", f(d["n"]))]
+        for nm, v, err in d["params"]:
+            rows.append((f"{nm}", f"{v:.6g} ± {err:.3g}"))
+        rows += [("決定係数 R²", f(d["r2"])), ("RMSE (残差)", f(d["rmse"]))]
+        self._ds_show(f"任意関数フィット: {disp}", rows)
+        if c_add.isChecked():
+            import pandas as pd
+            xname = self.x_combo.currentText() or "x"
+            df = pd.DataFrame({xname: d["x"], f"fit({disp})": d["yfit"]})
+            base = f"FIT: {disp}"
+            label, i = base, 2
+            while label in self.datasets:
+                label = f"{base} ({i})"; i += 1
+            self.datasets[label] = df
+            self.meta[label] = {"path": label, "enc": "-", "delim": "-"}
+            self._add_file_item(label)
+            self._refresh_columns()
+            self._set_status(f"フィット完了: R²={f(d['r2'])}。曲線を『{label}』として追加しました"
+                             "（ツリーでチェックすると重ね描きできます）。")
+        else:
+            self._set_status(f"フィット完了: R²={f(d['r2'])}")
+
+    # ---- t検定・分散分析 ----
+    def run_t_test(self):
+        """t検定（1標本 / 対応なしWelch / 対応あり）。対象Aはこのタブの対象コンボ。"""
+        disp, t, y = self._ds_xy()
+        if t is None:
+            return
+        others = [d for _fl, _c, d in self._selected_series_items() if d != disp]
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"t検定: {disp}")
+        form = QtWidgets.QFormLayout(dlg)
+        kind = QtWidgets.QComboBox()
+        kind.addItems(["1標本（母平均μ0と比較）", "対応なし2標本（Welch）", "対応あり2標本"])
+        e_mu = QtWidgets.QLineEdit("0")
+        cb_b = QtWidgets.QComboBox(); cb_b.addItems(others)
+        form.addRow("種類", kind)
+        form.addRow("μ0（1標本のとき）", e_mu)
+        form.addRow("対象B（2標本のとき）", cb_b)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok
+                                        | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if not dlg.exec():
+            return
+        ki = kind.currentIndex()
+        b = None
+        if ki > 0:
+            if not cb_b.currentText():
+                QtWidgets.QMessageBox.information(self, "情報",
+                                                  "2標本の検定には対象Bの系列もデータタブで選択してください。")
+                return
+            _tb, b = self._xy_by_disp(cb_b.currentText())
+        d = t_test(y, b=b, mu=_parse_float(e_mu.text(), 0.0) or 0.0,
+                           paired=(ki == 2))
+        if not d:
+            QtWidgets.QMessageBox.information(self, "情報",
+                                              "t検定を計算できませんでした（要scipy・点数を確認）。")
+            return
+        f = self._fmt
+        name = ["1標本", "対応なし(Welch)", "対応あり"][ki]
+        rows = [("種類", name), ("平均 A", f(d["mean_a"]))]
+        if d["mean_b"] is not None:
+            rows.append(("平均 B", f(d["mean_b"])))
+        rows += [("t統計量", f(d["t"])), ("p値", f(d["p_value"]))]
+        if d["df"] is not None:
+            rows.append(("自由度", f(d["df"])))
+        rows.append(("5%有意差あり", f(d["sig_5pct"])))
+        self._ds_show(f"t検定（{name}）: {disp}"
+                      + (f" vs {cb_b.currentText()}" if ki > 0 else ""), rows)
+
+    def run_anova(self):
+        """一元配置分散分析。選択中の全Y系列を群として比較する。"""
+        items = self._selected_series_items()
+        if len(items) < 2:
+            QtWidgets.QMessageBox.information(
+                self, "情報", "分散分析には2系列以上をデータタブで選択してください。")
+            return
+        groups = []
+        for _fl, _c, disp in items:
+            _t, y = self._xy_by_disp(disp)
+            if y is not None:
+                groups.append((disp, y))
+        d = anova_oneway(groups)
+        if not d:
+            QtWidgets.QMessageBox.information(self, "情報",
+                                              "分散分析を計算できませんでした（要scipy）。")
+            return
+        f = self._fmt
+        rows = [("F統計量", f(d["F"])), ("p値", f(d["p_value"])),
+                ("5%有意差あり", f(d["sig_5pct"]))]
+        for name, n, mean, std in d["groups"]:
+            rows.append((f"{name}", f"n={n}, 平均={mean:.6g}, σ={std:.6g}"))
+        self._ds_show(f"一元配置ANOVA（{len(d['groups'])}群）", rows)
+
     # ---- 主成分分析（PCA） ----
     def run_pca(self):
         """選択中の系列（特徴量）に PCA をかけ、PC1..PCk を新データセットとして作る。
@@ -8515,7 +10531,9 @@ class BatchMixin:
                                 "軸名・凡例・近似曲線・縦横比などは右の書式パネルの値を使います。")
         info.setStyleSheet("color:#666;"); form.addRow(info)
         title_edit = QtWidgets.QLineEdit(self.title_edit.text() or "{name}")
-        title_edit.setToolTip("グラフタイトル。{name} はファイル名（拡張子なし）に置き換わります。")
+        title_edit.setToolTip("グラフタイトル。{name} はファイル名（拡張子なし）に置き換わります。\n"
+                              "空欄にするとタイトルなしで出力します。")
+        title_edit.setPlaceholderText("（空欄=タイトルなし）")
         form.addRow("グラフタイトル", title_edit)
         fmt_combo = QtWidgets.QComboBox(); fmt_combo.addItems(["png", "jpg", "pdf", "svg"])
         form.addRow("出力形式", fmt_combo)
@@ -8532,8 +10550,8 @@ class BatchMixin:
         form.addRow(bb)
         if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return None
-        title = title_edit.text().strip() or "{name}"
-        return {"title": title, "fmt": fmt_combo.currentText(),
+        # 空欄はそのまま「タイトルなし」として扱う（勝手に {name} へ戻さない）
+        return {"title": title_edit.text().strip(), "fmt": fmt_combo.currentText(),
                 "dpi": dpi_spin.value(), "transparent": trans.isChecked()}
 
     def batch_export(self):
@@ -8717,8 +10735,10 @@ class PersistenceMixin:
             "   （項目は見出しクリックで開閉できます。開閉状態・ウィンドウ配置は次回起動時に復元）\n"
             "※ パネルの切り離し（別ウィンドウ化）は3通り:\n"
             "   ①タブをダブルクリック ②タブを外へドラッグ ③表示メニュー「別ウィンドウで表示」\n"
-            "   元に戻す: ウィンドウのタイトルをダブルクリック／メニューのチェックを外す／枠へドラッグ\n"
-            "   ✕で閉じたパネルは表示メニューで再表示。「パネル配置をリセット」で全部初期位置へ\n"
+            "   切り離したウィンドウはWindowsのスナップ対応（画面端へドラッグ／Win+矢印／\n"
+            "   最大化ボタンにマウスでレイアウト選択）。元に戻す: タイトルバーをダブルクリック、\n"
+            "   メインウィンドウの左右端へドロップ、または表示メニューのチェックを外す。\n"
+            "   ✕で閉じたパネルは表示メニューで再表示、「パネル配置をリセット」で初期配置へ\n"
             "5. 波形は『オシロ/解析』パネルで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
             "【グラフ上の操作】ホバー=近傍点の値を右下に表示／ホイール=ズーム"
             "（Shift+ホイール=X方向のみ）／ダブルクリック=全体表示／凡例クリック=系列ON/OFF\n"
@@ -8761,6 +10781,8 @@ class PersistenceMixin:
                 sp.restoreState(st)
         if str(s.value("ui/watch_files")) in ("1", "true", "True"):
             self._watch_action.setChecked(True)   # → toggle_file_watch で監視開始
+        # UIスタイル（外観）を復元。標準でも基準QSS（ボタン高さ統一）を必ず適用する
+        self._apply_ui_style(str(s.value("ui/style") or "standard"))
         # 復元した切り離し状態をメニューのチェックへ反映し、タブバーも配線し直す
         if hasattr(self, "_float_actions"):
             for d in [*self.left_docks, self.format_dock]:

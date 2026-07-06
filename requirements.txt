@@ -11,6 +11,10 @@ scikit-learn        # 主成分分析(PCA)に使用（任意。無くても nump
 # spicelib        # LTspice 連携で波形データを生成する場合のみ必要
 #                 # （tools/generate_ltspice.py）。LTspice 本体も別途必要。
 #                 # セットアップ.bat では spicelib も併せて入れています。
+# npTDMS          # NI TDMS (.tdms) を読み込む場合のみ必要
+# asammdf         # 車載計測 MDF (.mf4/.mdf) を読み込む場合のみ必要
+# h5py            # HDF5 (.h5/.hdf5) を読み込む場合のみ必要（tables でも可）
+# xlrd>=2.0.1     # 旧形式 Excel (.xls) を読み込む場合のみ必要
 
 # GUI は PySide6 を想定（公式 Qt for Python・LGPL）。
 # PyQt6 でも同じコードで動作します（matplotlib の qt_compat 経由・Qt6 系）。

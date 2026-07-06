@@ -96,34 +96,133 @@ class LazyColumnCombo(QtWidgets.QComboBox):
             self.blockSignals(False)
         super().showPopup()
 
+SERIES_MIME = "application/x-graphapp-series"   # ツリー→グラフD&Dの系列ペイロード
+
+
 class ExplorerTree(QtWidgets.QTreeWidget):
     """VS Code のエクスプローラー風ツリー（ファイル → 列）。
 
-    チェック可能な子行（列）は行のどこを左クリックしてもチェックがトグルする
-    （CheckListWidget と同じ操作感）。ファイル行（トップレベル）は通常の
-    クリック＝選択・展開。列行かどうかは「親を持つか」で判定する
-    （childCount()==0 だと列ゼロのファイル行まで葉扱いになり選択できなくなる）。
+    VS Code 互換のキーボード操作: F2=名前の変更（renameRequested を発火）、
+    Delete=削除（deleteRequested を発火）、文字入力=その名前へジャンプ（Qt標準）。
+    描画はインデントガイド線（薄い縦線）付き。
 
-    ダブルクリックは自前で itemDoubleClicked を発火する: mousePressEvent が
-    イベントを消費すると Qt 内部の pressedIndex が更新されず、標準の
-    doubleClicked 判定（pressedIndex == index）が成立しないため。
+    - 列行（親を持つチェック可能行）: クリック＝チェックのトグル（リリース時に確定）、
+      **ドラッグ＝グラフへドロップして系列追加**（PlotJuggler風）。
+    - ファイル行: クリック＝選択・展開（標準動作）、ドラッグ＝全列をまとめて追加。
+    - 列行かどうかは「親を持つか」で判定する（childCount()==0 だと列ゼロの
+      ファイル行まで葉扱いになり選択できなくなる）。
+    - ダブルクリックは自前で itemDoubleClicked を発火する: press を消費すると
+      Qt 内部の pressedIndex が更新されず標準の判定が成立しないため。
     """
+
+    renameRequested = QtCore.Signal(object)   # F2: 対象アイテム
+    deleteRequested = QtCore.Signal()         # Delete: 選択中ファイルの削除要求
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._press_item = None
+        self._press_pos = None
+        self._dragged = False
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key.Key_F2 and self.currentItem() is not None:
+            self.renameRequested.emit(self.currentItem())
+            event.accept()
+            return
+        if event.key() == QtCore.Qt.Key.Key_Delete:
+            self.deleteRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        # VS Code風のインデントガイド（階層ごとの薄い縦線）
+        painter = QtGui.QPainter(self.viewport())
+        painter.setPen(QtGui.QColor(128, 128, 128, 60))
+        ind = max(self.indentation(), 1)
+        idx = self.indexAt(QtCore.QPoint(0, 0))
+        limit = self.viewport().height()
+        while idx.isValid():
+            rect = self.visualRect(idx)
+            if rect.top() > limit:
+                break
+            depth, p = 0, idx.parent()
+            while p.isValid():
+                depth += 1
+                p = p.parent()
+            for lv in range(depth):
+                x = lv * ind + ind // 2
+                painter.drawLine(x, rect.top(), x, rect.bottom())
+            idx = self.indexBelow(idx)
+        painter.end()
 
     @staticmethod
     def _is_check_leaf(item):
-        return (item is not None and item.parent() is not None
-                and item.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+        """列行（チェックトグル対象）か。UserRole の種別で判定する
+        （フォルダ階層があると「親を持つ＝列」の判定は成立しないため）。"""
+        if item is None:
+            return False
+        d = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        return bool(d and d[0] == "col"
+                    and item.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+
+    @classmethod
+    def _drag_payload(cls, item):
+        """ドラッグする (ファイル, 列) 行のリストを 'fl\\tcol' 行テキストで返す。
+        列=1行／ファイル=全列／フォルダ=配下の全ファイルの全列。"""
+        data = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        if data and data[0] == "col":
+            return f"{data[1]}\t{data[2]}"
+        rows = []
+        if data and data[0] in ("file", "folder"):
+            for j in range(item.childCount()):
+                sub = cls._drag_payload(item.child(j))
+                if sub:
+                    rows.append(sub)
+        return "\n".join(rows)
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
             item = self.itemAt(event.position().toPoint())
+            self._press_item = item
+            self._press_pos = event.position().toPoint()
+            self._dragged = False
             if self._is_check_leaf(item):
-                checked = item.checkState(0) == QtCore.Qt.CheckState.Checked
-                item.setCheckState(0, QtCore.Qt.CheckState.Unchecked if checked
-                                   else QtCore.Qt.CheckState.Checked)
-                event.accept()
+                event.accept()   # トグルはリリース時（ドラッグと区別するため）
                 return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._press_item is not None and not self._dragged
+                and event.buttons() & QtCore.Qt.MouseButton.LeftButton
+                and (event.position().toPoint() - self._press_pos).manhattanLength()
+                >= QtWidgets.QApplication.startDragDistance()):
+            payload = self._drag_payload(self._press_item)
+            if payload:
+                self._dragged = True
+                drag = QtGui.QDrag(self)
+                mime = QtCore.QMimeData()
+                mime.setData(SERIES_MIME, payload.encode("utf-8"))
+                mime.setText(self._press_item.text(0))
+                drag.setMimeData(mime)
+                drag.exec(QtCore.Qt.DropAction.CopyAction)
+                self._press_item = None
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        item, dragged = self._press_item, self._dragged
+        self._press_item = None
+        if (event.button() == QtCore.Qt.MouseButton.LeftButton
+                and not dragged and self._is_check_leaf(item)
+                and item is self.itemAt(event.position().toPoint())):
+            checked = item.checkState(0) == QtCore.Qt.CheckState.Checked
+            item.setCheckState(0, QtCore.Qt.CheckState.Unchecked if checked
+                               else QtCore.Qt.CheckState.Checked)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
@@ -207,4 +306,5 @@ __all__ = [
     "LazyColumnCombo",
     "CollapsibleBox",
     "ExplorerTree",
+    "SERIES_MIME",
 ]

@@ -210,6 +210,45 @@ class AdvancedMixin:
         self._has_drawn = False  # カラーバー付き特殊表示。次のdrawで作り直す
         self._set_status(f"スペクトログラム表示: {label}")
 
+    def show_waterfall(self):
+        """FFTウォーターフォール: STFTの時間スライスを3Dに重ねて周波数変化を見る。"""
+        import numpy as np
+        t, y, label = self._analysis_xy()
+        if t is None:
+            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            return
+        f, tt, S = analysis.spectrogram(t, np.asarray(y, float),
+                                        window=self.fft_window.currentText())
+        if S is None:
+            QtWidgets.QMessageBox.warning(self, "ウォーターフォール", "計算できませんでした。")
+            return
+        self._ensure_axes_projection(True)   # 3D軸で描く
+        self._reset_figure_axes()
+        self.ax.clear()
+        from matplotlib import cm
+        n = S.shape[1]
+        step = max(1, n // 60)   # スライスは最大60本（視認性と速度のバランス）
+        f = np.asarray(f, float)
+        for i in range(0, n, step):
+            self.ax.plot(f, np.full_like(f, tt[i]), S[:, i], lw=0.8,
+                         color=cm.viridis(i / max(n - 1, 1)))
+        self.ax.set_xlabel("周波数 [Hz]")
+        self.ax.set_ylabel("時間 [s]")
+        self.ax.set_zlabel("振幅 [dB]")
+        self.ax.set_title(f"FFTウォーターフォール: {label}")
+        try:
+            self.ax.view_init(elev=self.elev_spin.value(), azim=self.azim_spin.value())
+        except Exception:
+            pass
+        try:
+            self.fig.tight_layout()
+        except Exception:
+            pass
+        self.canvas.draw()
+        self._has_drawn = False  # 特殊表示。次の「グラフを描画」で通常表示に戻る
+        self._set_status(f"FFTウォーターフォール表示: {label}（{(n + step - 1) // step}スライス・"
+                         "ドラッグで回転）")
+
     def run_mask_test(self):
         import numpy as np
         t, y, label = self._analysis_xy()
@@ -358,13 +397,16 @@ class AdvancedMixin:
             "UART": (["信号線", "", ""], "ボーレート", "115200"),
             "I2C": (["SCL", "SDA", ""], "不使用", ""),
             "SPI": (["SCK", "MOSI", "CS(任意)"], "不使用", ""),
+            "CAN": (["CAN(RXまたは差動)", "", ""], "ビットレート", "500k"),
+            "LIN": (["信号線", "", ""], "ボーレート", "19200"),
+            "1-Wire": (["信号線", "", ""], "不使用", ""),
         }[proto]
         labels, baud_lbl, baud_val = cfg
         for i in range(3):
             show = labels[i] != ""
             self.proto_ch_labels[i].setText(labels[i]); self.proto_ch_labels[i].setVisible(show)
             self.proto_ch[i].setVisible(show)
-        self.proto_baud.setEnabled(proto == "UART")
+        self.proto_baud.setEnabled(proto in ("UART", "CAN", "LIN"))
         if baud_val:
             self.proto_baud.setText(baud_val)
 
@@ -392,7 +434,7 @@ class AdvancedMixin:
                     else:
                         rows.append((e["time"], e["type"], e["hex"],
                                      f"{e.get('rw','')} {e.get('ack','')}".strip()))
-            else:  # SPI
+            elif proto == "SPI":
                 t2, y2 = self._xy_by_disp(self.proto_ch[1].currentText())
                 if t2 is None:
                     QtWidgets.QMessageBox.information(self, "情報", "MOSI(Ch2)も選択してください。"); return
@@ -402,6 +444,35 @@ class AdvancedMixin:
                     cs = np.asarray(cs, float) if cs is not None else None
                 ev = advanced.decode_spi(t1, np.asarray(y1, float), np.asarray(y2, float), cs=cs)
                 rows = [(e["time"], "data", e["hex"], "") for e in ev]
+            elif proto == "CAN":
+                rate = plotter.parse_eng(self.proto_baud.text(), 500e3)
+                ev = advanced.decode_can(t1, np.asarray(y1, float), bitrate=rate)
+                rows = []
+                for e in ev:
+                    idw = f"{e['id']:08X}" if e["ext"] else f"{e['id']:03X}"
+                    kind = ("CANx" if e["ext"] else "CAN") + ("/RTR" if e["rtr"] else "")
+                    note = f"DLC={e['dlc']}" + ("" if e["crc_ok"] else " CRC⚠")
+                    rows.append((e["time"], kind, f"ID={idw} [{e['hex']}]", note))
+            elif proto == "LIN":
+                baud = plotter.parse_eng(self.proto_baud.text(), 19200)
+                ev = advanced.decode_lin(t1, np.asarray(y1, float), baud=baud)
+                rows = []
+                for e in ev:
+                    if e["type"] == "BREAK":
+                        rows.append((e["time"], "BREAK", "", ""))
+                    elif e["type"] == "PID":
+                        rows.append((e["time"], "PID", f"0x{e['value']:02X}",
+                                     "" if e.get("ok") else "パリティ⚠"))
+                    elif e["type"] == "CSUM":
+                        rows.append((e["time"], "CSUM", f"0x{e['value']:02X}",
+                                     "OK" if e.get("ok") else "不一致⚠"))
+                    else:
+                        rows.append((e["time"], e["type"], f"0x{e['value']:02X}", ""))
+            else:  # 1-Wire
+                ev = advanced.decode_onewire(t1, np.asarray(y1, float))
+                rows = [(e["time"], e["type"],
+                         f"0x{e['value']:02X}" if e["type"] == "data" else "", "")
+                        for e in ev]
         except Exception as e:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "解読エラー", str(e)); return
 
@@ -411,4 +482,13 @@ class AdvancedMixin:
             self.proto_table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(kind)))
             self.proto_table.setItem(r, 2, QtWidgets.QTableWidgetItem(str(hexv)))
             self.proto_table.setItem(r, 3, QtWidgets.QTableWidgetItem(str(note)))
+        # 波形上の注記用に保持（「解読結果をグラフに注記表示」ON時に描画）
+        self._proto_annotations = {"rows": rows, "proto": proto}
+        if (getattr(self, "proto_overlay_check", None)
+                and self.proto_overlay_check.isChecked() and self._has_drawn):
+            self.draw_graph()
         self._set_status(f"{proto} 解読: {len(rows)} 件")
+
+    def _on_proto_overlay_toggled(self, *_):
+        if self.datasets and self._has_drawn:
+            self.draw_graph()

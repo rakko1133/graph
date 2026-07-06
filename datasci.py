@@ -214,3 +214,82 @@ def normality(y):
         return {"W": float(w), "p_value": float(p), "normal_5pct": bool(p > 0.05)}
     except Exception:
         return {}
+
+
+def fit_custom(x, y, expr, params, p0):
+    """任意式 expr（変数 x とパラメータ names）を y に非線形フィットする（要 scipy）。
+
+    expr は mathchan.eval_expr の安全評価を使う（sin/exp/log 等の許可関数のみ）。
+    戻り dict: params=[(名前, 値, 標準誤差)...], r2, rmse, n, x, yfit。失敗時は {}。
+    """
+    try:
+        from scipy.optimize import curve_fit
+    except ImportError:
+        return {}
+    import mathchan
+    x, y = _clean_xy(x, y)
+    if x.size < len(params) + 2:
+        return {}
+
+    def f(xx, *vals):
+        env = {"x": xx, "t": xx}
+        env.update(dict(zip(params, vals)))
+        return np.asarray(mathchan.eval_expr(expr, env), dtype=float) * np.ones_like(xx)
+
+    popt, pcov = curve_fit(f, x, y, p0=p0, maxfev=20000)
+    yfit = f(x, *popt)
+    ss_res = float(np.sum((y - yfit) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    perr = np.sqrt(np.abs(np.diag(pcov)))
+    return {"params": [(nm, float(v), float(e)) for nm, v, e in zip(params, popt, perr)],
+            "r2": (1.0 - ss_res / ss_tot) if ss_tot > 0 else None,
+            "rmse": float(np.sqrt(ss_res / x.size)),
+            "n": int(x.size), "x": x, "yfit": yfit}
+
+
+def t_test(a, b=None, mu=0.0, paired=False):
+    """t検定（要 scipy）。b=None なら1標本（母平均mu）、paired=True なら対応あり、
+    それ以外は Welch の対応なし2標本。戻り dict: t, p_value, df, mean_a, mean_b。"""
+    try:
+        from scipy import stats
+    except ImportError:
+        return {}
+    a = _clean(a)
+    if a.size < 2:
+        return {}
+    if b is None:
+        res = stats.ttest_1samp(a, float(mu))
+        mb = None
+    else:
+        b = _clean(b)
+        if b.size < 2:
+            return {}
+        if paired:
+            n = min(a.size, b.size)
+            res = stats.ttest_rel(a[:n], b[:n])
+            mb = float(np.mean(b[:n]))
+        else:
+            res = stats.ttest_ind(a, b, equal_var=False)   # Welch
+            mb = float(np.mean(b))
+    df = getattr(res, "df", None)
+    return {"t": float(res.statistic), "p_value": float(res.pvalue),
+            "df": (float(df) if df is not None else None),
+            "mean_a": float(np.mean(a)), "mean_b": mb,
+            "sig_5pct": bool(res.pvalue < 0.05)}
+
+
+def anova_oneway(groups):
+    """一元配置分散分析（要 scipy）。groups=[(名前, 配列), ...]。
+    戻り dict: F, p_value, groups=[(名前, n, 平均, σ)...], sig_5pct。"""
+    try:
+        from scipy import stats
+    except ImportError:
+        return {}
+    arrs = [(_clean(g)) for _n, g in groups]
+    named = [(str(n), a) for (n, _g), a in zip(groups, arrs) if a.size >= 2]
+    if len(named) < 2:
+        return {}
+    f, p = stats.f_oneway(*[a for _n, a in named])
+    return {"F": float(f), "p_value": float(p), "sig_5pct": bool(p < 0.05),
+            "groups": [(n, int(a.size), float(a.mean()), float(a.std(ddof=1)))
+                       for n, a in named]}

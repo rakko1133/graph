@@ -13,6 +13,7 @@ import sys
 LOG_DIR = os.path.join(os.path.expanduser("~"), ".csv_graph_tool")
 LOG_FILE = os.path.join(LOG_DIR, "app.log")
 _logger = None
+_crash_file = None   # faulthandler の出力先（GCで閉じないよう保持）
 
 
 def setup_logging(level=logging.INFO):
@@ -36,6 +37,17 @@ def setup_logging(level=logging.INFO):
     ch.setFormatter(fmt)
     logger.addHandler(ch)
     logger.propagate = False
+    # ネイティブクラッシュ（アクセス違反等）でもPythonスタックが crash.log に残るように。
+    # 通常の例外フックでは捕まらない 0xC0000005 系の事後解析用。
+    try:
+        import faulthandler
+        global _crash_file
+        _crash_file = open(os.path.join(LOG_DIR, "crash.log"), "a", encoding="utf-8")
+        _crash_file.write("\n==== 起動 ====\n")
+        _crash_file.flush()
+        faulthandler.enable(file=_crash_file)
+    except OSError:
+        pass
     _logger = logger
     return logger
 

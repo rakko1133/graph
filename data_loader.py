@@ -1,8 +1,11 @@
-"""CSV / TSV ファイルの読み込み。
+"""表・波形データファイルの読み込み。
 
-文字コード（UTF-8 / UTF-8 BOM付き / Shift_JIS(CP932) など）と
-区切り文字（カンマ / タブ / セミコロン）を自動判定して
-pandas.DataFrame として読み込む。日本語 CSV を想定。
+- CSV/TSV/TXT: 文字コード（UTF-8 / BOM付き / CP932 など）と区切り文字を自動判定
+- Excel (.xlsx/.xlsm/.xls): シート指定可（既定は先頭シート）
+- WAV (.wav): 音声波形を 時間[s]＋ch列 として読む（標準ライブラリのみ）
+- LTspice (.raw): 過渡解析のバイナリ/ASCII波形（AC複素・fastaccessは未対応）
+- TDMS (.tdms): 要 npTDMS ／ MDF (.mf4/.mdf): 要 asammdf ／ HDF5 (.h5/.hdf5): 要 tables か h5py
+  （任意依存。未インストール時は pip コマンド入りの分かりやすいエラーを出す）
 """
 
 import csv
@@ -146,19 +149,189 @@ def _normalize_columns(df):
     return df
 
 
-def load_table(path, encoding=None, delimiter=None):
-    """CSV/TSV/Excel を読み込み (DataFrame, 使用した encoding, 使用した delimiter) を返す。
+def excel_sheet_names(path):
+    """Excelブックのシート名一覧を返す（読めない場合は空リスト）。"""
+    try:
+        return list(pd.ExcelFile(path).sheet_names)
+    except Exception:
+        return []
 
-    encoding / delimiter を None にすると自動判定する。.xlsx/.xls/.xlsm は Excel として読む。
+
+def _load_wav(path):
+    """WAV音声を 時間[s]＋ch1..chN のDataFrameにする（8/16/32bit PCM対応）。"""
+    import wave
+    import numpy as np
+    with wave.open(path, "rb") as w:
+        ch, sw, fr, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+        raw = w.readframes(n)
+    dtype = {1: np.uint8, 2: np.dtype("<i2"), 4: np.dtype("<i4")}.get(sw)
+    if dtype is None:
+        raise ValueError(f"未対応のサンプル幅です: {sw * 8}bit（8/16/32bit PCMに対応）")
+    a = np.frombuffer(raw, dtype=dtype).astype(float)
+    if sw == 1:
+        a -= 128.0   # 8bitは無符号なので中心を0に
+    a = a.reshape(-1, ch)
+    cols = {"時間[s]": np.arange(a.shape[0], dtype=float) / fr}
+    for i in range(ch):
+        cols[f"ch{i + 1}"] = a[:, i]
+    return pd.DataFrame(cols)
+
+
+def _load_ltspice_raw(path):
+    """LTspice の .raw 波形（過渡解析）を読む。バイナリ/ASCII両対応。
+
+    ヘッダはASCIIまたはUTF-16LE（LTspice XVII）。複素数（AC解析）と
+    fastaccess形式は未対応で、その旨を案内するエラーを出す。"""
+    import numpy as np
+    with open(path, "rb") as f:
+        data = f.read()
+    enc = "utf-16-le" if (data[:2] == b"\xff\xfe" or data[1:2] == b"\x00") else "latin-1"
+    marker = body = None
+    for m in ("Binary:", "Values:"):
+        mb = (m + "\n").encode(enc)
+        i = data.find(mb)
+        if i < 0:
+            mb = (m + "\r\n").encode(enc)
+            i = data.find(mb)
+        if i >= 0:
+            marker, hdr_end, body = m, i, i + len(mb)
+            break
+    if marker is None:
+        raise ValueError("LTspiceの .raw 形式として解釈できません（Binary:/Values: が見つかりません）。")
+    header = data[:hdr_end].decode(enc, errors="replace")
+    nvars = npts = 0
+    flags = ""
+    names = []
+    in_vars = False
+    for line in header.splitlines():
+        low = line.strip()
+        if low.startswith("No. Variables:"):
+            nvars = int(low.split(":")[1])
+        elif low.startswith("No. Points:"):
+            npts = int(low.split(":")[1])
+        elif low.startswith("Flags:"):
+            flags = low.split(":", 1)[1].lower()
+        elif low.startswith("Variables:"):
+            in_vars = True
+        elif in_vars and low:
+            parts = low.split("\t") if "\t" in line else low.split()
+            if len(parts) >= 2 and parts[0].strip().isdigit():
+                names.append(parts[1].strip())
+    if not nvars or not npts or len(names) != nvars:
+        raise ValueError("LTspice .raw のヘッダを解釈できませんでした。")
+    if "complex" in flags:
+        raise ValueError("AC解析（複素数）の .raw は未対応です。過渡解析(.tran)の .raw を読み込んでください。")
+    if "fastaccess" in flags:
+        raise ValueError(".raw が fastaccess 形式です。LTspiceの設定で fastaccess を無効にして再保存してください。")
+    if marker == "Binary:":
+        if "double" in flags:   # 全変数 float64
+            arr = np.frombuffer(data[body:body + 8 * nvars * npts], dtype="<f8")
+            table = arr.reshape(npts, nvars)
+        else:                    # 時間=float64、他=float32（LTspice標準）
+            rec = np.dtype([("t", "<f8")] + [(f"v{i}", "<f4") for i in range(1, nvars)])
+            arr = np.frombuffer(data[body:body + rec.itemsize * npts], dtype=rec)
+            table = np.column_stack([arr["t"]] + [arr[f"v{i}"] for i in range(1, nvars)])
+    else:                        # ASCII (Values:)
+        text = data[body:].decode(enc, errors="replace")
+        vals = [float(tok) for tok in text.split() if _is_float(tok)]
+        # 各点は「点番号 v0 v1 ...」の並び。点番号を除いて詰め直す
+        table = np.array(vals, dtype=float).reshape(npts, nvars + 1)[:, 1:]
+    table[:, 0] = np.abs(table[:, 0])   # LTspiceは圧縮マーカーで時間が負になることがある
+    return pd.DataFrame({names[i]: table[:, i] for i in range(nvars)})
+
+
+def _is_float(tok):
+    try:
+        float(tok)
+        return True
+    except ValueError:
+        return False
+
+
+def _load_tdms(path):
+    """NI TDMS を読む（要 npTDMS）。グループ/チャンネルを列に展開する。"""
+    try:
+        from nptdms import TdmsFile
+    except ImportError as e:
+        raise ValueError("TDMS の読み込みには npTDMS が必要です（pip install npTDMS）。") from e
+    td = TdmsFile.read(path)
+    groups = td.groups()
+    cols = {}
+    for g in groups:
+        for chan in g.channels():
+            name = f"{g.name}/{chan.name}" if len(groups) > 1 else str(chan.name)
+            try:   # 波形属性があれば時間軸も作る（最初の1本だけ）
+                if "時間[s]" not in cols:
+                    cols["時間[s]"] = chan.time_track()
+            except (KeyError, ValueError):
+                pass
+            cols[name] = chan[:]
+    if not cols:
+        raise ValueError("TDMS内にチャンネルが見つかりません。")
+    return pd.DataFrame({k: pd.Series(v) for k, v in cols.items()})
+
+
+def _load_mdf(path):
+    """車載計測 MDF (.mf4/.mdf) を読む（要 asammdf）。"""
+    try:
+        from asammdf import MDF
+    except ImportError as e:
+        raise ValueError("MDF の読み込みには asammdf が必要です（pip install asammdf）。") from e
+    with MDF(path) as m:
+        df = m.to_dataframe()
+    df = df.reset_index()
+    if df.columns[0] in ("timestamps", "time", "index"):
+        df = df.rename(columns={df.columns[0]: "時間[s]"})
+    return df
+
+
+def _load_hdf5(path):
+    """HDF5 を読む。pandas形式（要 tables）→ 汎用h5py（1D/2D数値データセット）の順に試す。"""
+    try:
+        df = pd.read_hdf(path)
+        if hasattr(df, "to_frame"):
+            df = df.to_frame()
+        return df.reset_index(drop=False)
+    except Exception:
+        pass
+    try:
+        import h5py
+    except ImportError as e:
+        raise ValueError("HDF5 の読み込みには tables または h5py が必要です"
+                         "（pip install h5py）。") from e
+    cols = {}
+    with h5py.File(path, "r") as f:
+        def visit(name, obj):
+            if not isinstance(obj, h5py.Dataset) or obj.dtype.kind not in "fiu":
+                return
+            short = name.split("/")[-1]
+            key = short if short not in cols else name
+            if obj.ndim == 1:
+                cols[key] = obj[...]
+            elif obj.ndim == 2 and obj.shape[1] <= 64:   # 2Dは列に展開
+                arr = obj[...]
+                for j in range(arr.shape[1]):
+                    cols[f"{key}[{j}]"] = arr[:, j]
+        f.visititems(visit)
+    if not cols:
+        raise ValueError("HDF5 内に数値データセット（1D/2D）が見つかりません。")
+    return pd.DataFrame({k: pd.Series(v) for k, v in cols.items()})
+
+
+def load_table(path, encoding=None, delimiter=None, sheet=None):
+    """表・波形ファイルを読み込み (DataFrame, 使用encoding, 使用delimiter) を返す。
+
+    encoding / delimiter は CSV/TSV系のみ意味を持ち、None なら自動判定。
+    sheet は Excel のシート名/番号（None=先頭）。その他の形式は拡張子で自動判別。
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"ファイルが見つかりません: {path}")
 
-    # --- Excel（先頭シート）---
     ext = os.path.splitext(path)[1].lower()
+    # --- Excel ---
     if ext in (".xlsx", ".xlsm", ".xls"):
         try:
-            df = pd.read_excel(path)
+            df = pd.read_excel(path, sheet_name=sheet if sheet is not None else 0)
         except ImportError as e:
             if ext == ".xls":   # 旧形式 .xls は openpyxl では読めず xlrd が必要
                 raise ValueError('.xls の読み込みには xlrd が必要です'
@@ -168,6 +341,17 @@ def load_table(path, encoding=None, delimiter=None):
         if df.shape[1] == 0:
             raise ValueError("シートから列を読み取れませんでした。")
         return _normalize_columns(df), "excel", "excel"
+    # --- 波形・計測形式 ---
+    if ext == ".wav":
+        return _normalize_columns(_load_wav(path)), "wav", ""
+    if ext == ".raw":
+        return _normalize_columns(_load_ltspice_raw(path)), "ltspice", ""
+    if ext == ".tdms":
+        return _normalize_columns(_load_tdms(path)), "tdms", ""
+    if ext in (".mf4", ".mdf"):
+        return _normalize_columns(_load_mdf(path)), "mdf", ""
+    if ext in (".h5", ".hdf5"):
+        return _normalize_columns(_load_hdf5(path)), "hdf5", ""
 
     if encoding is None:
         encoding = detect_encoding(path)
