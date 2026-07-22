@@ -51,12 +51,32 @@ def is_internal_import(stripped):
     return False
 
 
-def build():
+DEFAULT_HEADER = (
+    "# -*- coding: utf-8 -*-\n"
+    '"""CSV / TSV / 波形 グラフ・オシロ解析ツール（単一ファイル版）。\n\n'
+    "全モジュールを結合した版。これ1ファイルだけで動作する（依存: requirements.txt）。\n"
+    "tools/build_onefile.py で再生成できる。使い方:  python graph_onefile.py\n"
+    '"""\n'
+)
+
+
+def build(out_path=None, header=None, transform=None, tail=""):
+    """モジュールを結合して単一ファイルを書き出す。
+
+    transform: (相対パス, ソース文字列) -> ソース文字列。結合前に各ファイルを
+        書き換えるフック（シンプル版ビルドで見た目テンプレートを削るのに使う）。
+    tail: 結合後の末尾に足すコード（エントリポイントの差し替え用）。
+    """
+    out_path = out_path or OUT
+    header = DEFAULT_HEADER if header is None else header
     external = []        # 外部importを順序付きでdedup
     body = []
     for rel in ORDER:
         path = os.path.join(ROOT, rel.replace("/", os.sep))
-        lines = open(path, encoding="utf-8").read().splitlines()
+        src = open(path, encoding="utf-8").read()
+        if transform is not None:
+            src = transform(rel, src)
+        lines = src.splitlines()
         i, paren_skip = 0, False
         while i < len(lines):
             line = lines[i]
@@ -101,17 +121,11 @@ def build():
     # 一括出力の並列(プロセスプール)は単一ファイルでは spawn が再帰起動するため無効化
     text = re.sub(r"BATCH_PARALLEL_THRESHOLD\s*=\s*\d+", "BATCH_PARALLEL_THRESHOLD = 10**9", text)
 
-    header = (
-        "# -*- coding: utf-8 -*-\n"
-        '"""CSV / TSV / 波形 グラフ・オシロ解析ツール（単一ファイル版）。\n\n'
-        "全モジュールを結合した版。これ1ファイルだけで動作する（依存: requirements.txt）。\n"
-        "tools/build_onefile.py で再生成できる。使い方:  python graph_onefile.py\n"
-        '"""\n'
-    )
-    out = header + "\n".join(external) + "\n\n" + text + "\n"
-    open(OUT, "w", encoding="utf-8").write(out)
-    print(f"出力: {OUT}")
+    out = header + "\n".join(external) + "\n\n" + text + "\n" + tail
+    open(out_path, "w", encoding="utf-8").write(out)
+    print(f"出力: {out_path}")
     print(f"結合: {len(ORDER)} モジュール / {out.count(chr(10)) + 1} 行 / {len(out) / 1024:.0f} KB / 外部import {len(external)} 種")
+    return out_path
 
 
 if __name__ == "__main__":
