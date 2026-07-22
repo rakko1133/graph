@@ -378,53 +378,54 @@ class StyleTableMixin:
             self._set_style(skey, "color", hexc)
             btn.setText(hexc); btn.setStyleSheet(f"background:{hexc};")
 
-    def _pick_bg_color(self):
-        """プロット領域の背景色を選ぶ（オシロ表示の濃色固定も上書きできる）。"""
-        col = QtWidgets.QColorDialog.getColor(parent=self)
-        if col.isValid():
-            self.bg_color = col.name()
-            self.bg_btn.setText("背景色: " + self.bg_color)
-            self.bg_btn.setStyleSheet(f"background:{self.bg_color};")
-            self._request_redraw()
+    # 「色を選ぶ／自動に戻す」ボタンの定義。attr=色を持つ属性名、
+    # btn=ボタンの属性名、prefix=ボタンに出す見出し。
+    # 背景色・近似曲線・塗りつぶしで同じ処理を3回書いていたのを1本にまとめた。
+    _COLOR_BUTTONS = {
+        "bg": ("bg_color", "bg_btn", "背景色: "),
+        "trend": ("trend_color", "trend_color_btn", "色: "),
+        "fill": ("fill_color", "fill_color_btn", "色: "),
+    }
 
-    def _reset_bg_color(self):
-        """背景色を自動（通常=白・オシロ=濃色）に戻す。"""
-        self.bg_color = ""
-        self.bg_btn.setText("背景色: 自動")
-        self.bg_btn.setStyleSheet("")
+    def pick_color(self, kind):
+        """色を選ぶ（キャンセルしたら何も変えない）。"""
+        attr, btn_name, prefix = self._COLOR_BUTTONS[kind]
+        col = QtWidgets.QColorDialog.getColor(parent=self)
+        if not col.isValid():
+            return
+        setattr(self, attr, col.name())
+        btn = getattr(self, btn_name)
+        btn.setText(prefix + col.name())
+        btn.setStyleSheet(f"background:{col.name()};")
         self._request_redraw()
 
-    def _pick_trend_color(self):
-        """近似曲線の色を選ぶ（空=自動: 各系列と同じ色）。"""
-        col = QtWidgets.QColorDialog.getColor(parent=self)
-        if col.isValid():
-            self.trend_color = col.name()
-            self.trend_color_btn.setText("色: " + self.trend_color)
-            self.trend_color_btn.setStyleSheet(f"background:{self.trend_color};")
-            self._request_redraw()
+    def reset_color(self, kind):
+        """色を自動に戻す（背景=白/オシロ濃色、近似・塗りつぶし=系列の色）。"""
+        attr, btn_name, prefix = self._COLOR_BUTTONS[kind]
+        setattr(self, attr, "")
+        btn = getattr(self, btn_name)
+        btn.setText(prefix + "自動")
+        btn.setStyleSheet("")
+        self._request_redraw()
+
+    def _wire_color_button(self, kind):
+        """色ボタンに「左クリック=選ぶ／右クリック=自動へ戻す」を配線する。"""
+        _attr, btn_name, _prefix = self._COLOR_BUTTONS[kind]
+        btn = getattr(self, btn_name)
+        btn.clicked.connect(lambda *_a, k=kind: self.pick_color(k))
+        btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        btn.customContextMenuRequested.connect(lambda *_a, k=kind: self.reset_color(k))
+        return btn
+
+    # 旧名（設定の復元・プリセット適用から呼ばれる）。中身は上の2本に委譲する。
+    def _reset_bg_color(self):
+        self.reset_color("bg")
 
     def _reset_trend_color(self):
-        """近似曲線の色を自動（系列と同じ色）に戻す。"""
-        self.trend_color = ""
-        self.trend_color_btn.setText("色: 自動")
-        self.trend_color_btn.setStyleSheet("")
-        self._request_redraw()
-
-    def _pick_fill_color(self):
-        """系列間塗りつぶしの色を選ぶ（空=自動: 系列Aの色）。"""
-        col = QtWidgets.QColorDialog.getColor(parent=self)
-        if col.isValid():
-            self.fill_color = col.name()
-            self.fill_color_btn.setText("色: " + self.fill_color)
-            self.fill_color_btn.setStyleSheet(f"background:{self.fill_color};")
-            self._request_redraw()
+        self.reset_color("trend")
 
     def _reset_fill_color(self):
-        """塗りつぶしの色を自動（系列Aの色）に戻す。"""
-        self.fill_color = ""
-        self.fill_color_btn.setText("色: 自動")
-        self.fill_color_btn.setStyleSheet("")
-        self._request_redraw()
+        self.reset_color("fill")
 
     # 純視覚スタイル（全再描画せず該当アーティストへ直接反映できるもの）
     _STYLE_VISUAL = frozenset({"color", "linewidth", "linestyle", "marker", "markersize"})

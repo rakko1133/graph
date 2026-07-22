@@ -967,6 +967,84 @@ def test_editions_remember_their_level_separately():
         QtCore.QSettings("graph-tool", "GraphApp").clear()
 
 
+def test_reload_keeps_generated_datasets():
+    """実体ファイルの無いデータに再読込しても消えないこと。
+
+    以前は datasets から先に取り除いてから読み直そうとしていたため、
+    貼り付け・数学チャンネル・フィット・PCA のデータが黙って消えていた。"""
+    w = _make_app(_wave())
+    w.datasets["Math: A+B"] = pd.DataFrame({"時間[s]": [0, 1], "A+B": [1.0, 2.0]})
+    w.meta["Math: A+B"] = {"path": "Math: A+B", "enc": "-", "delim": "-"}
+    w._add_file_item("Math: A+B")
+    w._refresh_columns()
+    for i in range(w.file_list.count()):
+        if w.file_list.item(i).text() == "Math: A+B":
+            w.file_list.setCurrentRow(i)
+            break
+    w.reload_current()
+    assert "Math: A+B" in w.datasets, "生成データが再読込で消えた"
+    assert w._find_file_item("Math: A+B") is not None
+    assert "再読込できません" in w.notify_bar.current_text()
+
+
+def test_register_dataset_is_shared():
+    """生成データの登録が共通口を通り、名前の重複も避けられること。"""
+    w = _make_app(_wave())
+    df = pd.DataFrame({"時間[s]": [0, 1], "値": [1.0, 2.0]})
+    a = w.register_dataset("Math: test", df, status="作成: {label}")
+    b = w.register_dataset("Math: test", df)
+    assert a == "Math: test" and b == "Math: test (2)"     # 重複を避ける
+    for label in (a, b):
+        assert label in w.datasets
+        assert w.meta[label]["path"] == label              # 実体なしの印
+        assert w._find_file_item(label) is not None
+    assert "作成: Math: test" in [m["text"] for m in w._message_log]
+
+
+def test_color_buttons_share_one_implementation():
+    """3つの色ボタンが同じ実装を通り、選択・自動戻しが効くこと。"""
+    w = _make_app(_wave())
+    for kind, attr, btn_name in (("bg", "bg_color", "bg_btn"),
+                                 ("trend", "trend_color", "trend_color_btn"),
+                                 ("fill", "fill_color", "fill_color_btn")):
+        setattr(w, attr, "#123456")
+        w.reset_color(kind)
+        assert getattr(w, attr) == ""
+        assert "自動" in getattr(w, btn_name).text()
+        assert getattr(w, btn_name).styleSheet() == ""
+    # 旧名（設定復元・プリセットから呼ばれる）も生きている
+    for legacy in ("_reset_bg_color", "_reset_trend_color", "_reset_fill_color"):
+        getattr(w, legacy)()
+
+
+def test_extension_list_has_one_source():
+    """対応拡張子の定義が1つで、ダイアログのフィルタと食い違わないこと。"""
+    import data_loader
+    w = _make_app(_wave())
+    assert w._ACCEPT_EXTS is data_loader.ACCEPT_EXTS
+    filt = data_loader.file_dialog_filter()
+    for ext in data_loader.ACCEPT_EXTS:
+        assert "*" + ext in filt, f"{ext} がファイルダイアログのフィルタに無い"
+    assert "*.net" in filt                      # 以前ここだけ抜けていた
+    assert set(data_loader.TABLE_EXTS) == set(data_loader.ACCEPT_EXTS) - set(
+        data_loader.RUNNABLE_EXTS)
+
+
+def test_dark_background_check_is_shared():
+    """地色の明暗判定が1本で、グラフ側とGUI側で食い違わないこと。"""
+    import plotter
+    import plotter_draw
+    assert not hasattr(plotter_draw, "_is_dark")     # 重複実装を消した
+    assert plotter.is_dark_bg("#000000") and not plotter.is_dark_bg("#ffffff")
+    assert plotter.is_dark_bg("不正な色名")          # 解釈できない色は暗い扱い（従来どおり）
+    # 輝度0.45〜0.5 の中間色でも、グラフの格子とGUIの文字色が同じ判断になる
+    mid = "#787878"
+    w = _make_app(_wave())
+    w.bg_color = mid
+    w.draw_graph()
+    assert plotter.is_dark_bg(mid) == (w.ax.get_xticklabels()[0].get_color() != "black")
+
+
 def test_command_palette_opens_with_all_commands():
     """コマンドパレットが開き、登録が全部 QAction であること。
 

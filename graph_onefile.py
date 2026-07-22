@@ -268,6 +268,33 @@ DELIMITER_LABELS = {
     "|": "パイプ ( | )",
 }
 
+# 扱える拡張子の一覧。**ここが唯一の定義**。
+# 以前は「ドラッグ&ドロップの受付」「ファイルダイアログのフィルタ文字列」
+# 「フォルダ読み込みの対象」が別々に書かれており、実際にダイアログのフィルタ
+# だけ .net が抜けていた（D&Dでは開けるのに、参照ボタンからは選べない）。
+EXT_GROUPS = (
+    ("CSV/TSV", (".csv", ".tsv", ".txt")),
+    ("Excel", (".xlsx", ".xls", ".xlsm")),
+    ("波形/計測", (".wav", ".raw", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5")),
+    ("LTspice回路", (".asc", ".net")),
+)
+# 読み込むのではなく「実行して結果を読む」もの（回路図・ネットリスト）
+RUNNABLE_EXTS = (".asc", ".net")
+# 受け付ける全拡張子
+ACCEPT_EXTS = tuple(e for _name, exts in EXT_GROUPS for e in exts)
+# 表データとして直接開ける拡張子（フォルダ一括読み込みの対象）
+TABLE_EXTS = tuple(e for e in ACCEPT_EXTS if e not in RUNNABLE_EXTS)
+
+
+def file_dialog_filter():
+    """QFileDialog 用のフィルタ文字列を EXT_GROUPS から組み立てる。"""
+    def pat(exts):
+        return " ".join("*" + e for e in exts)
+    parts = ["データ (" + pat(ACCEPT_EXTS) + ")"]
+    parts += [f"{name} ({pat(exts)})" for name, exts in EXT_GROUPS]
+    parts.append("すべて (*.*)")
+    return ";;".join(parts)
+
 
 def _japanese_score(text):
     """テキスト中の日本語文字数と、壊れた文字（私用領域・置換文字）数を返す。"""
@@ -681,6 +708,21 @@ def parse_eng(text, default=None):
         if ch in _ENG_MULT:
             return num * _ENG_MULT[ch]
     return num                       # 単位のみ（例 '2V'）は倍率なし
+
+
+def is_dark_bg(color, threshold=0.5):
+    """地色（名前/HEX）が暗いか。目盛り・グリッド・文字の色の自動切替に使う。
+
+    以前は plotter_draw（閾値0.45）と GUI 側（0.5）に別々の実装があり、
+    輝度が 0.45〜0.5 の中間色ではオシロの格子だけ「明るい地色」扱い、
+    文字は「暗い地色」扱いという食い違いが起きていた。判定は1本にする。
+    色を解釈できないときは暗い扱い（従来の挙動）。"""
+    try:
+        from matplotlib.colors import to_rgb
+        r, g, b = to_rgb(color)
+    except Exception:   # noqa: BLE001  未知の色指定は従来どおり暗い扱い
+        return True
+    return (0.299 * r + 0.587 * g + 0.114 * b) < threshold
 
 
 def eng_125_sequence(lo, hi, suffix=""):
@@ -1325,16 +1367,6 @@ def _draw_3d(ax, series, chart_type, fonts=None, data_labels=False, zlabel=""):
             _data_labels_3d(ax, x, y, z, st["color"], fs)
 
 
-def _is_dark(color):
-    """色（名前/HEX）が暗いか（相対輝度<0.45）。目盛り色などの自動切替に使う。"""
-    try:
-        from matplotlib.colors import to_rgb
-        r, g, b = to_rgb(color)
-        return (0.299 * r + 0.587 * g + 0.114 * b) < 0.45
-    except Exception:
-        return True
-
-
 def _apply_scope(ax, scope, bg_color=""):
     """オシロスコープ風の div グリッドと表示範囲を設定する。
 
@@ -1355,7 +1387,7 @@ def _apply_scope(ax, scope, bg_color=""):
     ax.set_xticks(np.linspace(x0, x1, xd + 1))
     ax.set_yticks(np.linspace(y0, y1, yd + 1))
     bg = bg_color or "#0b0f0b"
-    dark = _is_dark(bg)
+    dark = is_dark_bg(bg)
     ax.grid(True, which="major", color=("#888" if dark else "#aaa"),
             linestyle="-", linewidth=0.6, alpha=0.5)
     ax.set_facecolor(bg)
@@ -4862,10 +4894,7 @@ QToolBar { background:$title_bg; spacing:1px; }
             return
         try:
             face = self._effective_bg_color() or "white"
-            import matplotlib.colors as mcolors
-            r, g, b = mcolors.to_rgb(face)
-            dark_face = (0.299 * r + 0.587 * g + 0.114 * b) < 0.5
-            fg = "#e6e6e6" if dark_face else "black"
+            fg = "#e6e6e6" if is_dark_bg(face) else "black"   # 判定は plotter と共通
             fig.set_facecolor(face)
             for ax in fig.get_axes():
                 ax.tick_params(colors=fg, which="both")
@@ -6447,9 +6476,7 @@ QToolBar { background:$title_bg; spacing:1px; }
         self.bg_btn = QtWidgets.QPushButton("背景色: 自動")
         self.bg_btn.setToolTip("プロット領域の背景色。クリックで色を選択／右クリックで自動に戻す。\n"
                                "『自動』は通常=白・オシロ=濃色。オシロでも好きな色にできます。")
-        self.bg_btn.clicked.connect(self._pick_bg_color)
-        self.bg_btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.bg_btn.customContextMenuRequested.connect(lambda *_: self._reset_bg_color())
+        self._wire_color_button("bg")
         opt2.addWidget(self.bg_btn)
         opt.addStretch(1); opt2.addStretch(1)
         leg_v.addLayout(opt); leg_v.addLayout(opt2)
@@ -6523,9 +6550,7 @@ QToolBar { background:$title_bg; spacing:1px; }
         self.trend_color = ""
         self.trend_color_btn = QtWidgets.QPushButton("色: 自動")
         self.trend_color_btn.setToolTip("近似曲線の色。クリックで色を選択／右クリックで自動（系列と同じ色）に戻す。")
-        self.trend_color_btn.clicked.connect(self._pick_trend_color)
-        self.trend_color_btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.trend_color_btn.customContextMenuRequested.connect(lambda *_: self._reset_trend_color())
+        self._wire_color_button("trend")
         tl2.addWidget(self.trend_color_btn)
         self.trend_eq = QtWidgets.QCheckBox("数式/R²"); self.trend_eq.setChecked(True)
         tl2.addWidget(self.trend_eq)
@@ -6552,9 +6577,7 @@ QToolBar { background:$title_bg; spacing:1px; }
         self.fill_color = ""
         self.fill_color_btn = QtWidgets.QPushButton("色: 自動")
         self.fill_color_btn.setToolTip("塗りつぶしの色。クリックで選択／右クリックで自動（系列Aの色）に戻す。")
-        self.fill_color_btn.clicked.connect(self._pick_fill_color)
-        self.fill_color_btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.fill_color_btn.customContextMenuRequested.connect(lambda *_: self._reset_fill_color())
+        self._wire_color_button("fill")
         fl2.addWidget(self.fill_color_btn)
         fl2.addWidget(QtWidgets.QLabel("濃さ"))
         self.fill_alpha = QtWidgets.QDoubleSpinBox()
@@ -7491,9 +7514,8 @@ class DataIOMixin:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
-    _ACCEPT_EXTS = (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls",
-                    ".wav", ".raw", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5",
-                    ".asc", ".net")   # LTspice回路/ネットリスト（実行→.raw読込）
+    # 対応拡張子の定義は data_loader に一本化（D&D・ダイアログ・フォルダ読込で共通）
+    _ACCEPT_EXTS = ACCEPT_EXTS
 
     def dropEvent(self, event):
         paths = []
@@ -7510,10 +7532,7 @@ class DataIOMixin:
     def add_file(self):
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "ファイルを追加（複数選択可）", self.last_dir,
-            "データ (*.csv *.tsv *.txt *.xlsx *.xls *.xlsm *.wav *.raw *.tdms *.mf4 *.mdf *.h5 *.hdf5 *.asc);;"
-            "Excel (*.xlsx *.xls *.xlsm);;CSV/TSV (*.csv *.tsv *.txt);;"
-            "波形/計測 (*.wav *.raw *.tdms *.mf4 *.mdf *.h5 *.hdf5);;"
-            "LTspice回路 (*.asc *.net);;すべて (*.*)")
+            file_dialog_filter())
         if paths:
             self.last_dir = os.path.dirname(paths[-1])
             self._load_files_async(paths)
@@ -7578,6 +7597,30 @@ class DataIOMixin:
                     return None
         return {"path": path, "enc": enc, "delim": delim, "sheet": sheet}
 
+    def register_dataset(self, base_label, df, *, path=None, enc="-", delim="-",
+                         status=None):
+        """生成したデータを新しいデータセットとして登録する。
+
+        数学チャンネル・カーブフィット・PCA・クラスタリングなどが作った表を
+        取り込む共通口。同名があれば「(2)」を付けて重複を避け、ファイル一覧と
+        列一覧まで更新する。使う側は「何を作ったか」だけ書けばよい。
+
+        path を省くとラベルをそのまま入れる（＝ディスク上の実体は無い印。
+        reload_current はこれを見て再読込を断る）。
+        """
+        label, i = base_label, 2
+        while label in self.datasets:
+            label = f"{base_label} ({i})"
+            i += 1
+        self.datasets[label] = df
+        self.meta[label] = {"path": path if path is not None else label,
+                            "enc": enc, "delim": delim}
+        self._add_file_item(label)
+        self._refresh_columns()
+        if status:
+            self._set_status(status.format(label=label))
+        return label
+
     def _register_loaded(self, job, result):
         """読み込み結果をデータセットへ登録する（GUIスレッドで行う部分）。"""
         path, sheet = job["path"], job.get("sheet")
@@ -7599,7 +7642,7 @@ class DataIOMixin:
 
     def _load_file(self, path):
         """1ファイルを同期読み込みする（小さいファイル・スクリプト用の従来API）。"""
-        if os.path.splitext(path)[1].lower() in (".asc", ".net"):
+        if os.path.splitext(path)[1].lower() in RUNNABLE_EXTS:
             self.run_ltspice_asc(path)   # 回路図/ネットリストは実行→.raw読込
             return
         job = self._load_job(path)
@@ -7630,10 +7673,10 @@ class DataIOMixin:
         準備（シート選択）と登録だけをメインスレッドで行い、その間ウィンドウは
         操作可能なまま。進捗バーの「キャンセル」で途中中止できる。"""
         paths = list(paths)
-        for p in [p for p in paths if os.path.splitext(p)[1].lower() in (".asc", ".net")]:
+        for p in [p for p in paths if os.path.splitext(p)[1].lower() in RUNNABLE_EXTS]:
             self.run_ltspice_asc(p)       # 回路は別系統（QProcess）で非同期実行
         targets = [p for p in paths
-                   if os.path.splitext(p)[1].lower() not in (".asc", ".net")]
+                   if os.path.splitext(p)[1].lower() not in RUNNABLE_EXTS]
         jobs = []
         for p in targets:
             job = self._load_job(p)       # シート選択などはここで先に済ませる
@@ -7760,7 +7803,7 @@ class DataIOMixin:
             self._load_folder(d)
 
     def _load_folder(self, d):
-        exts = set(self._ACCEPT_EXTS) - {".asc", ".net"}   # 回路は誤爆実行を避けて除外
+        exts = set(TABLE_EXTS)   # 回路(.asc/.net)は誤爆実行を避けて除外
         try:
             names = sorted(os.listdir(d))
         except OSError as e:
@@ -8070,15 +8113,38 @@ class DataIOMixin:
             self._draw_placeholder()
 
     def reload_current(self):
+        """選択中のファイルをディスクから読み直す。
+
+        読み込み元の実体が無いデータ（クリップボード貼り付け・数学チャンネル・
+        フィット/PCA などの生成物）は再読込できない。以前はここで先に
+        datasets から取り除いてから読み直そうとしていたため、読み込みに
+        失敗した時点で**データが永久に消えていた**。先に確認してから外す。"""
         it = self.file_list.currentItem()
         if not it:
             self.notify("ファイルを選択してください。", "warn")
             return
-        path = self.meta[it.text()]["path"]
-        self.datasets.pop(it.text(), None)
-        self.meta.pop(it.text(), None)
-        self.file_list.takeItem(self.file_list.row(it))
+        label = it.text()
+        meta = dict(self.meta.get(label) or {})
+        path = meta.get("path", "")
+        if not path or not os.path.isfile(path):
+            self.notify(f"『{label}』は読み込み元のファイルが無いので再読込できません。",
+                        "warn",
+                        "貼り付けたデータや、数学チャンネル・カーブフィット・PCA などで"
+                        "作ったデータセットが該当します（データはそのまま残しました）。")
+            return
+        df = self.datasets.get(label)
+        row = self.file_list.row(it)
+        self.datasets.pop(label, None)
+        self.meta.pop(label, None)
+        self.file_list.takeItem(row)
         self._load_file(path)
+        if label not in self.datasets and df is not None:
+            # 読み直しに失敗した（ファイルが壊れた等）。元の内容へ戻す。
+            self.datasets[label] = df
+            self.meta[label] = meta
+            if not self._find_file_item(label):
+                self._add_file_item(label)
+            self.notify(f"『{label}』を読み直せなかったので、元の内容を残しました。", "warn")
         self._refresh_columns()
 
     def _on_file_selected(self, _row):
@@ -8778,53 +8844,54 @@ class StyleTableMixin:
             self._set_style(skey, "color", hexc)
             btn.setText(hexc); btn.setStyleSheet(f"background:{hexc};")
 
-    def _pick_bg_color(self):
-        """プロット領域の背景色を選ぶ（オシロ表示の濃色固定も上書きできる）。"""
-        col = QtWidgets.QColorDialog.getColor(parent=self)
-        if col.isValid():
-            self.bg_color = col.name()
-            self.bg_btn.setText("背景色: " + self.bg_color)
-            self.bg_btn.setStyleSheet(f"background:{self.bg_color};")
-            self._request_redraw()
+    # 「色を選ぶ／自動に戻す」ボタンの定義。attr=色を持つ属性名、
+    # btn=ボタンの属性名、prefix=ボタンに出す見出し。
+    # 背景色・近似曲線・塗りつぶしで同じ処理を3回書いていたのを1本にまとめた。
+    _COLOR_BUTTONS = {
+        "bg": ("bg_color", "bg_btn", "背景色: "),
+        "trend": ("trend_color", "trend_color_btn", "色: "),
+        "fill": ("fill_color", "fill_color_btn", "色: "),
+    }
 
-    def _reset_bg_color(self):
-        """背景色を自動（通常=白・オシロ=濃色）に戻す。"""
-        self.bg_color = ""
-        self.bg_btn.setText("背景色: 自動")
-        self.bg_btn.setStyleSheet("")
+    def pick_color(self, kind):
+        """色を選ぶ（キャンセルしたら何も変えない）。"""
+        attr, btn_name, prefix = self._COLOR_BUTTONS[kind]
+        col = QtWidgets.QColorDialog.getColor(parent=self)
+        if not col.isValid():
+            return
+        setattr(self, attr, col.name())
+        btn = getattr(self, btn_name)
+        btn.setText(prefix + col.name())
+        btn.setStyleSheet(f"background:{col.name()};")
         self._request_redraw()
 
-    def _pick_trend_color(self):
-        """近似曲線の色を選ぶ（空=自動: 各系列と同じ色）。"""
-        col = QtWidgets.QColorDialog.getColor(parent=self)
-        if col.isValid():
-            self.trend_color = col.name()
-            self.trend_color_btn.setText("色: " + self.trend_color)
-            self.trend_color_btn.setStyleSheet(f"background:{self.trend_color};")
-            self._request_redraw()
+    def reset_color(self, kind):
+        """色を自動に戻す（背景=白/オシロ濃色、近似・塗りつぶし=系列の色）。"""
+        attr, btn_name, prefix = self._COLOR_BUTTONS[kind]
+        setattr(self, attr, "")
+        btn = getattr(self, btn_name)
+        btn.setText(prefix + "自動")
+        btn.setStyleSheet("")
+        self._request_redraw()
+
+    def _wire_color_button(self, kind):
+        """色ボタンに「左クリック=選ぶ／右クリック=自動へ戻す」を配線する。"""
+        _attr, btn_name, _prefix = self._COLOR_BUTTONS[kind]
+        btn = getattr(self, btn_name)
+        btn.clicked.connect(lambda *_a, k=kind: self.pick_color(k))
+        btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        btn.customContextMenuRequested.connect(lambda *_a, k=kind: self.reset_color(k))
+        return btn
+
+    # 旧名（設定の復元・プリセット適用から呼ばれる）。中身は上の2本に委譲する。
+    def _reset_bg_color(self):
+        self.reset_color("bg")
 
     def _reset_trend_color(self):
-        """近似曲線の色を自動（系列と同じ色）に戻す。"""
-        self.trend_color = ""
-        self.trend_color_btn.setText("色: 自動")
-        self.trend_color_btn.setStyleSheet("")
-        self._request_redraw()
-
-    def _pick_fill_color(self):
-        """系列間塗りつぶしの色を選ぶ（空=自動: 系列Aの色）。"""
-        col = QtWidgets.QColorDialog.getColor(parent=self)
-        if col.isValid():
-            self.fill_color = col.name()
-            self.fill_color_btn.setText("色: " + self.fill_color)
-            self.fill_color_btn.setStyleSheet(f"background:{self.fill_color};")
-            self._request_redraw()
+        self.reset_color("trend")
 
     def _reset_fill_color(self):
-        """塗りつぶしの色を自動（系列Aの色）に戻す。"""
-        self.fill_color = ""
-        self.fill_color_btn.setText("色: 自動")
-        self.fill_color_btn.setStyleSheet("")
-        self._request_redraw()
+        self.reset_color("fill")
 
     # 純視覚スタイル（全再描画せず該当アーティストへ直接反映できるもの）
     _STYLE_VISUAL = frozenset({"color", "linewidth", "linestyle", "marker", "markersize"})
@@ -10742,15 +10809,9 @@ class AdvancedMixin:
             QtWidgets.QMessageBox.critical(self, "演算エラー", str(e)); return
         import pandas as pd
         col = f"{op}"
-        label = f"Math: {op}"
-        base, i = label, 2
-        while label in self.datasets:
-            label = f"{base} ({i})"; i += 1
-        self.datasets[label] = pd.DataFrame({"時間[s]": x, col: r})
-        self.meta[label] = {"path": label, "enc": "-", "delim": "-"}
-        self._add_file_item(label)
-        self._refresh_columns()
-        self._set_status(f"数学チャンネルを作成: {label} ▸ {col}")
+        self.register_dataset(f"Math: {op}",
+                              pd.DataFrame({"時間[s]": x, col: r}),
+                              status=f"数学チャンネルを作成: {{label}} ▸ {col}")
 
     def create_math_expr(self):
         """任意数式（A,B,VAR1,VAR2,t と許可関数）で新チャンネルを作成。"""
@@ -10776,15 +10837,9 @@ class AdvancedMixin:
         except Exception as e:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "数式エラー", str(e))
             return
-        label = f"Expr: {expr[:24]}"
-        base, i = label, 2
-        while label in self.datasets:
-            label = f"{base} ({i})"; i += 1
-        self.datasets[label] = pd.DataFrame({"時間[s]": ta, "結果": r})
-        self.meta[label] = {"path": label, "enc": "-", "delim": "-"}
-        self._add_file_item(label)
-        self._refresh_columns()
-        self._set_status(f"数式チャンネルを作成: {label}")
+        self.register_dataset(f"Expr: {expr[:24]}",
+                              pd.DataFrame({"時間[s]": ta, "結果": r}),
+                              status="数式チャンネルを作成: {label}")
 
     def show_param_stats(self):
         """解析対象チャンネルのサイクル統計表＋パラメータ間演算を別ウィンドウで表示。"""
@@ -11424,16 +11479,10 @@ class DataSciMixin:
             import pandas as pd
             xname = self.x_combo.currentText() or "x"
             df = pd.DataFrame({xname: d["x"], f"fit({disp})": d["yfit"]})
-            base = f"FIT: {disp}"
-            label, i = base, 2
-            while label in self.datasets:
-                label = f"{base} ({i})"; i += 1
-            self.datasets[label] = df
-            self.meta[label] = {"path": label, "enc": "-", "delim": "-"}
-            self._add_file_item(label)
-            self._refresh_columns()
-            self._set_status(f"フィット完了: R²={f(d['r2'])}。曲線を『{label}』として追加しました"
-                             "（ツリーでチェックすると重ね描きできます）。")
+            self.register_dataset(
+                f"FIT: {disp}", df,
+                status=(f"フィット完了: R²={f(d['r2'])}。曲線を『{{label}}』として追加しました"
+                        "（ツリーでチェックすると重ね描きできます）。"))
         else:
             self._set_status(f"フィット完了: R²={f(d['r2'])}")
 
@@ -11531,14 +11580,8 @@ class DataSciMixin:
         import pandas as pd
         df = pd.DataFrame({name: arr for name, arr in res["scores"]})
         src = items[0][0]
-        base = f"PCA: {os.path.splitext(os.path.basename(str(src)))[0]}"
-        label, i = base, 2
-        while label in self.datasets:
-            label = f"{base} ({i})"; i += 1
-        self.datasets[label] = df
-        self.meta[label] = {"path": label, "enc": "-", "delim": "-"}
-        self._add_file_item(label)
-        self._refresh_columns()
+        label = self.register_dataset(
+            f"PCA: {os.path.splitext(os.path.basename(str(src)))[0]}", df)
 
         f = self._fmt
         rows = [("使用した特徴量", ", ".join(res["features"])),

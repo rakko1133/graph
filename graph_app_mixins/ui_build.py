@@ -437,10 +437,7 @@ QToolBar { background:$title_bg; spacing:1px; }
             return
         try:
             face = self._effective_bg_color() or "white"
-            import matplotlib.colors as mcolors
-            r, g, b = mcolors.to_rgb(face)
-            dark_face = (0.299 * r + 0.587 * g + 0.114 * b) < 0.5
-            fg = "#e6e6e6" if dark_face else "black"
+            fg = "#e6e6e6" if plotter.is_dark_bg(face) else "black"   # 判定は plotter と共通
             fig.set_facecolor(face)
             for ax in fig.get_axes():
                 ax.tick_params(colors=fg, which="both")
@@ -2022,9 +2019,7 @@ QToolBar { background:$title_bg; spacing:1px; }
         self.bg_btn = QtWidgets.QPushButton("背景色: 自動")
         self.bg_btn.setToolTip("プロット領域の背景色。クリックで色を選択／右クリックで自動に戻す。\n"
                                "『自動』は通常=白・オシロ=濃色。オシロでも好きな色にできます。")
-        self.bg_btn.clicked.connect(self._pick_bg_color)
-        self.bg_btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.bg_btn.customContextMenuRequested.connect(lambda *_: self._reset_bg_color())
+        self._wire_color_button("bg")
         opt2.addWidget(self.bg_btn)
         opt.addStretch(1); opt2.addStretch(1)
         leg_v.addLayout(opt); leg_v.addLayout(opt2)
@@ -2098,9 +2093,7 @@ QToolBar { background:$title_bg; spacing:1px; }
         self.trend_color = ""
         self.trend_color_btn = QtWidgets.QPushButton("色: 自動")
         self.trend_color_btn.setToolTip("近似曲線の色。クリックで色を選択／右クリックで自動（系列と同じ色）に戻す。")
-        self.trend_color_btn.clicked.connect(self._pick_trend_color)
-        self.trend_color_btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.trend_color_btn.customContextMenuRequested.connect(lambda *_: self._reset_trend_color())
+        self._wire_color_button("trend")
         tl2.addWidget(self.trend_color_btn)
         self.trend_eq = QtWidgets.QCheckBox("数式/R²"); self.trend_eq.setChecked(True)
         tl2.addWidget(self.trend_eq)
@@ -2127,9 +2120,7 @@ QToolBar { background:$title_bg; spacing:1px; }
         self.fill_color = ""
         self.fill_color_btn = QtWidgets.QPushButton("色: 自動")
         self.fill_color_btn.setToolTip("塗りつぶしの色。クリックで選択／右クリックで自動（系列Aの色）に戻す。")
-        self.fill_color_btn.clicked.connect(self._pick_fill_color)
-        self.fill_color_btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.fill_color_btn.customContextMenuRequested.connect(lambda *_: self._reset_fill_color())
+        self._wire_color_button("fill")
         fl2.addWidget(self.fill_color_btn)
         fl2.addWidget(QtWidgets.QLabel("濃さ"))
         self.fill_alpha = QtWidgets.QDoubleSpinBox()

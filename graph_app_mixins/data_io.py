@@ -9,9 +9,8 @@ class DataIOMixin:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
-    _ACCEPT_EXTS = (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls",
-                    ".wav", ".raw", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5",
-                    ".asc", ".net")   # LTspice回路/ネットリスト（実行→.raw読込）
+    # 対応拡張子の定義は data_loader に一本化（D&D・ダイアログ・フォルダ読込で共通）
+    _ACCEPT_EXTS = data_loader.ACCEPT_EXTS
 
     def dropEvent(self, event):
         paths = []
@@ -28,10 +27,7 @@ class DataIOMixin:
     def add_file(self):
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "ファイルを追加（複数選択可）", self.last_dir,
-            "データ (*.csv *.tsv *.txt *.xlsx *.xls *.xlsm *.wav *.raw *.tdms *.mf4 *.mdf *.h5 *.hdf5 *.asc);;"
-            "Excel (*.xlsx *.xls *.xlsm);;CSV/TSV (*.csv *.tsv *.txt);;"
-            "波形/計測 (*.wav *.raw *.tdms *.mf4 *.mdf *.h5 *.hdf5);;"
-            "LTspice回路 (*.asc *.net);;すべて (*.*)")
+            data_loader.file_dialog_filter())
         if paths:
             self.last_dir = os.path.dirname(paths[-1])
             self._load_files_async(paths)
@@ -96,6 +92,30 @@ class DataIOMixin:
                     return None
         return {"path": path, "enc": enc, "delim": delim, "sheet": sheet}
 
+    def register_dataset(self, base_label, df, *, path=None, enc="-", delim="-",
+                         status=None):
+        """生成したデータを新しいデータセットとして登録する。
+
+        数学チャンネル・カーブフィット・PCA・クラスタリングなどが作った表を
+        取り込む共通口。同名があれば「(2)」を付けて重複を避け、ファイル一覧と
+        列一覧まで更新する。使う側は「何を作ったか」だけ書けばよい。
+
+        path を省くとラベルをそのまま入れる（＝ディスク上の実体は無い印。
+        reload_current はこれを見て再読込を断る）。
+        """
+        label, i = base_label, 2
+        while label in self.datasets:
+            label = f"{base_label} ({i})"
+            i += 1
+        self.datasets[label] = df
+        self.meta[label] = {"path": path if path is not None else label,
+                            "enc": enc, "delim": delim}
+        self._add_file_item(label)
+        self._refresh_columns()
+        if status:
+            self._set_status(status.format(label=label))
+        return label
+
     def _register_loaded(self, job, result):
         """読み込み結果をデータセットへ登録する（GUIスレッドで行う部分）。"""
         path, sheet = job["path"], job.get("sheet")
@@ -117,7 +137,7 @@ class DataIOMixin:
 
     def _load_file(self, path):
         """1ファイルを同期読み込みする（小さいファイル・スクリプト用の従来API）。"""
-        if os.path.splitext(path)[1].lower() in (".asc", ".net"):
+        if os.path.splitext(path)[1].lower() in data_loader.RUNNABLE_EXTS:
             self.run_ltspice_asc(path)   # 回路図/ネットリストは実行→.raw読込
             return
         job = self._load_job(path)
@@ -148,10 +168,10 @@ class DataIOMixin:
         準備（シート選択）と登録だけをメインスレッドで行い、その間ウィンドウは
         操作可能なまま。進捗バーの「キャンセル」で途中中止できる。"""
         paths = list(paths)
-        for p in [p for p in paths if os.path.splitext(p)[1].lower() in (".asc", ".net")]:
+        for p in [p for p in paths if os.path.splitext(p)[1].lower() in data_loader.RUNNABLE_EXTS]:
             self.run_ltspice_asc(p)       # 回路は別系統（QProcess）で非同期実行
         targets = [p for p in paths
-                   if os.path.splitext(p)[1].lower() not in (".asc", ".net")]
+                   if os.path.splitext(p)[1].lower() not in data_loader.RUNNABLE_EXTS]
         jobs = []
         for p in targets:
             job = self._load_job(p)       # シート選択などはここで先に済ませる
@@ -278,7 +298,7 @@ class DataIOMixin:
             self._load_folder(d)
 
     def _load_folder(self, d):
-        exts = set(self._ACCEPT_EXTS) - {".asc", ".net"}   # 回路は誤爆実行を避けて除外
+        exts = set(data_loader.TABLE_EXTS)   # 回路(.asc/.net)は誤爆実行を避けて除外
         try:
             names = sorted(os.listdir(d))
         except OSError as e:
@@ -588,15 +608,38 @@ class DataIOMixin:
             self._draw_placeholder()
 
     def reload_current(self):
+        """選択中のファイルをディスクから読み直す。
+
+        読み込み元の実体が無いデータ（クリップボード貼り付け・数学チャンネル・
+        フィット/PCA などの生成物）は再読込できない。以前はここで先に
+        datasets から取り除いてから読み直そうとしていたため、読み込みに
+        失敗した時点で**データが永久に消えていた**。先に確認してから外す。"""
         it = self.file_list.currentItem()
         if not it:
             self.notify("ファイルを選択してください。", "warn")
             return
-        path = self.meta[it.text()]["path"]
-        self.datasets.pop(it.text(), None)
-        self.meta.pop(it.text(), None)
-        self.file_list.takeItem(self.file_list.row(it))
+        label = it.text()
+        meta = dict(self.meta.get(label) or {})
+        path = meta.get("path", "")
+        if not path or not os.path.isfile(path):
+            self.notify(f"『{label}』は読み込み元のファイルが無いので再読込できません。",
+                        "warn",
+                        "貼り付けたデータや、数学チャンネル・カーブフィット・PCA などで"
+                        "作ったデータセットが該当します（データはそのまま残しました）。")
+            return
+        df = self.datasets.get(label)
+        row = self.file_list.row(it)
+        self.datasets.pop(label, None)
+        self.meta.pop(label, None)
+        self.file_list.takeItem(row)
         self._load_file(path)
+        if label not in self.datasets and df is not None:
+            # 読み直しに失敗した（ファイルが壊れた等）。元の内容へ戻す。
+            self.datasets[label] = df
+            self.meta[label] = meta
+            if not self._find_file_item(label):
+                self._add_file_item(label)
+            self.notify(f"『{label}』を読み直せなかったので、元の内容を残しました。", "warn")
         self._refresh_columns()
 
     def _on_file_selected(self, _row):

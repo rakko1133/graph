@@ -48,15 +48,9 @@ class AdvancedMixin:
             QtWidgets.QMessageBox.critical(self, "演算エラー", str(e)); return
         import pandas as pd
         col = f"{op}"
-        label = f"Math: {op}"
-        base, i = label, 2
-        while label in self.datasets:
-            label = f"{base} ({i})"; i += 1
-        self.datasets[label] = pd.DataFrame({"時間[s]": x, col: r})
-        self.meta[label] = {"path": label, "enc": "-", "delim": "-"}
-        self._add_file_item(label)
-        self._refresh_columns()
-        self._set_status(f"数学チャンネルを作成: {label} ▸ {col}")
+        self.register_dataset(f"Math: {op}",
+                              pd.DataFrame({"時間[s]": x, col: r}),
+                              status=f"数学チャンネルを作成: {{label}} ▸ {col}")
 
     def create_math_expr(self):
         """任意数式（A,B,VAR1,VAR2,t と許可関数）で新チャンネルを作成。"""
@@ -82,15 +76,9 @@ class AdvancedMixin:
         except Exception as e:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "数式エラー", str(e))
             return
-        label = f"Expr: {expr[:24]}"
-        base, i = label, 2
-        while label in self.datasets:
-            label = f"{base} ({i})"; i += 1
-        self.datasets[label] = pd.DataFrame({"時間[s]": ta, "結果": r})
-        self.meta[label] = {"path": label, "enc": "-", "delim": "-"}
-        self._add_file_item(label)
-        self._refresh_columns()
-        self._set_status(f"数式チャンネルを作成: {label}")
+        self.register_dataset(f"Expr: {expr[:24]}",
+                              pd.DataFrame({"時間[s]": ta, "結果": r}),
+                              status="数式チャンネルを作成: {label}")
 
     def show_param_stats(self):
         """解析対象チャンネルのサイクル統計表＋パラメータ間演算を別ウィンドウで表示。"""

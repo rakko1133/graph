@@ -234,16 +234,10 @@ class DataSciMixin:
             import pandas as pd
             xname = self.x_combo.currentText() or "x"
             df = pd.DataFrame({xname: d["x"], f"fit({disp})": d["yfit"]})
-            base = f"FIT: {disp}"
-            label, i = base, 2
-            while label in self.datasets:
-                label = f"{base} ({i})"; i += 1
-            self.datasets[label] = df
-            self.meta[label] = {"path": label, "enc": "-", "delim": "-"}
-            self._add_file_item(label)
-            self._refresh_columns()
-            self._set_status(f"フィット完了: R²={f(d['r2'])}。曲線を『{label}』として追加しました"
-                             "（ツリーでチェックすると重ね描きできます）。")
+            self.register_dataset(
+                f"FIT: {disp}", df,
+                status=(f"フィット完了: R²={f(d['r2'])}。曲線を『{{label}}』として追加しました"
+                        "（ツリーでチェックすると重ね描きできます）。"))
         else:
             self._set_status(f"フィット完了: R²={f(d['r2'])}")
 
@@ -341,14 +335,8 @@ class DataSciMixin:
         import pandas as pd
         df = pd.DataFrame({name: arr for name, arr in res["scores"]})
         src = items[0][0]
-        base = f"PCA: {os.path.splitext(os.path.basename(str(src)))[0]}"
-        label, i = base, 2
-        while label in self.datasets:
-            label = f"{base} ({i})"; i += 1
-        self.datasets[label] = df
-        self.meta[label] = {"path": label, "enc": "-", "delim": "-"}
-        self._add_file_item(label)
-        self._refresh_columns()
+        label = self.register_dataset(
+            f"PCA: {os.path.splitext(os.path.basename(str(src)))[0]}", df)
 
         f = self._fmt
         rows = [("使用した特徴量", ", ".join(res["features"])),

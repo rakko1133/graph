@@ -27,6 +27,33 @@ DELIMITER_LABELS = {
     "|": "パイプ ( | )",
 }
 
+# 扱える拡張子の一覧。**ここが唯一の定義**。
+# 以前は「ドラッグ&ドロップの受付」「ファイルダイアログのフィルタ文字列」
+# 「フォルダ読み込みの対象」が別々に書かれており、実際にダイアログのフィルタ
+# だけ .net が抜けていた（D&Dでは開けるのに、参照ボタンからは選べない）。
+EXT_GROUPS = (
+    ("CSV/TSV", (".csv", ".tsv", ".txt")),
+    ("Excel", (".xlsx", ".xls", ".xlsm")),
+    ("波形/計測", (".wav", ".raw", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5")),
+    ("LTspice回路", (".asc", ".net")),
+)
+# 読み込むのではなく「実行して結果を読む」もの（回路図・ネットリスト）
+RUNNABLE_EXTS = (".asc", ".net")
+# 受け付ける全拡張子
+ACCEPT_EXTS = tuple(e for _name, exts in EXT_GROUPS for e in exts)
+# 表データとして直接開ける拡張子（フォルダ一括読み込みの対象）
+TABLE_EXTS = tuple(e for e in ACCEPT_EXTS if e not in RUNNABLE_EXTS)
+
+
+def file_dialog_filter():
+    """QFileDialog 用のフィルタ文字列を EXT_GROUPS から組み立てる。"""
+    def pat(exts):
+        return " ".join("*" + e for e in exts)
+    parts = ["データ (" + pat(ACCEPT_EXTS) + ")"]
+    parts += [f"{name} ({pat(exts)})" for name, exts in EXT_GROUPS]
+    parts.append("すべて (*.*)")
+    return ";;".join(parts)
+
 
 def _japanese_score(text):
     """テキスト中の日本語文字数と、壊れた文字（私用領域・置換文字）数を返す。"""
