@@ -1,0 +1,874 @@
+{
+ "NaN混入": {
+  "advanced.auto_threshold": 0.0,
+  "advanced.crossings.both.head": [
+   0.0005,
+   0.001,
+   0.0015,
+   0.002,
+   0.003
+  ],
+  "advanced.crossings.both.n": 19,
+  "advanced.crossings.falling.head": [
+   0.0005,
+   0.0015,
+   "nan",
+   0.0035,
+   0.0045000000000000005
+  ],
+  "advanced.crossings.falling.n": 10,
+  "advanced.crossings.rising.head": [
+   0.001,
+   0.002,
+   0.003,
+   0.004,
+   0.005
+  ],
+  "advanced.crossings.rising.n": 9,
+  "cycle_stats": {
+   "cc_jitter": 2.868529319312601e-19,
+   "cycle_mean": 0.0008206332396004817,
+   "cycle_rms": 0.7090363767880183
+  },
+  "dominant_frequency": null,
+  "edge_intervals": {
+   "fall_to_fall": "nan",
+   "fall_to_rise": 0.0004999999999999998,
+   "rise_to_fall": 0.0006111111111111114,
+   "rise_to_rise": 0.001
+  },
+  "fft.len": 1001,
+  "fft.peak_amp": "nan",
+  "fft.peak_freq": 0.0,
+  "harmonic_search": [],
+  "histogram_top_base": [
+   0.99609375,
+   -0.99609375
+  ],
+  "measure.+デューティ比": 50.250138966092294,
+  "measure.+パルス幅": 0.0005022222222222225,
+  "measure.-デューティ比": 49.749861033907706,
+  "measure.-パルス幅": 0.000497222222222222,
+  "measure.Base": -0.99609375,
+  "measure.Cycle-Cycleジッタ": 2.868529319312601e-19,
+  "measure.P-P値 Vpp": 2.0,
+  "measure.Time@Max": 0.00025,
+  "measure.Time@Min": 0.00075,
+  "measure.Top": 0.99609375,
+  "measure.±1σ以内": 50.77850326469111,
+  "measure.±2σ以内": 100.0,
+  "measure.±3σ以内": 100.0,
+  "measure.アンダーシュート": 0.19607843137254902,
+  "measure.オーバーシュート": 0.19607843137254902,
+  "measure.サイクルRMS": 0.7090363767880183,
+  "measure.サイクル平均": 0.0008206332396004817,
+  "measure.サイクル数": 9.0,
+  "measure.サンプリング周波数": 200000.00000000815,
+  "measure.サンプル数": 2001.0,
+  "measure.スルーレート(立上り最大)": 6282.151815626235,
+  "measure.スルーレート(立下り最大)": -6282.151815626235,
+  "measure.デューティ誤差(50%基準)": 0.2501389660922939,
+  "measure.リプル(AC RMS)": 0.7086048800576995,
+  "measure.中央値 Median": -2.4492935982947064e-16,
+  "measure.周期": 0.001,
+  "measure.周波数(FFT)": null,
+  "measure.周波数(ゼロ交差)": 1000.0,
+  "measure.実効値 Vrms": 0.7086052305783966,
+  "measure.平均 Vmean": 0.0007048130787126255,
+  "measure.振幅 Vamp(Top-Base)": 1.9921875,
+  "measure.最大値 Vmax": 1.0,
+  "measure.最小値 Vmin": -1.0,
+  "measure.最頻ビン点数 PEAKHits": 70.0,
+  "measure.標準偏差 σ": 0.7086048800576995,
+  "measure.立上り→立上り": 0.001,
+  "measure.立上り→立下り(High幅)": 0.0006111111111111114,
+  "measure.立上りエッジ数": 9.0,
+  "measure.立上り時間 (10-90%)": 0.0002950000000000001,
+  "measure.立下り→立上り(Low幅)": 0.0004999999999999998,
+  "measure.立下り→立下り": "nan",
+  "measure.立下り時間 (90-10%)": 0.000295,
+  "measure.面積 ∫y dt": 7.625831616371072e-08,
+  "occupied_bandwidth": 0.0,
+  "pulse_metrics": {
+   "cycles": 9.0,
+   "neg_duty": 49.749861033907706,
+   "neg_width": 0.000497222222222222,
+   "pos_duty": 50.250138966092294,
+   "pos_width": 0.0005022222222222225,
+   "rising_edges": 9.0
+  },
+  "slew_rate": {
+   "fall": -6282.151815626235,
+   "rise": 6282.151815626235
+  },
+  "spectrum_metrics": {}
+ },
+ "PWM25%": {
+  "advanced.auto_threshold": 0.0,
+  "advanced.crossings.both.head": [
+   0.0002475,
+   0.0009975000000000001,
+   0.0012475,
+   0.0019975,
+   0.0022475000000000004
+  ],
+  "advanced.crossings.both.n": 20,
+  "advanced.crossings.falling.head": [
+   0.0002475,
+   0.0012475,
+   0.0022475000000000004,
+   0.0032475000000000004,
+   0.0042475
+  ],
+  "advanced.crossings.falling.n": 10,
+  "advanced.crossings.rising.head": [
+   0.0009975000000000001,
+   0.0019975,
+   0.0029975,
+   0.0039975,
+   0.0049975
+  ],
+  "advanced.crossings.rising.n": 10,
+  "cycle_stats": {
+   "cc_jitter": 6.765412868786562e-19,
+   "cycle_mean": -0.5,
+   "cycle_rms": 1.0
+  },
+  "dominant_frequency": 999.5002498751032,
+  "edge_intervals": {
+   "fall_to_fall": 0.001,
+   "fall_to_rise": 0.0007499999999999998,
+   "rise_to_fall": 0.00025000000000000017,
+   "rise_to_rise": 0.001
+  },
+  "fft.len": 1001,
+  "fft.peak_amp": 0.9003364114362766,
+  "fft.peak_freq": 999.5002498751032,
+  "harmonic_search": [
+   {
+    "amplitude": 0.9003364114362766,
+    "frequency": 999.5002498751032,
+    "harmonic": 1.0
+   },
+   {
+    "amplitude": 0.6366874122268382,
+    "frequency": 1999.0004997502065,
+    "harmonic": 2.0
+   },
+   {
+    "amplitude": 0.3001796403815205,
+    "frequency": 2998.5007496253097,
+    "harmonic": 3.0
+   }
+  ],
+  "histogram_top_base": [
+   0.99609375,
+   -0.99609375
+  ],
+  "measure.+デューティ比": 25.00000000000001,
+  "measure.+パルス幅": 0.0002500000000000001,
+  "measure.-デューティ比": 75.0,
+  "measure.-パルス幅": 0.00075,
+  "measure.Base": -0.99609375,
+  "measure.Cycle-Cycleジッタ": 6.765412868786562e-19,
+  "measure.P-P値 Vpp": 2.0,
+  "measure.Time@Max": 0.0,
+  "measure.Time@Min": 0.00025,
+  "measure.Top": 0.99609375,
+  "measure.±1σ以内": 74.96251874062968,
+  "measure.±2σ以内": 100.0,
+  "measure.±3σ以内": 100.0,
+  "measure.アンダーシュート": 0.19607843137254902,
+  "measure.オーバーシュート": 0.19607843137254902,
+  "measure.サイクルRMS": 1.0,
+  "measure.サイクル平均": -0.5,
+  "measure.サイクル数": 10.0,
+  "measure.サンプリング周波数": 200000.00000000815,
+  "measure.サンプル数": 2001.0,
+  "measure.スルーレート(立上り最大)": 400000.0000000163,
+  "measure.スルーレート(立下り最大)": -400000.0000000163,
+  "measure.デューティ誤差(50%基準)": -24.99999999999999,
+  "measure.リプル(AC RMS)": 0.8664577677241315,
+  "measure.中央値 Median": -1.0,
+  "measure.周期": 0.001,
+  "measure.周波数(FFT)": 999.5002498751032,
+  "measure.周波数(ゼロ交差)": 1000.0,
+  "measure.実効値 Vrms": 1.0,
+  "measure.平均 Vmean": -0.4992503748125937,
+  "measure.振幅 Vamp(Top-Base)": 1.9921875,
+  "measure.最大値 Vmax": 1.0,
+  "measure.最小値 Vmin": -1.0,
+  "measure.最頻ビン点数 PEAKHits": 1500.0,
+  "measure.標準偏差 σ": 0.8664577677241315,
+  "measure.立上り→立上り": 0.001,
+  "measure.立上り→立下り(High幅)": 0.00025000000000000017,
+  "measure.立上りエッジ数": 10.0,
+  "measure.立上り時間 (10-90%)": 0.0010000000000000002,
+  "measure.立下り→立上り(Low幅)": 0.0007499999999999998,
+  "measure.立下り→立下り": 0.001,
+  "measure.立下り時間 (90-10%)": 0.001,
+  "measure.面積 ∫y dt": -0.0049999999999999975,
+  "occupied_bandwidth": 65067.46626686921,
+  "pulse_metrics": {
+   "cycles": 10.0,
+   "neg_duty": 75.0,
+   "neg_width": 0.00075,
+   "pos_duty": 25.00000000000001,
+   "pos_width": 0.0002500000000000001,
+   "rising_edges": 10.0
+  },
+  "slew_rate": {
+   "fall": -400000.0000000163,
+   "rise": 400000.0000000163
+  },
+  "spectrum_metrics": {
+   "ENOB_bits": -0.1754526529085373,
+   "SFDR_dB": 4.772819193663548,
+   "SINAD_dB": 0.7037750294906054,
+   "SNR_dB": 8.43764126058545,
+   "THD_dB": -1.5051797942473644,
+   "THD_pct": 84.0893528725733,
+   "f0": 999.5002498751032
+  }
+ },
+ "台形波": {
+  "advanced.auto_threshold": 0.0,
+  "advanced.crossings.both.head": [
+   0.0005,
+   0.001,
+   0.0015,
+   0.002,
+   0.0025
+  ],
+  "advanced.crossings.both.n": 19,
+  "advanced.crossings.falling.head": [
+   0.0005,
+   0.0015,
+   0.0025,
+   0.0035,
+   0.0045000000000000005
+  ],
+  "advanced.crossings.falling.n": 10,
+  "advanced.crossings.rising.head": [
+   0.001,
+   0.002,
+   0.003,
+   0.004,
+   0.005
+  ],
+  "advanced.crossings.rising.n": 9,
+  "cycle_stats": {
+   "cc_jitter": 2.868529319312601e-19,
+   "cycle_mean": 1.3695501826753676e-33,
+   "cycle_rms": 0.9452636816217278
+  },
+  "dominant_frequency": 999.5002498751032,
+  "edge_intervals": {
+   "fall_to_fall": 0.001,
+   "fall_to_rise": 0.0004999999999999999,
+   "rise_to_fall": 0.0005000000000000002,
+   "rise_to_rise": 0.001
+  },
+  "fft.len": 1001,
+  "fft.peak_amp": 1.2599034895000492,
+  "fft.peak_freq": 999.5002498751032,
+  "harmonic_search": [
+   {
+    "amplitude": 1.2599034895000492,
+    "frequency": 999.5002498751032,
+    "harmonic": 1.0
+   },
+   {
+    "amplitude": 8.290765669284589e-06,
+    "frequency": 1999.0004997502065,
+    "harmonic": 2.0
+   },
+   {
+    "amplitude": 0.3854065751807658,
+    "frequency": 2998.5007496253097,
+    "harmonic": 3.0
+   }
+  ],
+  "histogram_top_base": [
+   0.99609375,
+   -0.99609375
+  ],
+  "measure.+デューティ比": 49.74986103390775,
+  "measure.+パルス幅": 0.0004972222222222224,
+  "measure.-デューティ比": 50.25013896609226,
+  "measure.-パルス幅": 0.000502222222222222,
+  "measure.Base": -0.99609375,
+  "measure.Cycle-Cycleジッタ": 2.868529319312601e-19,
+  "measure.P-P値 Vpp": 2.0,
+  "measure.Time@Max": 4.5e-05,
+  "measure.Time@Min": 0.000545,
+  "measure.Top": 0.99609375,
+  "measure.±1σ以内": 15.04247876061969,
+  "measure.±2σ以内": 100.0,
+  "measure.±3σ以内": 100.0,
+  "measure.アンダーシュート": 0.19607843137254902,
+  "measure.オーバーシュート": 0.19607843137254902,
+  "measure.サイクルRMS": 0.9452636816217278,
+  "measure.サイクル平均": 1.3695501826753676e-33,
+  "measure.サイクル数": 9.0,
+  "measure.サンプリング周波数": 200000.00000000815,
+  "measure.サンプル数": 2001.0,
+  "measure.スルーレート(立上り最大)": 25128.60726250494,
+  "measure.スルーレート(立下り最大)": -25128.60726250494,
+  "measure.デューティ誤差(50%基準)": -0.2501389660922513,
+  "measure.リプル(AC RMS)": 0.9450274542828843,
+  "measure.中央値 Median": -4.898587196589413e-15,
+  "measure.周期": 0.001,
+  "measure.周波数(FFT)": 999.5002498751032,
+  "measure.周波数(ゼロ交差)": 1000.0,
+  "measure.実効値 Vrms": 0.9450274542828843,
+  "measure.平均 Vmean": 2.8407505677565224e-17,
+  "measure.振幅 Vamp(Top-Base)": 1.9921875,
+  "measure.最大値 Vmax": 1.0,
+  "measure.最小値 Vmin": -1.0,
+  "measure.最頻ビン点数 PEAKHits": 850.0,
+  "measure.標準偏差 σ": 0.9450274542828843,
+  "measure.立上り→立上り": 0.001,
+  "measure.立上り→立下り(High幅)": 0.0005000000000000002,
+  "measure.立上りエッジ数": 9.0,
+  "measure.立上り時間 (10-90%)": 6.500000000000006e-05,
+  "measure.立下り→立上り(Low幅)": 0.0004999999999999999,
+  "measure.立下り→立下り": 0.001,
+  "measure.立下り時間 (90-10%)": 6.500000000000006e-05,
+  "measure.面積 ∫y dt": -1.0842021724855044e-19,
+  "occupied_bandwidth": 6096.951524238129,
+  "pulse_metrics": {
+   "cycles": 9.0,
+   "neg_duty": 50.25013896609226,
+   "neg_width": 0.000502222222222222,
+   "pos_duty": 49.74986103390775,
+   "pos_width": 0.0004972222222222224,
+   "rising_edges": 9.0
+  },
+  "slew_rate": {
+   "fall": -25128.60726250494,
+   "rise": 25128.60726250494
+  },
+  "spectrum_metrics": {
+   "ENOB_bits": 1.2034053297573575,
+   "SFDR_dB": 12.051594053501248,
+   "SINAD_dB": 9.004500085139291,
+   "SNR_dB": 20.595712086869465,
+   "THD_dB": -9.316511353511505,
+   "THD_pct": 34.2116824526788,
+   "f0": 999.5002498751032
+  }
+ },
+ "正弦1kHz": {
+  "advanced.auto_threshold": 0.0,
+  "advanced.crossings.both.head": [
+   0.0005,
+   0.001,
+   0.0015,
+   0.002,
+   0.0025
+  ],
+  "advanced.crossings.both.n": 19,
+  "advanced.crossings.falling.head": [
+   0.0005,
+   0.0015,
+   0.0025,
+   0.0035,
+   0.0045000000000000005
+  ],
+  "advanced.crossings.falling.n": 10,
+  "advanced.crossings.rising.head": [
+   0.001,
+   0.002,
+   0.003,
+   0.004,
+   0.005
+  ],
+  "advanced.crossings.rising.n": 9,
+  "cycle_stats": {
+   "cc_jitter": 3.03513382926455e-19,
+   "cycle_mean": -8.881784197001253e-18,
+   "cycle_rms": 0.7071067811865475
+  },
+  "dominant_frequency": 999.5002498751032,
+  "edge_intervals": {
+   "fall_to_fall": 0.001,
+   "fall_to_rise": 0.0004999999999999999,
+   "rise_to_fall": 0.0005000000000000002,
+   "rise_to_rise": 0.001
+  },
+  "fft.len": 1001,
+  "fft.peak_amp": 0.9999832661656654,
+  "fft.peak_freq": 999.5002498751032,
+  "harmonic_search": [
+   {
+    "amplitude": 0.9999832661656654,
+    "frequency": 999.5002498751032,
+    "harmonic": 1.0
+   },
+   {
+    "amplitude": 9.753929323524049e-06,
+    "frequency": 1999.0004997502065,
+    "harmonic": 2.0
+   },
+   {
+    "amplitude": 1.6477208716926745e-06,
+    "frequency": 2998.5007496253097,
+    "harmonic": 3.0
+   }
+  ],
+  "histogram_top_base": [
+   0.99609375,
+   -0.99609375
+  ],
+  "measure.+デューティ比": 49.74986103390775,
+  "measure.+パルス幅": 0.0004972222222222224,
+  "measure.-デューティ比": 50.25013896609226,
+  "measure.-パルス幅": 0.000502222222222222,
+  "measure.Base": -0.99609375,
+  "measure.Cycle-Cycleジッタ": 3.03513382926455e-19,
+  "measure.P-P値 Vpp": 2.0,
+  "measure.Time@Max": 0.00025,
+  "measure.Time@Min": 0.00075,
+  "measure.Top": 0.99609375,
+  "measure.±1σ以内": 49.02548725637181,
+  "measure.±2σ以内": 100.0,
+  "measure.±3σ以内": 100.0,
+  "measure.アンダーシュート": 0.19607843137254902,
+  "measure.オーバーシュート": 0.19607843137254902,
+  "measure.サイクルRMS": 0.7071067811865475,
+  "measure.サイクル平均": -8.881784197001253e-18,
+  "measure.サイクル数": 9.0,
+  "measure.サンプリング周波数": 200000.00000000815,
+  "measure.サンプル数": 2001.0,
+  "measure.スルーレート(立上り最大)": 6282.151815626235,
+  "measure.スルーレート(立下り最大)": -6282.151815626235,
+  "measure.デューティ誤差(50%基準)": -0.2501389660922513,
+  "measure.リプル(AC RMS)": 0.7069300707549023,
+  "measure.中央値 Median": -1.2246467991473533e-15,
+  "measure.周期": 0.001,
+  "measure.周波数(FFT)": 999.5002498751032,
+  "measure.周波数(ゼロ交差)": 1000.0,
+  "measure.実効値 Vrms": 0.7069300707549023,
+  "measure.平均 Vmean": 0.0,
+  "measure.振幅 Vamp(Top-Base)": 1.9921875,
+  "measure.最大値 Vmax": 1.0,
+  "measure.最小値 Vmin": -1.0,
+  "measure.最頻ビン点数 PEAKHits": 70.0,
+  "measure.標準偏差 σ": 0.7069300707549023,
+  "measure.立上り→立上り": 0.001,
+  "measure.立上り→立下り(High幅)": 0.0005000000000000002,
+  "measure.立上りエッジ数": 9.0,
+  "measure.立上り時間 (10-90%)": 0.0002950000000000001,
+  "measure.立下り→立上り(Low幅)": 0.0004999999999999999,
+  "measure.立下り→立下り": 0.001,
+  "measure.立下り時間 (90-10%)": 0.000295,
+  "measure.面積 ∫y dt": -5.421010862427522e-20,
+  "occupied_bandwidth": 199.90004997502058,
+  "pulse_metrics": {
+   "cycles": 9.0,
+   "neg_duty": 50.25013896609226,
+   "neg_width": 0.000502222222222222,
+   "pos_duty": 49.74986103390775,
+   "pos_width": 0.0004972222222222224,
+   "rising_edges": 9.0
+  },
+  "slew_rate": {
+   "fall": -6282.151815626235,
+   "rise": 6282.151815626235
+  },
+  "spectrum_metrics": {
+   "ENOB_bits": 12.674159168924218,
+   "SFDR_dB": 80.4192122436647,
+   "SINAD_dB": 78.05843819692379,
+   "SNR_dB": 78.3124847212179,
+   "THD_dB": -90.51355281430061,
+   "THD_pct": 0.002980728082802388,
+   "f0": 999.5002498751032
+  }
+ },
+ "矩形1kHz": {
+  "advanced.auto_threshold": 0.0,
+  "advanced.crossings.both.head": [
+   0.0005025,
+   0.0010025,
+   0.0015025,
+   0.0020025,
+   0.0025025000000000004
+  ],
+  "advanced.crossings.both.n": 19,
+  "advanced.crossings.falling.head": [
+   0.0005025,
+   0.0015025,
+   0.0025025000000000004,
+   0.0035025000000000004,
+   0.0045025
+  ],
+  "advanced.crossings.falling.n": 10,
+  "advanced.crossings.rising.head": [
+   0.0010025,
+   0.0020025,
+   0.0030025,
+   0.004002500000000001,
+   0.0050025
+  ],
+  "advanced.crossings.rising.n": 9,
+  "cycle_stats": {
+   "cc_jitter": 3.03513382926455e-19,
+   "cycle_mean": -0.005,
+   "cycle_rms": 1.0
+  },
+  "dominant_frequency": 999.5002498751032,
+  "edge_intervals": {
+   "fall_to_fall": 0.0009994444444444445,
+   "fall_to_rise": 0.0005022222222222218,
+   "rise_to_fall": 0.0004972222222222228,
+   "rise_to_rise": 0.001
+  },
+  "fft.len": 1001,
+  "fft.peak_amp": 1.2731052306595914,
+  "fft.peak_freq": 999.5002498751032,
+  "harmonic_search": [
+   {
+    "amplitude": 1.2731052306595914,
+    "frequency": 999.5002498751032,
+    "harmonic": 1.0
+   },
+   {
+    "amplitude": 0.009999868554789937,
+    "frequency": 1999.0004997502065,
+    "harmonic": 2.0
+   },
+   {
+    "amplitude": 0.4240152528588688,
+    "frequency": 2998.5007496253097,
+    "harmonic": 3.0
+   }
+  ],
+  "histogram_top_base": [
+   0.99609375,
+   -0.99609375
+  ],
+  "measure.+デューティ比": 49.74986103390775,
+  "measure.+パルス幅": 0.0004972222222222224,
+  "measure.-デューティ比": 50.25013896609226,
+  "measure.-パルス幅": 0.000502222222222222,
+  "measure.Base": -0.99609375,
+  "measure.Cycle-Cycleジッタ": 3.03513382926455e-19,
+  "measure.P-P値 Vpp": 2.0,
+  "measure.Time@Max": 5e-06,
+  "measure.Time@Min": 0.000505,
+  "measure.Top": 0.99609375,
+  "measure.±1σ以内": 50.27486256871564,
+  "measure.±2σ以内": 100.0,
+  "measure.±3σ以内": 100.0,
+  "measure.アンダーシュート": 0.19607843137254902,
+  "measure.オーバーシュート": 0.19607843137254902,
+  "measure.サイクルRMS": 1.0,
+  "measure.サイクル平均": -0.005,
+  "measure.サイクル数": 9.0,
+  "measure.サンプリング周波数": 200000.00000000815,
+  "measure.サンプル数": 2001.0,
+  "measure.スルーレート(立上り最大)": 400000.0000000163,
+  "measure.スルーレート(立下り最大)": -400000.0000000163,
+  "measure.デューティ誤差(50%基準)": -0.2501389660922513,
+  "measure.リプル(AC RMS)": 0.9997376030020702,
+  "measure.中央値 Median": -1.0,
+  "measure.周期": 0.001,
+  "measure.周波数(FFT)": 999.5002498751032,
+  "measure.周波数(ゼロ交差)": 1000.0,
+  "measure.実効値 Vrms": 0.9997500937109546,
+  "measure.平均 Vmean": -0.004997501249375313,
+  "measure.振幅 Vamp(Top-Base)": 1.9921875,
+  "measure.最大値 Vmax": 1.0,
+  "measure.最小値 Vmin": -1.0,
+  "measure.最頻ビン点数 PEAKHits": 1005.0,
+  "measure.標準偏差 σ": 0.9997376030020702,
+  "measure.立上り→立上り": 0.001,
+  "measure.立上り→立下り(High幅)": 0.0004972222222222228,
+  "measure.立上りエッジ数": 9.0,
+  "measure.立上り時間 (10-90%)": 0.001,
+  "measure.立下り→立上り(Low幅)": 0.0005022222222222218,
+  "measure.立下り→立下り": 0.0009994444444444445,
+  "measure.立下り時間 (90-10%)": 0.001,
+  "measure.面積 ∫y dt": -4.7499999999997956e-05,
+  "occupied_bandwidth": 56271.86406796831,
+  "pulse_metrics": {
+   "cycles": 9.0,
+   "neg_duty": 50.25013896609226,
+   "neg_width": 0.000502222222222222,
+   "pos_duty": 49.74986103390775,
+   "pos_width": 0.0004972222222222224,
+   "rising_edges": 9.0
+  },
+  "slew_rate": {
+   "fall": -400000.0000000163,
+   "rise": 400000.0000000163
+  },
+  "spectrum_metrics": {
+   "ENOB_bits": 0.7562947423192192,
+   "SFDR_dB": 11.313451435109684,
+   "SINAD_dB": 6.3128943487616995,
+   "SNR_dB": 10.843300707292938,
+   "THD_dB": -8.199409526180629,
+   "THD_pct": 38.90715934976269,
+   "f0": 999.5002498751032
+  }
+ },
+ "階段波": {
+  "advanced.auto_threshold": 0.0,
+  "advanced.crossings.both.head": [
+   0.0010500000000000002,
+   0.0019500000000000001,
+   0.00305,
+   0.00395,
+   0.005050000000000001
+  ],
+  "advanced.crossings.both.n": 10,
+  "advanced.crossings.falling.head": [
+   0.0010500000000000002,
+   0.00305,
+   0.005050000000000001,
+   0.007050000000000001,
+   0.00905
+  ],
+  "advanced.crossings.falling.n": 5,
+  "advanced.crossings.rising.head": [
+   0.0019500000000000001,
+   0.00395,
+   0.00595,
+   0.00795,
+   0.00995
+  ],
+  "advanced.crossings.rising.n": 5,
+  "cycle_stats": {
+   "cc_jitter": 2.0443912222444988e-19,
+   "cycle_mean": 0.0,
+   "cycle_rms": 0.7276293317647691
+  },
+  "dominant_frequency": 499.7501249375516,
+  "edge_intervals": {
+   "fall_to_fall": 0.002,
+   "fall_to_rise": 0.0009,
+   "rise_to_fall": 0.0011000000000000003,
+   "rise_to_rise": 0.002
+  },
+  "fft.len": 1001,
+  "fft.peak_amp": 1.0214445425049723,
+  "fft.peak_freq": 499.7501249375516,
+  "harmonic_search": [
+   {
+    "amplitude": 1.0214445425049723,
+    "frequency": 499.7501249375516,
+    "harmonic": 1.0
+   },
+   {
+    "amplitude": 4.1786451742423914e-05,
+    "frequency": 999.5002498751032,
+    "harmonic": 2.0
+   },
+   {
+    "amplitude": 0.01535442951760352,
+    "frequency": 1499.2503748126549,
+    "harmonic": 3.0
+   }
+  ],
+  "histogram_top_base": [
+   0.99609375,
+   -0.99609375
+  ],
+  "measure.+デューティ比": 55.25,
+  "measure.+パルス幅": 0.001105,
+  "measure.-デューティ比": 44.74999999999999,
+  "measure.-パルス幅": 0.000895,
+  "measure.Base": -0.99609375,
+  "measure.Cycle-Cycleジッタ": 2.0443912222444988e-19,
+  "measure.P-P値 Vpp": 2.0,
+  "measure.Time@Max": 0.000315,
+  "measure.Time@Min": 0.0013150000000000002,
+  "measure.Top": 0.99609375,
+  "measure.±1σ以内": 62.518740629685155,
+  "measure.±2σ以内": 100.0,
+  "measure.±3σ以内": 100.0,
+  "measure.アンダーシュート": 0.19607843137254902,
+  "measure.オーバーシュート": 0.19607843137254902,
+  "measure.サイクルRMS": 0.7276293317647691,
+  "measure.サイクル平均": 0.0,
+  "measure.サイクル数": 5.0,
+  "measure.サンプリング周波数": 200000.00000000815,
+  "measure.サンプル数": 2001.0,
+  "measure.スルーレート(立上り最大)": 66666.6666666694,
+  "measure.スルーレート(立下り最大)": -66666.6666666694,
+  "measure.デューティ誤差(50%基準)": 5.25,
+  "measure.リプル(AC RMS)": 0.7274474926186671,
+  "measure.中央値 Median": 0.0,
+  "measure.周期": null,
+  "measure.周波数(FFT)": 499.7501249375516,
+  "measure.周波数(ゼロ交差)": null,
+  "measure.実効値 Vrms": 0.7274474926186671,
+  "measure.平均 Vmean": 0.0,
+  "measure.振幅 Vamp(Top-Base)": 1.9921875,
+  "measure.最大値 Vmax": 1.0,
+  "measure.最小値 Vmin": -1.0,
+  "measure.最頻ビン点数 PEAKHits": 375.0,
+  "measure.標準偏差 σ": 0.7274474926186671,
+  "measure.立上り→立上り": 0.002,
+  "measure.立上り→立下り(High幅)": 0.0011000000000000003,
+  "measure.立上りエッジ数": 5.0,
+  "measure.立上り時間 (10-90%)": 0.0006249999999999999,
+  "measure.立下り→立上り(Low幅)": 0.0009,
+  "measure.立下り→立下り": 0.002,
+  "measure.立下り時間 (90-10%)": 0.0006250000000000001,
+  "measure.面積 ∫y dt": 9.75781955236954e-19,
+  "occupied_bandwidth": 12093.953023488748,
+  "pulse_metrics": {
+   "cycles": 5.0,
+   "neg_duty": 44.74999999999999,
+   "neg_width": 0.000895,
+   "pos_duty": 55.25,
+   "pos_width": 0.001105,
+   "rising_edges": 5.0
+  },
+  "slew_rate": {
+   "fall": -66666.6666666694,
+   "rise": 66666.6666666694
+  },
+  "spectrum_metrics": {
+   "ENOB_bits": 2.7431321675191365,
+   "SFDR_dB": 26.429638405758542,
+   "SINAD_dB": 18.2736556484652,
+   "SNR_dB": 18.34017868205976,
+   "THD_dB": -36.45499736373537,
+   "THD_pct": 1.5040079497389693,
+   "f0": 499.7501249375516
+  }
+ },
+ "高調波あり": {
+  "advanced.auto_threshold": -5.551115123125783e-17,
+  "advanced.crossings.both.head": [
+   0.0005,
+   0.001,
+   0.0015,
+   0.002,
+   0.0025
+  ],
+  "advanced.crossings.both.n": 19,
+  "advanced.crossings.falling.head": [
+   0.0005,
+   0.0015,
+   0.0025,
+   0.0035,
+   0.0045000000000000005
+  ],
+  "advanced.crossings.falling.n": 10,
+  "advanced.crossings.rising.head": [
+   0.001,
+   0.002,
+   0.003,
+   0.004,
+   0.005
+  ],
+  "advanced.crossings.rising.n": 9,
+  "cycle_stats": {
+   "cc_jitter": 3.03513382926455e-19,
+   "cycle_mean": 8.881784197001253e-18,
+   "cycle_rms": 0.7081313437491663
+  },
+  "dominant_frequency": 999.5002498751032,
+  "edge_intervals": {
+   "fall_to_fall": 0.001,
+   "fall_to_rise": 0.0004999999999999999,
+   "rise_to_fall": 0.0005000000000000002,
+   "rise_to_rise": 0.001
+  },
+  "fft.len": 1001,
+  "fft.peak_amp": 0.9999829908099962,
+  "fft.peak_freq": 999.5002498751032,
+  "harmonic_search": [
+   {
+    "amplitude": 0.9999829908099962,
+    "frequency": 999.5002498751032,
+    "harmonic": 1.0
+   },
+   {
+    "amplitude": 0.05000632186804064,
+    "frequency": 1999.0004997502065,
+    "harmonic": 2.0
+   },
+   {
+    "amplitude": 0.01999950154944222,
+    "frequency": 2998.5007496253097,
+    "harmonic": 3.0
+   }
+  ],
+  "histogram_top_base": [
+   0.9821022844473191,
+   -0.9821022844473192
+  ],
+  "measure.+デューティ比": 49.74986103390775,
+  "measure.+パルス幅": 0.0004972222222222224,
+  "measure.-デューティ比": 50.25013896609226,
+  "measure.-パルス幅": 0.000502222222222222,
+  "measure.Base": -0.9821022844473192,
+  "measure.Cycle-Cycleジッタ": 3.03513382926455e-19,
+  "measure.P-P値 Vpp": 1.9719073319099114,
+  "measure.Time@Max": 0.00023,
+  "measure.Time@Min": 0.004770000000000001,
+  "measure.Top": 0.9821022844473191,
+  "measure.±1σ以内": 49.02548725637181,
+  "measure.±2σ以内": 100.0,
+  "measure.±3σ以内": 100.0,
+  "measure.アンダーシュート": 0.19607843137254827,
+  "measure.オーバーシュート": 0.19607843137254827,
+  "measure.サイクルRMS": 0.7081313437491663,
+  "measure.サイクル平均": 8.881784197001253e-18,
+  "measure.サイクル数": 9.0,
+  "measure.サンプリング周波数": 200000.00000000815,
+  "measure.サンプル数": 2001.0,
+  "measure.スルーレート(立上り最大)": 7286.490264193573,
+  "measure.スルーレート(立下り最大)": -6030.679873607134,
+  "measure.デューティ誤差(50%基準)": -0.2501389660922513,
+  "measure.リプル(AC RMS)": 0.7079543772728932,
+  "measure.中央値 Median": -1.1364722296087438e-15,
+  "measure.周期": 0.001,
+  "measure.周波数(FFT)": 999.5002498751032,
+  "measure.周波数(ゼロ交差)": 1000.0,
+  "measure.実効値 Vrms": 0.7079543772728932,
+  "measure.平均 Vmean": -1.4203752838782612e-17,
+  "measure.振幅 Vamp(Top-Base)": 1.9642045688946381,
+  "measure.最大値 Vmax": 0.9859536659549556,
+  "measure.最小値 Vmin": -0.9859536659549557,
+  "measure.最頻ビン点数 PEAKHits": 80.0,
+  "measure.標準偏差 σ": 0.7079543772728932,
+  "measure.立上り→立上り": 0.001,
+  "measure.立上り→立下り(High幅)": 0.0005000000000000002,
+  "measure.立上りエッジ数": 9.0,
+  "measure.立上り時間 (10-90%)": 0.000255,
+  "measure.立下り→立上り(Low幅)": 0.0004999999999999999,
+  "measure.立下り→立下り": 0.001,
+  "measure.立下り時間 (90-10%)": 0.00031500000000000007,
+  "measure.面積 ∫y dt": -1.0842021724855044e-19,
+  "occupied_bandwidth": 199.90004997502058,
+  "pulse_metrics": {
+   "cycles": 9.0,
+   "neg_duty": 50.25013896609226,
+   "neg_width": 0.000502222222222222,
+   "pos_duty": 49.74986103390775,
+   "pos_width": 0.0004972222222222224,
+   "rising_edges": 9.0
+  },
+  "slew_rate": {
+   "fall": -6030.679873607134,
+   "rise": 7286.490264193573
+  },
+  "spectrum_metrics": {
+   "ENOB_bits": 3.9229310488643967,
+   "SFDR_dB": 27.78258535400001,
+   "SINAD_dB": 25.376044914163668,
+   "SNR_dB": 78.5085055672123,
+   "THD_dB": -25.376066026646118,
+   "THD_pct": 5.385136284175497,
+   "f0": 999.5002498751032
+  }
+ }
+}

@@ -6,19 +6,13 @@ from graph_app_common import *  # noqa: F401,F403
 class AdvancedMixin:
     # ------------------------------------------------------------ 高度解析
     def _xy_by_disp(self, disp):
-        """選択中系列の表示名から (t, y) を取得（時間軸は数値化）。"""
-        import numpy as np
-        import pandas as pd
+        """選択中系列の表示名から (t, y) を取得（時間軸は数値化）。
+
+        取り出しは series_xy と共通。ここは区間で絞らない（生成データや
+        相関の対象を切り詰めないため）。"""
         for fl, col, d in self._selected_series_items():
             if d == disp:
-                df = self.datasets[fl]
-                xname = self.x_combo.currentText()
-                raw = df[xname].to_numpy() if xname in df.columns else df.iloc[:, 0].to_numpy()
-                t = pd.to_numeric(pd.Series(raw), errors="coerce").to_numpy(dtype=float)
-                if np.isnan(t).mean() > 0.5:
-                    t = np.arange(len(t), dtype=float)
-                y = pd.to_numeric(pd.Series(df[col].to_numpy()), errors="coerce").to_numpy(dtype=float)
-                return t, y
+                return self.series_xy(fl, col, gated=False)
         return None, None
 
     def _on_math_op_change(self, op):
@@ -83,10 +77,10 @@ class AdvancedMixin:
     def show_param_stats(self):
         """解析対象チャンネルのサイクル統計表＋パラメータ間演算を別ウィンドウで表示。"""
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         yv = np.asarray(y, float)
         self._show_param_stats_window(label, analysis.cycle_statistics(t, yv),
                                       analysis.measurements(t, yv))
@@ -140,10 +134,10 @@ class AdvancedMixin:
 
     def compute_fft_metrics(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         win = self.fft_window.currentText()
         yv = np.asarray(y, float)
         m = analysis.spectrum_metrics(t, yv, window=win)
@@ -169,19 +163,16 @@ class AdvancedMixin:
 
     def show_spectrogram(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         f, tt, S = analysis.spectrogram(t, np.asarray(y, float),
                                         window=self.fft_window.currentText())
         if S is None:
             self.notify("計算できませんでした。", "warn")
             return
-        self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
-        self._reset_figure_axes()
-        self.ax.clear()
-        self.ax.set_facecolor("white"); self.ax.tick_params(colors="black")
+        self.prepare_view_axes()
         mesh = self.ax.pcolormesh(tt, f, S, shading="auto", cmap="viridis")
         self.ax.set_xlabel("時間 [s]"); self.ax.set_ylabel("周波数 [Hz]")
         self.ax.set_title(f"スペクトログラム: {label}")
@@ -201,18 +192,16 @@ class AdvancedMixin:
     def show_waterfall(self):
         """FFTウォーターフォール: STFTの時間スライスを3Dに重ねて周波数変化を見る。"""
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         f, tt, S = analysis.spectrogram(t, np.asarray(y, float),
                                         window=self.fft_window.currentText())
         if S is None:
             self.notify("計算できませんでした。", "warn")
             return
-        self._ensure_axes_projection(True)   # 3D軸で描く
-        self._reset_figure_axes()
-        self.ax.clear()
+        self.prepare_view_axes(three_d=True, white_bg=False)
         from matplotlib import cm
         n = S.shape[1]
         step = max(1, n // 60)   # スライスは最大60本（視認性と速度のバランス）
@@ -239,10 +228,10 @@ class AdvancedMixin:
 
     def run_mask_test(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         up = plotter.parse_eng(self.mask_upper.text(), None)
         lo = plotter.parse_eng(self.mask_lower.text(), None)
         if up is None and lo is None:
@@ -267,18 +256,15 @@ class AdvancedMixin:
 
     def show_eye_diagram(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         val = plotter.parse_eng(self.eye_rate.text(), 1e6)
         # シンボルレート[Hz] と解釈（>1 ならレート、<1 なら周期[s]とみなす）
         sym_period = (1.0 / val) if val and val > 1 else (val or 1e-6)
         phase, yy = advanced.eye_diagram(t, np.asarray(y, float), sym_period, n_ui=2)
-        self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
-        self._reset_figure_axes()
-        self.ax.clear()
-        self.ax.set_facecolor("white"); self.ax.tick_params(colors="black")
+        self.prepare_view_axes()
         self.ax.plot(phase * 1e6, yy, ".", ms=0.5, alpha=0.3, color="#1f77b4")
         self.ax.set_xlabel("UI内時間 [µs]"); self.ax.set_ylabel("電圧")
         self.ax.set_title(f"アイダイアグラム: {label}")
@@ -306,10 +292,10 @@ class AdvancedMixin:
 
     def run_jitter(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         jr = advanced.jitter_tie(t, np.asarray(y, float))
         if not jr:
             self.notify("エッジが不足し計算できませんでした。", "warn")
@@ -322,10 +308,10 @@ class AdvancedMixin:
 
     def show_cycle_stats(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         cm = analysis.cycle_measurements(t, np.asarray(y, float))
         fs = analysis.measurement_stats(cm["freq"])
         amps = analysis.measurement_stats(cm["vpp"])
@@ -341,18 +327,15 @@ class AdvancedMixin:
 
     def show_trend(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         cm = analysis.cycle_measurements(t, np.asarray(y, float))
         if len(cm["cycle_time"]) < 2:
             self.notify("サイクルが不足しています。", "warn")
             return
-        self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
-        self._reset_figure_axes()
-        self.ax.clear()
-        self.ax.set_facecolor("white"); self.ax.tick_params(colors="black")
+        self.prepare_view_axes()
         self.ax.plot(cm["cycle_time"], cm["freq"], "-o", ms=3, color="#1f77b4")
         self.ax.set_xlabel("時間 [s]"); self.ax.set_ylabel("周波数 [Hz]")
         self.ax.set_title(f"周波数トレンド（サイクルごと）: {label}")

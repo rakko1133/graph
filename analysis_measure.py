@@ -4,7 +4,8 @@ import numpy as np
 
 from analysis_common import (sampling_rate, find_signal_peaks, _trapz,
                              _zero_crossing_period, _edge_time,
-                             histogram_top_base, _mid_crossings)
+                             histogram_top_base, _mid_crossings,
+                             crossing_times, mid_level)
 from analysis_spectrum import dominant_frequency, find_spectral_peaks
 
 
@@ -183,22 +184,11 @@ def edge_intervals(t, y, level=None):
     if np.isfinite(y).sum() < 4:
         return {}
     if level is None:
-        top, base = histogram_top_base(y)
-        if top is None or top <= base:
+        level = mid_level(y)
+        if level is None:
             return {}
-        level = (top + base) / 2.0
-    up, dn = _mid_crossings(t, y, level)
-
-    def cross_times(idx):
-        idx = np.asarray(idx, dtype=int)
-        if idx.size == 0:
-            return np.asarray([], dtype=float)
-        y1, y2 = y[idx], y[idx + 1]
-        denom = y2 - y1
-        f = np.where(denom != 0.0, (level - y1) / np.where(denom != 0.0, denom, 1.0), 0.0)
-        return t[idx] + f * (t[idx + 1] - t[idx])
-
-    ut, dt_ = cross_times(up), cross_times(dn)
+    ut = crossing_times(t, y, level, edge="rising")
+    dt_ = crossing_times(t, y, level, edge="falling")
     res = {}
     if ut.size >= 2:
         res["rise_to_rise"] = float(np.mean(np.diff(ut)))
@@ -222,10 +212,9 @@ def pulse_metrics(t, y, level=None):
     if finite.sum() < 4:
         return out
     if level is None:
-        top, base = histogram_top_base(y)
-        if top is None or top <= base:
+        level = mid_level(y)
+        if level is None:
             return out
-        level = (top + base) / 2.0
     up, down = _mid_crossings(t, y, level)
     out["rising_edges"] = float(len(up))
     # 高区間（up→次のdown）と低区間（down→次のup）の幅

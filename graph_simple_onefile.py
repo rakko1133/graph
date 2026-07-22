@@ -2114,10 +2114,58 @@ def histogram_top_base(y, bins=256):
 
 def _mid_crossings(t, y, level):
     """level を上下に横切る位置（上昇・下降）を返す。"""
-    below = y < level
+    below = np.asarray(y, dtype=float) < level
     up = np.where(below[:-1] & ~below[1:])[0]
     down = np.where(~below[:-1] & below[1:])[0]
     return up, down
+
+
+def crossing_times(t, y, level, edge="both"):
+    """level を横切る時刻を線形補間で返す。edge: rising / falling / both。
+
+    交差の添字は `_mid_crossings` と同じ規約（`y < level` を基準に上昇・下降を
+    判定）。y2 == y1 のタイ点は補間できないので、その区間の始点の時刻を返す
+    （従来の実装と同じ扱い）。
+
+    以前は同じ補間が crossings と edge_intervals に写経されていた。
+    NaN の扱い・タイ点の扱いを片方だけ直すと測定値が食い違うため1本にする。
+    """
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    up, down = _mid_crossings(t, y, level)
+
+    def interp(idx):
+        idx = np.asarray(idx, dtype=int)
+        if idx.size == 0:
+            return np.asarray([], dtype=float)
+        y1, y2 = y[idx], y[idx + 1]
+        denom = y2 - y1
+        frac = np.where(denom != 0.0,
+                        (level - y1) / np.where(denom != 0.0, denom, 1.0), 0.0)
+        return t[idx] + frac * (t[idx + 1] - t[idx])
+
+    if edge == "rising":
+        return interp(up)
+    if edge == "falling":
+        return interp(down)
+    return np.sort(np.concatenate([interp(up), interp(down)]))
+
+
+def mid_level(y, require_span=True):
+    """ロジックのしきい値＝Top/Base の中点。決められなければ None。
+
+    require_span=True なら Top<=Base（振幅なし）も「決められない」とみなす。
+    False にすると Top/Base が取れた時点で中点を返す（auto_threshold の従来動作）。
+
+    以前は auto_threshold / edge_intervals / pulse_metrics が同じ計算を
+    別々に書いており、measurements() 1回で histogram_top_base が何度も走っていた。
+    """
+    top, base = histogram_top_base(y)
+    if top is None or base is None:
+        return None
+    if require_span and top <= base:
+        return None
+    return (top + base) / 2.0
 
 # ======================================================================
 # ↑ py
@@ -2511,22 +2559,11 @@ def edge_intervals(t, y, level=None):
     if np.isfinite(y).sum() < 4:
         return {}
     if level is None:
-        top, base = histogram_top_base(y)
-        if top is None or top <= base:
+        level = mid_level(y)
+        if level is None:
             return {}
-        level = (top + base) / 2.0
-    up, dn = _mid_crossings(t, y, level)
-
-    def cross_times(idx):
-        idx = np.asarray(idx, dtype=int)
-        if idx.size == 0:
-            return np.asarray([], dtype=float)
-        y1, y2 = y[idx], y[idx + 1]
-        denom = y2 - y1
-        f = np.where(denom != 0.0, (level - y1) / np.where(denom != 0.0, denom, 1.0), 0.0)
-        return t[idx] + f * (t[idx + 1] - t[idx])
-
-    ut, dt_ = cross_times(up), cross_times(dn)
+    ut = crossing_times(t, y, level, edge="rising")
+    dt_ = crossing_times(t, y, level, edge="falling")
     res = {}
     if ut.size >= 2:
         res["rise_to_rise"] = float(np.mean(np.diff(ut)))
@@ -2550,10 +2587,9 @@ def pulse_metrics(t, y, level=None):
     if finite.sum() < 4:
         return out
     if level is None:
-        top, base = histogram_top_base(y)
-        if top is None or top <= base:
+        level = mid_level(y)
+        if level is None:
             return out
-        level = (top + base) / 2.0
     up, down = _mid_crossings(t, y, level)
     out["rising_edges"] = float(len(up))
     # 高区間（up→次のdown）と低区間（down→次のup）の幅
@@ -2664,10 +2700,9 @@ LIN（1線・break/sync/PID/チェックサム検証）、1-Wire（1線・標準
 
 # ----------------------------------------------------------------- 共通
 def auto_threshold(y):
-    top, base = histogram_top_base(y)
-    if top is None:
-        return float(np.nanmean(y))
-    return (top + base) / 2.0
+    """ロジック判定のしきい値（Top/Base の中点。取れなければ平均）。"""
+    level = mid_level(y, require_span=False)
+    return float(np.nanmean(y)) if level is None else level
 
 
 def _logic(y, threshold):
@@ -2677,26 +2712,7 @@ def _logic(y, threshold):
 
 def crossings(t, y, level, edge="both"):
     """level を横切る時刻（線形補間）を返す。edge: rising/falling/both。"""
-    t = np.asarray(t, dtype=float)
-    y = np.asarray(y, dtype=float)
-    below = y < level
-    up = np.where(below[:-1] & ~below[1:])[0]
-    dn = np.where(~below[:-1] & below[1:])[0]
-
-    def interp(idx):
-        idx = np.asarray(idx, dtype=int)
-        if idx.size == 0:
-            return np.asarray([], dtype=float)
-        y1, y2 = y[idx], y[idx + 1]
-        denom = y2 - y1
-        frac = np.where(denom != 0.0, (level - y1) / np.where(denom != 0.0, denom, 1.0), 0.0)
-        return t[idx] + frac * (t[idx + 1] - t[idx])
-
-    if edge == "rising":
-        return interp(up)
-    if edge == "falling":
-        return interp(dn)
-    return np.sort(np.concatenate([interp(up), interp(dn)]))
+    return crossing_times(t, y, level, edge=edge)
 
 
 def _level_at(t, logic, time):
@@ -10337,9 +10353,16 @@ class ScopeCursorMixin:
 
 class AnalysisMixin:
     # ------------------------------------------------------------ 解析
-    def _xy_for(self, fl, col):
-        """指定系列(fl,col)の (t, y) を返す。時間軸は数値化（非数値ならインデックス）。
-        「表示範囲のみ測定」ONなら画面のX範囲に絞る。"""
+    def series_xy(self, fl, col, gated=False):
+        """指定系列(fl,col)の (t, y) を数値配列で返す。
+
+        時間軸は数値化し、非数値のX（文字列カテゴリ等）ならインデックスを
+        時間軸とみなす。gated=True なら「表示範囲のみ測定」の設定に従って
+        画面のX範囲に絞る。
+
+        以前は同じ取り出し処理が _xy_for と _xy_by_disp に写経されており、
+        片方だけ直すと解析タブと高度解析タブで別の値が出る状態だった。
+        """
         import numpy as np
         import pandas as pd
         df = self.datasets[fl]
@@ -10349,6 +10372,43 @@ class AnalysisMixin:
         if np.isnan(t).mean() > 0.5:  # 非数値Xはインデックスを時間軸とみなす
             t = np.arange(len(t), dtype=float)
         y = pd.to_numeric(pd.Series(df[col].to_numpy()), errors="coerce").to_numpy(dtype=float)
+        if gated:
+            t, y = self._apply_measure_window(t, y)
+        return t, y
+
+    def _xy_for(self, fl, col):
+        """指定系列(fl,col)の (t, y)。「表示範囲のみ測定」ONなら画面範囲に絞る。"""
+        return self.series_xy(fl, col, gated=True)
+
+    def analysis_xy_or_warn(self, msg="解析対象の系列を選択してください。"):
+        """解析対象の (t, y, label)。未選択なら通知して None を返す。
+
+        「取得→未選択なら警告して return」の4行が解析系の入口11箇所に
+        写経されていたのをまとめたもの。呼び出し側は
+        `got = self.analysis_xy_or_warn()` / `if got is None: return` で使う。"""
+        t, y, label = self._analysis_xy()
+        if t is None:
+            self.notify(msg, "warn")
+            return None
+        return t, y, label
+
+    def prepare_view_axes(self, three_d=False, white_bg=True):
+        """特殊表示（スペクトログラム／アイ／トレンド等）のために軸を作り直す。
+
+        3D表示中でも指定の投影に戻し、補助軸（カラーバー等）を片付けてから
+        まっさらにする。white_bg=True なら地色を白・目盛りを黒にする
+        （オシロの濃色設定が残ったままだと解析ビューが読めないため）。"""
+        self._ensure_axes_projection(three_d)
+        self._reset_figure_axes()
+        self.ax.clear()
+        if white_bg:
+            self.ax.set_facecolor("white")
+            self.ax.tick_params(colors="black")
+        return self.ax
+
+    def _apply_measure_window(self, t, y):
+        """「表示範囲のみ測定」がONなら、画面のX範囲だけに絞り込む。"""
+        import numpy as np   # noqa: F401  （呼び出し側と同じ遅延importの流儀）
         if self.window_meas_check.isChecked() and self._has_drawn:
             x0, x1 = self.ax.get_xlim()
             if x1 < x0:
@@ -10393,10 +10453,10 @@ class AnalysisMixin:
         return out
 
     def run_analysis(self):
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         import numpy as np
         y = np.asarray(y, float)
         res = analyze(t, y, n_peaks=self.npeaks.value(),
@@ -10611,19 +10671,13 @@ class AnalysisMixin:
 class AdvancedMixin:
     # ------------------------------------------------------------ 高度解析
     def _xy_by_disp(self, disp):
-        """選択中系列の表示名から (t, y) を取得（時間軸は数値化）。"""
-        import numpy as np
-        import pandas as pd
+        """選択中系列の表示名から (t, y) を取得（時間軸は数値化）。
+
+        取り出しは series_xy と共通。ここは区間で絞らない（生成データや
+        相関の対象を切り詰めないため）。"""
         for fl, col, d in self._selected_series_items():
             if d == disp:
-                df = self.datasets[fl]
-                xname = self.x_combo.currentText()
-                raw = df[xname].to_numpy() if xname in df.columns else df.iloc[:, 0].to_numpy()
-                t = pd.to_numeric(pd.Series(raw), errors="coerce").to_numpy(dtype=float)
-                if np.isnan(t).mean() > 0.5:
-                    t = np.arange(len(t), dtype=float)
-                y = pd.to_numeric(pd.Series(df[col].to_numpy()), errors="coerce").to_numpy(dtype=float)
-                return t, y
+                return self.series_xy(fl, col, gated=False)
         return None, None
 
     def _on_math_op_change(self, op):
@@ -10688,10 +10742,10 @@ class AdvancedMixin:
     def show_param_stats(self):
         """解析対象チャンネルのサイクル統計表＋パラメータ間演算を別ウィンドウで表示。"""
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         yv = np.asarray(y, float)
         self._show_param_stats_window(label, cycle_statistics(t, yv),
                                       measurements(t, yv))
@@ -10745,10 +10799,10 @@ class AdvancedMixin:
 
     def compute_fft_metrics(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         win = self.fft_window.currentText()
         yv = np.asarray(y, float)
         m = spectrum_metrics(t, yv, window=win)
@@ -10774,19 +10828,16 @@ class AdvancedMixin:
 
     def show_spectrogram(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         f, tt, S = spectrogram(t, np.asarray(y, float),
                                         window=self.fft_window.currentText())
         if S is None:
             self.notify("計算できませんでした。", "warn")
             return
-        self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
-        self._reset_figure_axes()
-        self.ax.clear()
-        self.ax.set_facecolor("white"); self.ax.tick_params(colors="black")
+        self.prepare_view_axes()
         mesh = self.ax.pcolormesh(tt, f, S, shading="auto", cmap="viridis")
         self.ax.set_xlabel("時間 [s]"); self.ax.set_ylabel("周波数 [Hz]")
         self.ax.set_title(f"スペクトログラム: {label}")
@@ -10806,18 +10857,16 @@ class AdvancedMixin:
     def show_waterfall(self):
         """FFTウォーターフォール: STFTの時間スライスを3Dに重ねて周波数変化を見る。"""
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         f, tt, S = spectrogram(t, np.asarray(y, float),
                                         window=self.fft_window.currentText())
         if S is None:
             self.notify("計算できませんでした。", "warn")
             return
-        self._ensure_axes_projection(True)   # 3D軸で描く
-        self._reset_figure_axes()
-        self.ax.clear()
+        self.prepare_view_axes(three_d=True, white_bg=False)
         from matplotlib import cm
         n = S.shape[1]
         step = max(1, n // 60)   # スライスは最大60本（視認性と速度のバランス）
@@ -10844,10 +10893,10 @@ class AdvancedMixin:
 
     def run_mask_test(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         up = parse_eng(self.mask_upper.text(), None)
         lo = parse_eng(self.mask_lower.text(), None)
         if up is None and lo is None:
@@ -10872,18 +10921,15 @@ class AdvancedMixin:
 
     def show_eye_diagram(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         val = parse_eng(self.eye_rate.text(), 1e6)
         # シンボルレート[Hz] と解釈（>1 ならレート、<1 なら周期[s]とみなす）
         sym_period = (1.0 / val) if val and val > 1 else (val or 1e-6)
         phase, yy = eye_diagram(t, np.asarray(y, float), sym_period, n_ui=2)
-        self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
-        self._reset_figure_axes()
-        self.ax.clear()
-        self.ax.set_facecolor("white"); self.ax.tick_params(colors="black")
+        self.prepare_view_axes()
         self.ax.plot(phase * 1e6, yy, ".", ms=0.5, alpha=0.3, color="#1f77b4")
         self.ax.set_xlabel("UI内時間 [µs]"); self.ax.set_ylabel("電圧")
         self.ax.set_title(f"アイダイアグラム: {label}")
@@ -10911,10 +10957,10 @@ class AdvancedMixin:
 
     def run_jitter(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         jr = jitter_tie(t, np.asarray(y, float))
         if not jr:
             self.notify("エッジが不足し計算できませんでした。", "warn")
@@ -10927,10 +10973,10 @@ class AdvancedMixin:
 
     def show_cycle_stats(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         cm = cycle_measurements(t, np.asarray(y, float))
         fs = measurement_stats(cm["freq"])
         amps = measurement_stats(cm["vpp"])
@@ -10946,18 +10992,15 @@ class AdvancedMixin:
 
     def show_trend(self):
         import numpy as np
-        t, y, label = self._analysis_xy()
-        if t is None:
-            self.notify("解析対象の系列を選択してください。", "warn")
+        got = self.analysis_xy_or_warn()
+        if got is None:
             return
+        t, y, label = got
         cm = cycle_measurements(t, np.asarray(y, float))
         if len(cm["cycle_time"]) < 2:
             self.notify("サイクルが不足しています。", "warn")
             return
-        self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
-        self._reset_figure_axes()
-        self.ax.clear()
-        self.ax.set_facecolor("white"); self.ax.tick_params(colors="black")
+        self.prepare_view_axes()
         self.ax.plot(cm["cycle_time"], cm["freq"], "-o", ms=3, color="#1f77b4")
         self.ax.set_xlabel("時間 [s]"); self.ax.set_ylabel("周波数 [Hz]")
         self.ax.set_title(f"周波数トレンド（サイクルごと）: {label}")

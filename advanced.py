@@ -13,10 +13,9 @@ import analysis
 
 # ----------------------------------------------------------------- 共通
 def auto_threshold(y):
-    top, base = analysis.histogram_top_base(y)
-    if top is None:
-        return float(np.nanmean(y))
-    return (top + base) / 2.0
+    """ロジック判定のしきい値（Top/Base の中点。取れなければ平均）。"""
+    level = analysis.mid_level(y, require_span=False)
+    return float(np.nanmean(y)) if level is None else level
 
 
 def _logic(y, threshold):
@@ -26,26 +25,7 @@ def _logic(y, threshold):
 
 def crossings(t, y, level, edge="both"):
     """level を横切る時刻（線形補間）を返す。edge: rising/falling/both。"""
-    t = np.asarray(t, dtype=float)
-    y = np.asarray(y, dtype=float)
-    below = y < level
-    up = np.where(below[:-1] & ~below[1:])[0]
-    dn = np.where(~below[:-1] & below[1:])[0]
-
-    def interp(idx):
-        idx = np.asarray(idx, dtype=int)
-        if idx.size == 0:
-            return np.asarray([], dtype=float)
-        y1, y2 = y[idx], y[idx + 1]
-        denom = y2 - y1
-        frac = np.where(denom != 0.0, (level - y1) / np.where(denom != 0.0, denom, 1.0), 0.0)
-        return t[idx] + frac * (t[idx + 1] - t[idx])
-
-    if edge == "rising":
-        return interp(up)
-    if edge == "falling":
-        return interp(dn)
-    return np.sort(np.concatenate([interp(up), interp(dn)]))
+    return analysis.crossing_times(t, y, level, edge=edge)
 
 
 def _level_at(t, logic, time):
