@@ -939,6 +939,34 @@ def test_simple_edition_is_same_app_with_fewer_controls():
         QtCore.QSettings("graph-tool", "GraphApp").clear()
 
 
+def test_editions_remember_their_level_separately():
+    """通常版とシンプル版が表示レベルを取り合わないこと。
+
+    保存キーを共有していると、通常版を「全部」で使った直後にシンプル版を
+    開いても「全部」で立ち上がり、シンプル版がシンプルでなくなる。"""
+    import graph_app_simple
+    QtCore.QSettings("graph-tool", "GraphApp").clear()
+    try:
+        assert graph_app.GraphApp.UI_LEVEL_KEY != graph_app_simple.SimpleGraphApp.UI_LEVEL_KEY
+        full = graph_app.GraphApp()
+        full.set_ui_level("全部", announce=False)
+        full._save_ui_state()
+        full.close()
+        simple = graph_app_simple.SimpleGraphApp()
+        assert simple.ui_level() == "基本"        # 通常版の設定に引きずられない
+        simple.set_ui_level("標準", announce=False)
+        simple._save_ui_state()
+        simple.close()
+        again_full = graph_app.GraphApp()
+        assert again_full.ui_level() == "全部"    # 通常版は自分の設定を保つ
+        again_full.close()
+        again_simple = graph_app_simple.SimpleGraphApp()
+        assert again_simple.ui_level() == "標準"  # シンプル版も自分の設定を覚える
+        again_simple.close()
+    finally:
+        QtCore.QSettings("graph-tool", "GraphApp").clear()
+
+
 def test_command_palette_opens_with_all_commands():
     """コマンドパレットが開き、登録が全部 QAction であること。
 

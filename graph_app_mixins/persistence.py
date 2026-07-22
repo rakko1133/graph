@@ -87,7 +87,7 @@ class PersistenceMixin:
         self._apply_ui_style(str(s.value("ui/style") or "standard"))
         # 表示レベルを復元。既定は「全部」＝従来と同じ見た目（減らすのは明示操作のみ）。
         # シンプル版（graph_app_simple.py）は DEFAULT_UI_LEVEL を上書きして起動する。
-        self._apply_ui_level(str(s.value("ui/level") or self.DEFAULT_UI_LEVEL))
+        self._apply_ui_level(str(s.value(self.UI_LEVEL_KEY) or self.DEFAULT_UI_LEVEL))
         # 復元した切り離し状態をメニューのチェックへ反映し、タブバーも配線し直す
         if hasattr(self, "_float_actions"):
             for d in [*self.left_docks, self.format_dock]:
@@ -107,7 +107,7 @@ class PersistenceMixin:
                 s.setValue(key, sp.saveState())
         for k, box in getattr(self, "_fmt_sections", {}).items():
             s.setValue("fmt_section/" + k, "1" if box.is_expanded() else "0")
-        s.setValue("ui/level", self.ui_level())
+        s.setValue(self.UI_LEVEL_KEY, self.ui_level())
 
     # ------------------------------------------------------------ Excelレポート出力
     def export_excel_report(self):

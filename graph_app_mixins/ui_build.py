@@ -307,6 +307,10 @@ QToolBar { background:$title_bg; spacing:1px; }
     UI_LEVELS = ("基本", "標準", "全部")
     # 通常版の既定。シンプル版はサブクラスでこれを "基本" に上書きする。
     DEFAULT_UI_LEVEL = "全部"
+    # レベルの保存先キー。通常版とシンプル版で**別のキー**にしないと、
+    # 通常版で「全部」を保存した直後にシンプル版を開いても「全部」で立ち上がり、
+    # シンプル版がシンプルでなくなる（実際にそうなっていた）。
+    UI_LEVEL_KEY = "ui/level"
 
     # 各レベルで見せるドック（objectName）と書式セクション（_fmt_sections のキー）。
     # 「全部」は例外扱いで、この表を参照せず全部見せる。
@@ -332,7 +336,7 @@ QToolBar { background:$title_bg; spacing:1px; }
         if level not in self.UI_LEVELS:
             return
         self._apply_ui_level(level)
-        self._ui_settings().setValue("ui/level", level)
+        self._ui_settings().setValue(self.UI_LEVEL_KEY, level)
         if announce:
             self.notify(
                 f"表示レベル: {level}"
@@ -823,7 +827,7 @@ QToolBar { background:$title_bg; spacing:1px; }
         上げる（そうしないと、プリセットが出したパネルをレベルが隠し返す）。"""
         if self.ui_level() != "全部":
             self._apply_ui_level("全部")
-            self._ui_settings().setValue("ui/level", "全部")
+            self._ui_settings().setValue(self.UI_LEVEL_KEY, "全部")
         total = max(sum(self.center_splitter.sizes()), 400)
         for d in [self.files_dock, *self.left_docks, self.format_dock]:
             d.setFloating(False)
@@ -1823,7 +1827,7 @@ QToolBar { background:$title_bg; spacing:1px; }
             return False
         for level in self.UI_LEVELS[self.UI_LEVELS.index(self.ui_level()) + 1:]:
             self._apply_ui_level(level)
-            self._ui_settings().setValue("ui/level", level)
+            self._ui_settings().setValue(self.UI_LEVEL_KEY, level)
             if widget.isVisibleTo(self):
                 return True
         return True     # 「全部」まで上げても隠れている＝折りたたみ側の問題
