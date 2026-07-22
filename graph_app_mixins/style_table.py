@@ -130,7 +130,24 @@ class StyleTableMixin:
     def _on_y_check_changed(self, _item):
         if self._suspend_redraw:
             return
-        self._on_y_selection_changed()
+        # ツリーのチェックと系列バーは「今つけた印」なので即座に反映する。
+        # 一方、系列スタイル表と解析候補の作り直しは1列あたり全行を作り直す
+        # ので、連続操作（ファイル単位のチェック・すべて選択・まとめてドロップ）
+        # では列数の2乗に比例して待たされる。そちらだけ後回しにして
+        # 一連の操作が終わってから1回だけ実行する。
+        self._rebuild_series_bar()          # 内部で _sync_explorer_checks も呼ぶ
+        timer = getattr(self, "_ysel_timer", None)
+        if timer is None:
+            timer = self._ysel_timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._apply_y_selection_deferred)
+        timer.start(30)
+
+    def _apply_y_selection_deferred(self):
+        """まとめた選択変更の重い側（系列表・解析候補・再描画）を反映する。"""
+        self._rebuild_style_table()
+        self._update_analysis_targets()
+        self._request_redraw()
 
     def _set_all_checks(self, func):
         """func(item) -> bool で各行のチェック状態を一括設定し、まとめて更新。"""

@@ -21,12 +21,8 @@ class DataIOMixin:
                 paths.append(p)
         if not paths:
             return
-        for p in paths:
-            self._load_file(p)
         self.last_dir = os.path.dirname(paths[-1])
-        self._refresh_columns()
-        if self._has_drawn:
-            self.draw_graph()
+        self._load_files_async(paths)
 
     # ------------------------------------------------------------ ファイル
     def add_file(self):
@@ -36,11 +32,9 @@ class DataIOMixin:
             "Excel (*.xlsx *.xls *.xlsm);;CSV/TSV (*.csv *.tsv *.txt);;"
             "波形/計測 (*.wav *.raw *.tdms *.mf4 *.mdf *.h5 *.hdf5);;"
             "LTspice回路 (*.asc *.net);;すべて (*.*)")
-        for p in paths:
-            self._load_file(p)
         if paths:
             self.last_dir = os.path.dirname(paths[-1])
-            self._refresh_columns()
+            self._load_files_async(paths)
 
     def paste_from_clipboard(self):
         """クリップボードの表データ（Excel等からのコピー＝TSV/CSV）を新規データとして読み込む。"""
@@ -48,7 +42,7 @@ class DataIOMixin:
         import pandas as pd
         text = QtWidgets.QApplication.clipboard().text()
         if not text or not text.strip():
-            QtWidgets.QMessageBox.information(self, "貼り付け", "クリップボードに表データがありません。")
+            self.notify("クリップボードに表データがありません。", "info")
             return
         first = text.splitlines()[0]
         sep = "\t" if first.count("\t") >= first.count(",") else ","   # Excelコピーはタブ区切り
@@ -56,10 +50,10 @@ class DataIOMixin:
             df = pd.read_csv(io.StringIO(text), sep=sep, engine="python", skip_blank_lines=True)
             df = data_loader._normalize_columns(df)
         except Exception as e:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "貼り付け", f"表として読み取れませんでした:\n{e}")
+            self.notify(f"表として読み取れませんでした:\n{e}", "warn")
             return
         if df.shape[1] == 0 or len(df) == 0:
-            QtWidgets.QMessageBox.warning(self, "貼り付け", "表として読み取れませんでした。")
+            self.notify("表として読み取れませんでした。", "warn")
             return
         label, i = "貼り付け", 2
         while label in self.datasets:
@@ -71,10 +65,11 @@ class DataIOMixin:
         self._refresh_columns()
         self._set_status(f"クリップボードから {len(df)}行 × {len(df.columns)}列 を貼り付けました。")
 
-    def _load_file(self, path):
-        if os.path.splitext(path)[1].lower() in (".asc", ".net"):
-            self.run_ltspice_asc(path)   # 回路図/ネットリストは実行→.raw読込
-            return
+    # ------------------------------------------------------------ 読み込み
+    # 読み込みは「GUI が必要な準備」「重い解析」「GUI への登録」の3段に分かれる。
+    # 重い部分だけをワーカースレッドへ出せるように分割してある。
+    def _load_job(self, path):
+        """読み込みの準備（GUIスレッドで行う部分）。ジョブ辞書か None を返す。"""
         enc = self.enc_combo.currentText()
         enc = None if enc.startswith("自動") else enc
         delim = None
@@ -87,28 +82,24 @@ class DataIOMixin:
         # Excelで複数シートがある場合はどのシートを読むか選んでもらう
         sheet = None
         if os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm", ".xls"):
-            sheets = data_loader.excel_sheet_names(path)
+            try:
+                sheets = data_loader.excel_sheet_names(path)
+            except Exception as e:  # noqa: BLE001  壊れたブックはここで弾く
+                self.notify(f"{os.path.basename(path)} のシートを読めませんでした。",
+                            "error", str(e))
+                return None
             if len(sheets) > 1:
                 sheet, ok = QtWidgets.QInputDialog.getItem(
                     self, "シートの選択", f"{os.path.basename(path)} のシート:",
                     sheets, 0, False)
                 if not ok:
-                    return
-        size = os.path.getsize(path) if os.path.isfile(path) else 0
-        busy = size > 5_000_000   # 5MB 超は待機カーソル＋進捗
-        if busy:
-            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
-            self._set_status(f"読み込み中… {os.path.basename(path)}")
-            QtWidgets.QApplication.processEvents()
-        try:
-            df, used_enc, used_delim = data_loader.load_table(
-                path, encoding=enc, delimiter=delim, sheet=sheet)
-        except Exception as e:  # noqa: BLE001
-            QtWidgets.QMessageBox.critical(self, "読み込みエラー", f"{os.path.basename(path)}\n\n{e}")
-            return
-        finally:
-            if busy:
-                QtWidgets.QApplication.restoreOverrideCursor()
+                    return None
+        return {"path": path, "enc": enc, "delim": delim, "sheet": sheet}
+
+    def _register_loaded(self, job, result):
+        """読み込み結果をデータセットへ登録する（GUIスレッドで行う部分）。"""
+        path, sheet = job["path"], job.get("sheet")
+        df, used_enc, used_delim = result
         label = os.path.basename(path)
         if sheet:
             label = f"{label}[{sheet}]"   # シート違いを別データとして区別できるように
@@ -122,6 +113,162 @@ class DataIOMixin:
             self._add_file_item(label)
         self._push_recent(path)
         self._set_status(f"{label} を読み込み（{len(df)}行 × {len(df.columns)}列, {used_enc}）")
+        return label
+
+    def _load_file(self, path):
+        """1ファイルを同期読み込みする（小さいファイル・スクリプト用の従来API）。"""
+        if os.path.splitext(path)[1].lower() in (".asc", ".net"):
+            self.run_ltspice_asc(path)   # 回路図/ネットリストは実行→.raw読込
+            return
+        job = self._load_job(path)
+        if job is None:
+            return
+        size = os.path.getsize(path) if os.path.isfile(path) else 0
+        busy = size > 5_000_000   # 5MB 超は待機カーソル
+        if busy:
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+            self._set_status(f"読み込み中… {os.path.basename(path)}")
+            QtWidgets.QApplication.processEvents()
+        try:
+            result = data_loader.load_table(
+                path, encoding=job["enc"], delimiter=job["delim"], sheet=job["sheet"])
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"{os.path.basename(path)} を読み込めませんでした。", "error", str(e))
+            return
+        finally:
+            if busy:
+                QtWidgets.QApplication.restoreOverrideCursor()
+        self._register_loaded(job, result)
+
+    # ---- 非同期読み込み（GUIを固まらせない）----
+    def _load_files_async(self, paths, on_finished=None):
+        """複数ファイルをワーカースレッドで読み込む。
+
+        pandas の解析は Qt に触らないのでスレッドで実行できる。GUI が必要な
+        準備（シート選択）と登録だけをメインスレッドで行い、その間ウィンドウは
+        操作可能なまま。進捗バーの「キャンセル」で途中中止できる。"""
+        paths = list(paths)
+        for p in [p for p in paths if os.path.splitext(p)[1].lower() in (".asc", ".net")]:
+            self.run_ltspice_asc(p)       # 回路は別系統（QProcess）で非同期実行
+        targets = [p for p in paths
+                   if os.path.splitext(p)[1].lower() not in (".asc", ".net")]
+        jobs = []
+        for p in targets:
+            job = self._load_job(p)       # シート選択などはここで先に済ませる
+            if job is not None:
+                jobs.append(job)
+        if not jobs:
+            if on_finished:
+                on_finished([])
+            return None
+        if getattr(self, "_load_thread", None) is not None:
+            self.notify("前の読み込みが実行中です。終わるまでお待ちください。", "warn")
+            return None
+
+        loaded, errors = [], []
+
+        # 小さくて少ない読み込みは、その場で済ませる。スレッド起動と進捗バーの
+        # 明滅のほうが待ち時間より長く、呼び出し側から見た完了タイミングも
+        # 素直になる（フリーズが問題になるのは大きい・多いときだけ）。
+        total_bytes = 0
+        for job in jobs:
+            try:
+                total_bytes += os.path.getsize(job["path"])
+            except OSError:
+                applog.get_logger().debug("_load_files_async: 無視した例外", exc_info=True)
+        if len(jobs) <= ASYNC_LOAD_COUNT and total_bytes <= ASYNC_LOAD_BYTES:
+            for job in jobs:
+                name = os.path.basename(job["path"])
+                try:
+                    res = data_loader.load_table(
+                        job["path"], encoding=job["enc"], delimiter=job["delim"],
+                        sheet=job["sheet"])
+                    loaded.append(self._register_loaded(job, res))
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{name}: {e}")
+            self._refresh_columns()
+            if loaded and self._has_drawn:
+                self.draw_graph()
+            if errors:
+                self.notify(f"{len(errors)} 件のファイルを読み込めませんでした。",
+                            "error", "\n".join(errors))
+            if on_finished:
+                on_finished(loaded)
+            return None
+
+        def _on_one(index, result, err):
+            job = jobs[index]
+            name = os.path.basename(job["path"])
+            if result is None:
+                errors.append(f"{name}: {err}")
+            else:
+                try:
+                    loaded.append(self._register_loaded(job, result))
+                except Exception as e:  # noqa: BLE001  登録側の失敗も1件ずつ報告
+                    errors.append(f"{name}: {e}")
+            self.progress_strip.update(index + 1)
+
+        def _on_progress(done, name):
+            self.progress_strip.update(done, f"読み込み中… {name}（{done + 1}/{len(jobs)}）")
+
+        def _on_finished():
+            thread = getattr(self, "_load_thread", None)
+            canceled = bool(thread is not None and thread.is_canceled())
+            self._load_thread = None
+            self.progress_strip.finish()
+            self._refresh_columns()
+            if loaded and self._has_drawn:
+                self.draw_graph()
+            if errors:
+                self.notify(f"{len(errors)} 件のファイルを読み込めませんでした。",
+                            "error", "\n".join(errors))
+            elif canceled:
+                self.notify(f"読み込みを中止しました（{len(loaded)} 件は読み込み済み）。", "warn")
+            elif loaded:
+                self.notify(f"{len(loaded)} 件のファイルを読み込みました。", "ok")
+            if on_finished:
+                on_finished(loaded)
+
+        thread = TableLoadThread(jobs, self)
+        self._load_thread = thread
+        thread.one_done.connect(_on_one)
+        thread.progressed.connect(_on_progress)
+        thread.finished.connect(_on_finished)
+        self.progress_strip.start(f"読み込み中…（0/{len(jobs)}）", len(jobs))
+        thread.start()
+        return thread
+
+    def _cancel_background(self):
+        """進捗バーのキャンセルボタン。実行中のワーカーへ中止を伝える。"""
+        thread = getattr(self, "_load_thread", None)
+        if thread is not None:
+            thread.cancel()
+            self._set_status("読み込みの中止を要求しました（実行中の1件が終わり次第停止）。")
+
+    def _stop_background_tasks(self):
+        """終了時にワーカースレッドを止める（スレッド生存中の破棄を避ける）。"""
+        thread = getattr(self, "_load_thread", None)
+        if thread is not None:
+            thread.cancel()
+            thread.wait(5000)
+            self._load_thread = None
+
+    def wait_for_loads(self, timeout_ms=30000):
+        """非同期読み込みの完了を待つ（スクリプト・テストから使う同期用）。
+
+        イベントループを回しながら待つので、登録処理（メインスレッド側）も
+        きちんと進む。GUI 操作からは使わない。"""
+        app = QtWidgets.QApplication.instance()
+        deadline = QtCore.QElapsedTimer()
+        deadline.start()
+        while getattr(self, "_load_thread", None) is not None:
+            if deadline.hasExpired(timeout_ms):
+                return False
+            if app is not None:
+                app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 20)
+        if app is not None:
+            app.processEvents()
+        return True
 
     # ------------------------------------------------------------ フォルダを開く
     def add_folder(self):
@@ -141,8 +288,7 @@ class DataIOMixin:
                  if os.path.splitext(f)[1].lower() in exts
                  and os.path.isfile(os.path.join(d, f))]
         if not files:
-            QtWidgets.QMessageBox.information(
-                self, "情報", "このフォルダに読み込めるデータファイルがありません。")
+            self.notify("このフォルダに読み込めるデータファイルがありません。", "warn")
             return
         if len(files) > 40:
             ret = QtWidgets.QMessageBox.question(
@@ -150,13 +296,12 @@ class DataIOMixin:
                 f"{len(files)} 個のファイルが見つかりました。すべて読み込みますか？")
             if ret != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
-        for p in files:
-            self._load_file(p)
         self.last_dir = d
-        self._refresh_columns()
-        if self._has_drawn:
-            self.draw_graph()
-        self._set_status(f"フォルダを読み込みました: {os.path.basename(d)}（{len(files)}ファイル）")
+        self._load_files_async(
+            files,
+            on_finished=lambda labels: self.notify(
+                f"フォルダを読み込みました: {os.path.basename(d)}"
+                f"（{len(labels)}/{len(files)} ファイル）", "ok"))
 
     # ------------------------------------------------------------ LTspice 連携
     # .asc 回路をバッチ実行し、生成された .raw を自動で読み込む。ファイル監視を
@@ -183,7 +328,7 @@ class DataIOMixin:
                 if os.path.isfile(str(c)):
                     return str(c)
         except Exception:
-            pass
+            applog.get_logger().debug("_ltspice_exe: 無視した例外", exc_info=True)
         import shutil
         return shutil.which("LTspice") or shutil.which("XVIIx64")
 
@@ -234,10 +379,8 @@ class DataIOMixin:
     def _on_ltspice_finished(self, code, asc_path, raw_path):
         self._lt_proc = None
         if not os.path.isfile(raw_path):
-            QtWidgets.QMessageBox.warning(
-                self, "LTspice",
-                f"シミュレーションは終了しましたが .raw が見つかりません（終了コード {code}）。\n"
-                f"回路にエラーがないか LTspice で確認してください:\n{asc_path}")
+            self.notify(f"シミュレーションは終了しましたが .raw が見つかりません（終了コード {code}）。\n"
+                        f"回路にエラーがないか LTspice で確認してください:\n{asc_path}", "warn")
             return
         self._load_file(raw_path)
         self._refresh_columns()
@@ -371,7 +514,7 @@ class DataIOMixin:
 
     def _open_recent(self, path):
         if not os.path.isfile(path):
-            QtWidgets.QMessageBox.information(self, "情報", f"ファイルが見つかりません:\n{path}")
+            self.notify(f"ファイルが見つかりません:\n{path}", "warn")
             self.recent_files = [q for q in self.recent_files if q != path]
             self._rebuild_recent_menu()
             return
@@ -387,7 +530,7 @@ class DataIOMixin:
             items = [self.file_list.currentItem()]
         labels = [it.text() for it in items]
         if not labels:
-            QtWidgets.QMessageBox.information(self, "情報", "削除するファイルを選択してください。")
+            self.notify("削除するファイルを選択してください。", "warn")
             return
         if len(labels) > 1:
             ret = QtWidgets.QMessageBox.question(
@@ -400,7 +543,7 @@ class DataIOMixin:
     def clear_all_files(self):
         """読み込み済みファイルをすべて削除する。"""
         if not self.datasets:
-            QtWidgets.QMessageBox.information(self, "情報", "読み込み済みファイルがありません。")
+            self.notify("読み込み済みファイルがありません。", "warn")
             return
         ret = QtWidgets.QMessageBox.question(
             self, "全削除", f"読み込み済みの {len(self.datasets)} 個すべてを一覧から削除しますか？")
@@ -447,7 +590,7 @@ class DataIOMixin:
     def reload_current(self):
         it = self.file_list.currentItem()
         if not it:
-            QtWidgets.QMessageBox.information(self, "情報", "ファイルを選択してください。")
+            self.notify("ファイルを選択してください。", "warn")
             return
         path = self.meta[it.text()]["path"]
         self.datasets.pop(it.text(), None)
@@ -616,7 +759,7 @@ class DataIOMixin:
     def _edit_target(self):
         lbl = getattr(self, "_preview_label", None)
         if not lbl or lbl not in self.datasets:
-            QtWidgets.QMessageBox.information(self, "情報", "左の一覧でファイルを選択してください。")
+            self.notify("左の一覧でファイルを選択してください。", "warn")
             return None
         return lbl
 
@@ -660,7 +803,7 @@ class DataIOMixin:
             return
         df = self.datasets[lbl]
         if name in df.columns:
-            QtWidgets.QMessageBox.warning(self, "列追加", "同名の列が既にあります。")
+            self.notify("同名の列が既にあります。", "warn")
             return
         df[name] = 0.0
         self._data_record({"kind": "col_add", "label": lbl, "name": name})

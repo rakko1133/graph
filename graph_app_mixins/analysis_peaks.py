@@ -63,7 +63,7 @@ class AnalysisMixin:
     def run_analysis(self):
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         import numpy as np
         y = np.asarray(y, float)
@@ -137,7 +137,7 @@ class AnalysisMixin:
         """選択中の全系列のFFTスペクトルを1枚に重ね描き（系列ごとに色分け・凡例）。"""
         items = self._selected_series_items()
         if not items:
-            QtWidgets.QMessageBox.information(self, "情報", "解析する系列を選択してください。")
+            self.notify("解析する系列を選択してください。", "warn")
             return
         import numpy as np
         win = self.fft_window.currentText() if hasattr(self, "fft_window") else "hann"
@@ -162,7 +162,7 @@ class AnalysisMixin:
                                 "text": f"{p['frequency']:.0f}Hz", "color": color})
             drawn += 1
         if drawn == 0:
-            QtWidgets.QMessageBox.warning(self, "FFT", "FFT を計算できませんでした。")
+            self.notify("FFT を計算できませんでした。", "warn")
             return
         self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
         self._reset_figure_axes()
@@ -174,7 +174,7 @@ class AnalysisMixin:
         try:
             self.fig.tight_layout()
         except Exception:
-            pass
+            applog.get_logger().debug("show_fft: 無視した例外", exc_info=True)
         self.canvas.draw()
         self._set_status(f"FFT表示: {drawn}系列を重ね描き")
 
@@ -183,7 +183,7 @@ class AnalysisMixin:
         """選択中の全系列のピーク＋測定を計算し、別ウィンドウ（表＋CSV保存）で表示する。"""
         items = self._selected_series_items()
         if not items:
-            QtWidgets.QMessageBox.information(self, "情報", "解析する系列を選択してください。")
+            self.notify("解析する系列を選択してください。", "warn")
             return
         import numpy as np
         peak_rows, meas_rows = [], []
@@ -199,7 +199,7 @@ class AnalysisMixin:
             for m in r["measurements"]:
                 meas_rows.append((disp, m["name"], m["value"], m["unit"]))
         if not peak_rows and not meas_rows:
-            QtWidgets.QMessageBox.information(self, "情報", "解析できる系列がありません。")
+            self.notify("解析できる系列がありません。", "warn")
             return
         self._show_analysis_window(peak_rows, meas_rows)
 

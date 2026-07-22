@@ -22,6 +22,7 @@ import ast as _ast
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 import re
+import string
 from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg as FigureCanvas,
@@ -41,6 +42,24 @@ _logger = None
 _crash_file = None   # faulthandler の出力先（GCで閉じないよう保持）
 
 
+class _TolerantRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """ローテーションに失敗しても落ちないファイルハンドラ。
+
+    Windows では別のプロセス（同時に起動したアプリ・テスト）が app.log を
+    開いていると os.rename が PermissionError になり、標準のハンドラは
+    そのたびに「--- Logging error ---」とトレースバックを吐く。ログが
+    肥大するだけで実害は無いので、失敗したら今回のローテーションを諦めて
+    そのまま書き続ける。"""
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except OSError:
+            # 回せなかった。ファイルを開き直して追記を続ける（記録は止めない）
+            if self.stream is None:
+                self.stream = self._open()
+
+
 def setup_logging(level=logging.INFO):
     """ロガーを構成して返す（多重構成しない）。"""
     global _logger
@@ -52,7 +71,7 @@ def setup_logging(level=logging.INFO):
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
-        fh = logging.handlers.RotatingFileHandler(
+        fh = _TolerantRotatingFileHandler(
             LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
         fh.setFormatter(fmt)
         logger.addHandler(fh)
@@ -3880,6 +3899,12 @@ UserRole = QtCore.Qt.ItemDataRole.UserRole
 DECIMATE_TARGET = 8000   # 折れ線/散布図でこの点数を超えたら間引いて表示
 BUSY_ROWS = 200_000      # この行数を超える読み込みは待機カーソルを出す
 BATCH_PARALLEL_THRESHOLD = 10**9   # 一括出力でこの枚数以上なら別プロセス並列を試みる
+ASYNC_LOAD_BYTES = 4_000_000   # 合計がこれを超える読み込みはワーカースレッドへ回す
+ASYNC_LOAD_COUNT = 8           # 枚数がこれを超える読み込みもワーカースレッドへ回す
+SERIES_BAR_MAX = 60      # 系列バーに並べるチェックボックスの上限（超過分は一覧から選ぶ）
+HEAVY_SERIES = 60        # これを超える系列数の描画は時間がかかるので確認を挟む
+MESSAGE_LOG_MAX = 500    # メッセージ履歴の保持件数
+NOTIFY_MS = 8000         # 通知バーの自動消灯までの時間（ミリ秒）
 
 
 def _parse_float(text, default=None):
@@ -3889,7 +3914,7 @@ def _parse_float(text, default=None):
     try:
         return float(text)        # 1e-6 / 0.000001 / 1000 などはそのまま
     except ValueError:
-        pass
+        pass                      # 失敗ではなく分岐（下の『底^指数』表記へ）
     # 『底^指数』表記も許可: 10^-6 → 1e-6, 2^10 → 1024（^ は累乗）
     m = re.fullmatch(r"([+-]?[\d.]+)\s*\^\s*([+-]?[\d.]+)", text)
     if m:
@@ -4131,6 +4156,228 @@ class CollapsibleBox(QtWidgets.QWidget):
     def set_expanded(self, on):
         self._btn.setChecked(bool(on))
 
+    def title(self):
+        return self._btn.text()
+
+
+# --------------------------------------------------------------- 配色（テーマ追従）
+def _mix(c1, c2, ratio):
+    """2色を ratio（0=c1, 1=c2）で混ぜる。"""
+    r = max(0.0, min(1.0, float(ratio)))
+    return QtGui.QColor(
+        round(c1.red() * (1 - r) + c2.red() * r),
+        round(c1.green() * (1 - r) + c2.green() * r),
+        round(c1.blue() * (1 - r) + c2.blue() * r))
+
+
+def palette_tokens(pal=None):
+    """現在のパレットから QSS 用の色トークンを作る。
+
+    QSS に色を直書きすると、OS がダークテーマのとき「白背景に白文字」に
+    なって読めなくなる。背景・文字・境界線をすべてパレットから導出すれば、
+    ライト／ダークのどちらでもコントラストが保たれる。
+    """
+    if pal is None:
+        app = QtWidgets.QApplication.instance()
+        pal = app.palette() if app is not None else QtGui.QPalette()
+    role = QtGui.QPalette.ColorRole
+    win = pal.color(role.Window)
+    base = pal.color(role.Base)
+    text = pal.color(role.WindowText)
+    button = pal.color(role.Button)
+    accent = pal.color(role.Highlight)
+    accent_text = pal.color(role.HighlightedText)
+    dark = win.lightness() < 128
+    return {
+        "bg": win.name(),
+        "fg": text.name(),
+        "base": base.name(),
+        "button": _mix(button, base, 0.35 if not dark else 0.15).name(),
+        "button_hover": _mix(button, accent, 0.25).name(),
+        "button_down": _mix(button, accent, 0.45).name(),
+        "accent": accent.name(),
+        "accent_fg": accent_text.name(),
+        "accent_soft": _mix(win, accent, 0.22).name(),
+        "border": _mix(win, text, 0.32).name(),
+        "border_soft": _mix(win, text, 0.18).name(),
+        "title_bg": _mix(win, text, 0.07).name(),
+        "muted": _mix(win, text, 0.55).name(),
+        "info_bg": _mix(win, QtGui.QColor("#1e88e5"), 0.18).name(),
+        "warn_bg": _mix(win, QtGui.QColor("#f9a825"), 0.24).name(),
+        "error_bg": _mix(win, QtGui.QColor("#e53935"), 0.22).name(),
+        "info_fg": _mix(text, QtGui.QColor("#1565c0"), 0.0 if dark else 0.7).name(),
+        "warn_fg": _mix(text, QtGui.QColor("#8d6e00"), 0.0 if dark else 0.7).name(),
+        "error_fg": _mix(text, QtGui.QColor("#b71c1c"), 0.0 if dark else 0.7).name(),
+    }
+
+
+def is_dark_theme(pal=None):
+    """現在のパレットがダーク配色か。"""
+    if pal is None:
+        app = QtWidgets.QApplication.instance()
+        pal = app.palette() if app is not None else QtGui.QPalette()
+    return pal.color(QtGui.QPalette.ColorRole.Window).lightness() < 128
+
+
+def render_qss(template, tokens=None):
+    """`$bg` 形式のトークンを含む QSS テンプレートを実際の色へ展開する。
+
+    QSS は `{}` を多用するので str.format ではなく string.Template を使う。"""
+    return string.Template(template).safe_substitute(tokens or palette_tokens())
+
+
+# --------------------------------------------------------------- 通知バー
+class NotificationBar(QtWidgets.QFrame):
+    """画面内に出す非モーダルの通知バー。
+
+    「読み込みました」「先に系列を選んでください」程度の告知でモーダル
+    ダイアログを出すと、そのたびに操作が止まって OK を押させられる。
+    このバーは操作を止めず、一定時間で自動的に消える。重要なもの
+    （エラー）は自動で消さず、閉じるまで残す。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("notify_bar")
+        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(8, 4, 4, 4)
+        lay.setSpacing(6)
+        self._icon = QtWidgets.QLabel()
+        self._icon.setAccessibleName("通知の種類")
+        lay.addWidget(self._icon)
+        self._text = QtWidgets.QLabel()
+        self._text.setWordWrap(True)
+        self._text.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._text.setAccessibleName("通知メッセージ")
+        lay.addWidget(self._text, 1)
+        self._detail_btn = QtWidgets.QToolButton()
+        self._detail_btn.setText("詳細")
+        self._detail_btn.setToolTip("メッセージの詳細を表示します")
+        self._detail_btn.clicked.connect(self._show_detail)
+        self._detail_btn.setVisible(False)
+        lay.addWidget(self._detail_btn)
+        close = QtWidgets.QToolButton()
+        close.setText("✕")
+        close.setToolTip("この通知を閉じます")
+        close.setAccessibleName("通知を閉じる")
+        close.clicked.connect(self.dismiss)
+        lay.addWidget(close)
+        self._detail = ""
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.dismiss)
+        self.setVisible(False)
+
+    def show_message(self, text, level="info", detail="", timeout_ms=NOTIFY_MS):
+        icons = {"info": "ℹ", "warn": "⚠", "error": "✖", "ok": "✔"}
+        tok = palette_tokens()
+        colors = {"info": ("info_bg", "info_fg"), "ok": ("info_bg", "info_fg"),
+                  "warn": ("warn_bg", "warn_fg"), "error": ("error_bg", "error_fg")}
+        bg, fg = colors.get(level, colors["info"])
+        self.setStyleSheet(
+            f"#notify_bar {{ background:{tok[bg]}; border:1px solid {tok['border_soft']};"
+            f" border-radius:3px; }}"
+            f"#notify_bar QLabel {{ color:{tok[fg]}; }}")
+        self._icon.setText(icons.get(level, "ℹ"))
+        self._text.setText(str(text))
+        self._detail = str(detail or "")
+        self._detail_btn.setVisible(bool(self._detail))
+        self.setVisible(True)
+        self._timer.stop()
+        if level != "error" and timeout_ms:      # エラーは自分で閉じるまで残す
+            self._timer.start(int(timeout_ms))
+
+    def dismiss(self):
+        self._timer.stop()
+        self.setVisible(False)
+
+    def current_text(self):
+        return self._text.text()
+
+    def _show_detail(self):
+        QtWidgets.QMessageBox.information(self, "詳細", self._detail or self._text.text())
+
+
+class ProgressStrip(QtWidgets.QFrame):
+    """非モーダルの進捗表示（ラベル＋バー＋キャンセル）。
+
+    モーダルの QProgressDialog と違い、進捗中も他のパネルを見たり
+    ウィンドウを動かしたりできる。"""
+
+    canceled = QtCore.Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(8, 2, 8, 2)
+        lay.setSpacing(6)
+        self._label = QtWidgets.QLabel("")
+        self._label.setAccessibleName("処理の状況")
+        lay.addWidget(self._label)
+        self._bar = QtWidgets.QProgressBar()
+        self._bar.setAccessibleName("進捗")
+        self._bar.setMaximumHeight(14)
+        lay.addWidget(self._bar, 1)
+        self._cancel = QtWidgets.QPushButton("キャンセル")
+        self._cancel.setToolTip("実行中の処理を中止します")
+        self._cancel.clicked.connect(self.canceled.emit)
+        lay.addWidget(self._cancel)
+        self.setVisible(False)
+
+    def start(self, text, total):
+        self._label.setText(text)
+        self._bar.setRange(0, max(1, int(total)))
+        self._bar.setValue(0)
+        self._cancel.setEnabled(True)
+        self.setVisible(True)
+
+    def update(self, value, text=None):
+        self._bar.setValue(int(value))
+        if text is not None:
+            self._label.setText(text)
+
+    def finish(self):
+        self.setVisible(False)
+
+
+# --------------------------------------------------------------- 読み込みワーカー
+class TableLoadThread(QtCore.QThread):
+    """`load_table` を GUI スレッドの外で実行するワーカー。
+
+    50万点級の CSV をイベントループ上で読むとウィンドウが固まり、Windows に
+    「応答なし」と判定される。読み込みは Qt に触らない純粋な処理なので、
+    ここで実行して結果だけをシグナルで GUI スレッドへ返す。
+    """
+
+    one_done = QtCore.Signal(int, object, str)   # 添字, (df, enc, delim) か None, エラー文
+    progressed = QtCore.Signal(int, str)         # 完了数, 次に読むファイル名
+
+    def __init__(self, jobs, parent=None):
+        super().__init__(parent)
+        self.jobs = list(jobs)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def is_canceled(self):
+        return self._cancel
+
+    def run(self):
+        for i, job in enumerate(self.jobs):
+            if self._cancel:
+                break
+            self.progressed.emit(i, os.path.basename(job["path"]))
+            try:
+                res = load_table(
+                    job["path"], encoding=job.get("enc"),
+                    delimiter=job.get("delim"), sheet=job.get("sheet"))
+                self.one_done.emit(i, res, "")
+            except Exception as e:  # noqa: BLE001  読み込み失敗は1件ずつ通知して続行
+                self.one_done.emit(i, None, str(e))
+
 
 __all__ = [
     "os",
@@ -4155,12 +4402,24 @@ __all__ = [
     "DECIMATE_TARGET",
     "BUSY_ROWS",
     "BATCH_PARALLEL_THRESHOLD",
+    "ASYNC_LOAD_BYTES",
+    "ASYNC_LOAD_COUNT",
+    "SERIES_BAR_MAX",
+    "HEAVY_SERIES",
+    "MESSAGE_LOG_MAX",
+    "NOTIFY_MS",
     "_parse_float",
     "CheckListWidget",
     "LazyColumnCombo",
     "CollapsibleBox",
     "ExplorerTree",
     "SERIES_MIME",
+    "palette_tokens",
+    "is_dark_theme",
+    "render_qss",
+    "NotificationBar",
+    "ProgressStrip",
+    "TableLoadThread",
 ]
 
 # ======================================================================
@@ -4187,9 +4446,18 @@ class UIBuildMixin:
 
         メニューを動的に走査すると PySide6 の QAction.menu() が返す一時ラッパーの
         破棄で C++ 側の QMenu ごと削除される（所有権の罠）ため、構築時に登録した
-        アクションだけを候補にする。"""
+        アクションだけを候補にする。
+
+        QAction 以外（メソッドなど）を混ぜると show_command_palette の
+        `a.isEnabled()` が AttributeError になり、**パレット全体が開かなくなる**。
+        1件の登録ミスで52コマンドが道連れになるので、ここで弾いて記録する。"""
         if not hasattr(self, "_all_actions"):
             self._all_actions = []
+        if not isinstance(act, QtGui.QAction):
+            get_logger().warning(
+                "コマンドパレットに QAction 以外を登録しようとした: %s / %s (%s)",
+                category, label, type(act).__name__)
+            return
         cat = str(category).replace("&", "").replace("...", "").strip()
         self._all_actions.append((f"{cat} › {label.replace('&', '')}", act))
 
@@ -4231,8 +4499,31 @@ class UIBuildMixin:
         # 表示
         vm = m.addMenu("表示(&V)")
         self.view_menu = vm   # パネルの表示/非表示トグルを _build_central で追加する
+        # 表示レベル（画面に出す量）。隠れた項目は Ctrl+F / Ctrl+Shift+P から呼べる
+        level_menu = vm.addMenu("表示レベル")
+        self._level_actions = {}
+        level_group = QtGui.QActionGroup(self)
+        level_group.setExclusive(True)
+        _LEVEL_TIPS = {
+            "基本": "読み込み→列選択→描画に必要な物だけを出す（隠れた設定も Ctrl+F で呼べます）",
+            "標準": "基本＋オシロ/解析と主な書式",
+            "全部": "すべてのパネル・設定を表示（従来と同じ）",
+        }
+        for lv in self.UI_LEVELS:
+            act = QtGui.QAction(lv, self)
+            act.setCheckable(True)
+            act.setStatusTip(_LEVEL_TIPS[lv])
+            act.triggered.connect(lambda _c=False, x=lv: self.set_ui_level(x))
+            level_group.addAction(act)
+            level_menu.addAction(act)
+            self._level_actions[lv] = act
+            self._palette_register("表示レベル", lv, act)
+        vm.addSeparator()
         self._menu_action(vm, "コマンドパレット...", self.show_command_palette, "Ctrl+Shift+P",
                           tip="すべてのメニュー操作を名前で検索して実行")
+        self._menu_action(vm, "設定を検索...", self._focus_setting_search, "Ctrl+F",
+                          tip="設定名でパネルを横断検索し、その項目まで画面を移動します"
+                              "（設定はデータ・書式・描画バー・ツールバーに分かれているため）")
         vm.addSeparator()
         self._menu_action(vm, "グラフを描画", self.draw_graph, "F5")
         self._menu_action(vm, "新しいグラフウィンドウ（現在のグラフを複製）",
@@ -4323,6 +4614,10 @@ class UIBuildMixin:
     # ---- UIスタイル（外観テーマ）----
     # ウィジェット構成は一切変えず、QSS＋ツールバー設定で密度・大きさ・配色だけを
     # 変える。機能は全スタイルで同一（見た目の再現のみ）。
+    #
+    # 色は `$bg` `$fg` のようなトークンで書き、適用時に palette_tokens() で
+    # 現在のパレット由来の実色へ展開する。色を直書きすると OS がダークテーマの
+    # とき「白背景に白文字」になって読めなくなるため、直書きは禁止。
     _UI_STYLES = {
         # 標準にも「基準QSS」を持たせ、ボタン/入力欄の高さを統一して見切れを防ぐ
         "standard": {
@@ -4334,21 +4629,22 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
         "labplot": {   # KDE Breeze調: ゆったり・角丸・青アクセント
             "qss": """
 QWidget { font-size: 10pt; }
-QPushButton { background:#fcfcfc; border:1px solid #bfc4c9; border-radius:3px;
-              padding:5px 12px; }
-QPushButton:hover { border-color:#3daee9; }
-QPushButton:pressed, QPushButton:checked { background:#d6ecf8; border-color:#3daee9; }
+QPushButton { background:$button; color:$fg; border:1px solid $border;
+              border-radius:3px; padding:5px 12px; }
+QPushButton:hover { border-color:$accent; }
+QPushButton:pressed, QPushButton:checked { background:$accent_soft; border-color:$accent; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    border:1px solid #bfc4c9; border-radius:3px; padding:3px 6px; background:white; }
+    border:1px solid $border; border-radius:3px; padding:3px 6px;
+    background:$base; color:$fg; }
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
-    border-color:#3daee9; }
-QTreeWidget, QListWidget, QTableWidget { border:1px solid #cfd4d9; border-radius:3px; }
+    border-color:$accent; }
+QTreeWidget, QListWidget, QTableWidget { border:1px solid $border_soft; border-radius:3px; }
 QTreeWidget::item { min-height:24px; }
 QTabBar::tab { padding:6px 14px; }
 QToolBar { spacing:4px; padding:3px; }
 QToolButton { padding:4px; border-radius:3px; }
-QToolButton:hover { background:#d6ecf8; }
-QDockWidget::title { background:#eff0f1; padding:5px; }
+QToolButton:hover { background:$accent_soft; }
+QDockWidget::title { background:$title_bg; color:$fg; padding:5px; }
 """,
             "tb_style": "beside", "tb_icon": 22, "indent": 20},
         "veusz": {     # 実用主義コンパクト: 小さく詰めて情報密度を上げる
@@ -4367,50 +4663,53 @@ QDockWidget::title { padding:2px; }
             "qss": """
 QWidget { font-size: 9pt; }
 QToolBar { border:0; spacing:2px; padding:2px; background:transparent; }
-QDockWidget::title { background:transparent; padding:3px; }
-QPushButton { padding:3px 10px; border:1px solid #c9c9c9; border-radius:2px;
-              background:#f7f7f7; }
-QPushButton:checked { background:#e2e2e2; }
-QTreeWidget, QListWidget, QTableWidget { border:1px solid #dddddd; }
+QDockWidget::title { background:transparent; color:$fg; padding:3px; }
+QPushButton { padding:3px 10px; border:1px solid $border_soft; border-radius:2px;
+              background:$button; color:$fg; }
+QPushButton:checked { background:$accent_soft; }
+QTreeWidget, QListWidget, QTableWidget { border:1px solid $border_soft; }
 QTreeWidget::item { min-height:20px; }
 QTabBar::tab { padding:4px 10px; }
 """,
             "tb_style": "icon", "tb_icon": 18, "indent": 16},
-        "igor": {      # クラシック高密度: グレー基調・小さな立体ボタン
+        "igor": {      # クラシック高密度: 小さな立体ボタン・詰めた余白
             "qss": """
 QWidget { font-size: 8pt; }
-QMainWindow, QDockWidget, QTabWidget::pane { background-color:#ececec; }
-QPushButton { background:qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                                         stop:0 #fdfdfd, stop:1 #dcdcdc);
-              border:1px solid #8f8f8f; border-radius:2px; padding:2px 9px;
+QMainWindow, QDockWidget, QTabWidget::pane { background-color:$bg; }
+QPushButton { background:$button; color:$fg;
+              border:1px solid $border; border-radius:2px; padding:2px 9px;
               min-height:18px; }
-QPushButton:pressed, QPushButton:checked { background:#cfcfcf; }
+QPushButton:pressed, QPushButton:checked { background:$accent_soft; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    background:white; border:1px solid #9a9a9a; padding:1px 3px; }
-QTreeWidget, QListWidget, QTableWidget { background:white; border:1px solid #9a9a9a; }
+    background:$base; color:$fg; border:1px solid $border; padding:1px 3px; }
+QTreeWidget, QListWidget, QTableWidget { background:$base; color:$fg;
+    border:1px solid $border; }
 QTreeWidget::item { min-height:18px; }
-QDockWidget::title { background:#dcdcdc; border:1px solid #b0b0b0; padding:3px; }
-QTabBar::tab { padding:3px 10px; background:#dcdcdc; border:1px solid #b0b0b0; }
-QTabBar::tab:selected { background:#ececec; }
-QToolBar { background:#e4e4e4; spacing:1px; }
+QDockWidget::title { background:$title_bg; color:$fg;
+    border:1px solid $border_soft; padding:3px; }
+QTabBar::tab { padding:3px 10px; background:$title_bg; color:$fg;
+    border:1px solid $border_soft; }
+QTabBar::tab:selected { background:$bg; }
+QToolBar { background:$title_bg; spacing:1px; }
 """,
             "tb_style": "icon", "tb_icon": 20, "indent": 14},
     }
 
+    _UI_STYLE_NAMES = {"standard": "標準", "labplot": "LabPlot風", "veusz": "Veusz風",
+                       "kst": "KST2風", "igor": "Igor Pro風"}
+
     def _set_ui_style(self, name):
         """メニューからのUIスタイル切替（ステータス案内つき）。"""
         self._apply_ui_style(name)
-        names = {"standard": "標準", "labplot": "LabPlot風", "veusz": "Veusz風",
-                 "kst": "KST2風", "igor": "Igor Pro風"}
-        self._set_status(f"UIスタイル: {names.get(name, name)}"
-                         "（配置も合わせるなら 表示→レイアウト を併用）")
+        self._set_status(f"外観: {self._UI_STYLE_NAMES.get(name, name)}"
+                         "（配置も合わせるなら 表示→見た目 の上段を選んでください）")
 
     def _apply_ui_style(self, name):
         """UIスタイル（外観テーマ）を適用する。ウィジェット・機能は変えない。"""
         style = self._UI_STYLES.get(name)
         if style is None:
             return
-        self.setStyleSheet(style["qss"])
+        self.setStyleSheet(render_qss(style["qss"]))
         tb = getattr(self, "main_toolbar", None)
         if tb is not None:
             tb.setIconSize(QtCore.QSize(style["tb_icon"], style["tb_icon"]))
@@ -4422,6 +4721,187 @@ QToolBar { background:#e4e4e4; spacing:1px; }
             self.explorer.setIndentation(style["indent"])
         self._ui_settings().setValue("ui/style", name)
         self._ui_style_name = name
+        self._apply_figure_theme()
+
+    # ---- 表示レベル（画面に出す量の切り替え）----
+    # 方針: 隠すのは setVisible(False) だけ。ウィジェットは常に全部作り、
+    # self の属性として保持する。こうすると _collect_config / _apply_config /
+    # _scope_dict / _wire_live_signals / 既存テストの属性参照が無改造で動き、
+    # 「隠す＝機能を失う」にならない。隠したものは設定検索（Ctrl+F）と
+    # コマンドパレット（Ctrl+Shift+P）から名前で必ず呼び戻せる。
+    UI_LEVELS = ("基本", "標準", "全部")
+    # 通常版の既定。シンプル版はサブクラスでこれを "基本" に上書きする。
+    DEFAULT_UI_LEVEL = "全部"
+
+    # 各レベルで見せるドック（objectName）と書式セクション（_fmt_sections のキー）。
+    # 「全部」は例外扱いで、この表を参照せず全部見せる。
+    _LEVEL_VIEW = {
+        "基本": {
+            "docks": ("dock_files", "dock_data"),
+            "sections": ("axes_sel", "labels", "legend"),
+        },
+        "標準": {
+            "docks": ("dock_files", "dock_data", "dock_scope", "dock_format"),
+            "sections": ("file_ops", "axes_sel", "labels", "legend", "axis",
+                         "trend", "bins", "aspect", "export"),
+        },
+    }
+    # 基本レベルでは書式ドックも出す（種別・ラベル・凡例だけの薄い状態で）
+    _LEVEL_EXTRA_DOCKS = {"基本": ("dock_format",)}
+
+    def ui_level(self):
+        return getattr(self, "_ui_level", "全部")
+
+    def set_ui_level(self, level, announce=True):
+        """表示レベルを切り替える（メニュー・ステータスバーから）。"""
+        if level not in self.UI_LEVELS:
+            return
+        self._apply_ui_level(level)
+        self._ui_settings().setValue("ui/level", level)
+        if announce:
+            self.notify(
+                f"表示レベル: {level}"
+                + ("（隠れている設定も Ctrl+F で名前を入れれば出てきます）"
+                   if level != "全部" else ""),
+                "info")
+
+    def _apply_ui_level(self, level):
+        """レベルに応じてドック・書式セクションの表示/非表示を決める。
+
+        注意: 左のドックはタブ化されているため、背面タブの `isVisible()` は
+        False になる。「ユーザーが閉じた」の判定に visibilityChanged を使うと
+        タブ切替を閉じたと誤認するので、レベルだけが可視性を決める規約にする。"""
+        if level not in self.UI_LEVELS:
+            level = "全部"
+        self._ui_level = level
+        docks = self._all_docks()
+        visible_docks = self._visible_dock_names(level)
+        visible_sections = self._visible_section_keys(level)
+        for d in docks:
+            d.setVisible(d.objectName() in visible_docks)
+        for key, box in getattr(self, "_fmt_sections", {}).items():
+            box.setVisible(key in visible_sections)
+        # タブ化された左ドック群は、表示にした中の1枚を必ず前面に出す
+        # （全部隠して1枚だけ出したとき、そのタブが選ばれていないと空に見える）
+        for d in docks:
+            if d.objectName() in visible_docks and not d.isFloating():
+                d.raise_()
+                break
+        # ドックを出し入れすると中央の取り分が変わるので、幅を明示し直す
+        if level != "全部":
+            self._restore_dock_sizes()
+        self._sync_level_ui()
+        return level
+
+    def _visible_dock_names(self, level=None):
+        """そのレベルで出すドックの objectName 集合。"""
+        level = level or self.ui_level()
+        if level not in self._LEVEL_VIEW:
+            return {d.objectName() for d in self._all_docks()}
+        return (set(self._LEVEL_VIEW[level]["docks"])
+                | set(self._LEVEL_EXTRA_DOCKS.get(level, ())))
+
+    def _visible_section_keys(self, level=None):
+        """そのレベルで出す書式セクションのキー集合。"""
+        level = level or self.ui_level()
+        if level not in self._LEVEL_VIEW:
+            return set(getattr(self, "_fmt_sections", {}))
+        return set(self._LEVEL_VIEW[level]["sections"])
+
+    def _all_docks(self):
+        """このウィンドウが持つドックの一覧（順序は左タブ→書式）。"""
+        docks = [getattr(self, "files_dock", None)]
+        docks += list(getattr(self, "left_docks", []))
+        docks.append(getattr(self, "format_dock", None))
+        return [d for d in docks if d is not None]
+
+    def _restore_dock_sizes(self):
+        """レベル変更でドックを隠した後、残ったドックの幅を既定に戻す。"""
+        try:
+            left = getattr(self, "left_docks", None)
+            if left:
+                self.resizeDocks([left[0]], [360], QtCore.Qt.Orientation.Horizontal)
+            fdock = getattr(self, "format_dock", None)
+            if fdock is not None and not fdock.isHidden():
+                self.resizeDocks([fdock], [400], QtCore.Qt.Orientation.Horizontal)
+        except Exception:   # noqa: BLE001  幅の調整は見た目だけなので失敗しても進む
+            get_logger().debug("ドック幅の再設定に失敗", exc_info=True)
+
+    def _sync_level_ui(self):
+        """メニューのチェックとステータスバーの表示をレベルに合わせる。"""
+        for lv, act in getattr(self, "_level_actions", {}).items():
+            act.blockSignals(True)
+            act.setChecked(lv == self._ui_level)
+            act.blockSignals(False)
+        btn = getattr(self, "_level_button", None)
+        if btn is not None:
+            btn.setText(f"表示: {self._ui_level} ▾")
+
+    # ---- OSのライト/ダーク切替への追従 ----
+    def _effective_bg_color(self):
+        """グラフの地色。ユーザー指定が無ければウィンドウの配色に合わせる。
+
+        ダークテーマでウィンドウだけ暗くなり、グラフだけ真っ白で残ると
+        まぶしくて読めない。明示指定があればそれを最優先する。"""
+        user_bg = (getattr(self, "bg_color", "") or "").strip()
+        if user_bg:
+            return user_bg
+        return palette_tokens()["base"] if is_dark_theme() else ""
+
+    def _apply_figure_theme(self, redraw=True):
+        """地色の明暗に合わせて、目盛り・軸ラベル・枠線・凡例の文字色を決める。
+
+        描画のたびに呼ぶ（plot_series は地色しか塗らないので、暗い地色のまま
+        だと黒い目盛り文字が読めなくなる）。"""
+        fig = getattr(self, "fig", None)
+        if fig is None:
+            return
+        try:
+            face = self._effective_bg_color() or "white"
+            import matplotlib.colors as mcolors
+            r, g, b = mcolors.to_rgb(face)
+            dark_face = (0.299 * r + 0.587 * g + 0.114 * b) < 0.5
+            fg = "#e6e6e6" if dark_face else "black"
+            fig.set_facecolor(face)
+            for ax in fig.get_axes():
+                ax.tick_params(colors=fg, which="both")
+                for spine in getattr(ax, "spines", {}).values():
+                    spine.set_color(fg)
+                axes = [ax.xaxis, ax.yaxis] + ([ax.zaxis] if hasattr(ax, "zaxis") else [])
+                for a in axes:
+                    a.label.set_color(fg)
+                if ax.get_title():
+                    ax.title.set_color(fg)
+                legend = ax.get_legend()
+                if legend is not None:
+                    # 枠も塗らないと、暗い地色の上に白い凡例だけが浮いて
+                    # その中の明るい文字が読めなくなる
+                    frame = legend.get_frame()
+                    frame.set_facecolor(face)
+                    frame.set_edgecolor(fg)
+                    for text in legend.get_texts():
+                        text.set_color(fg)
+                    title = legend.get_title()
+                    if title is not None:
+                        title.set_color(fg)
+            canvas = getattr(self, "canvas", None)
+            if canvas is not None and redraw:
+                canvas.draw_idle()
+        except Exception:   # noqa: BLE001  配色は表示上の飾りなので失敗しても続行
+            get_logger().debug("グラフ配色の適用に失敗", exc_info=True)
+
+    def _on_palette_changed(self, event_type):
+        """OS のテーマ変更（ライト⇔ダーク）でスタイルを再適用する。
+
+        呼び出し元は GraphApp.changeEvent（super() を呼ぶメソッドは Mixin に
+        置かない、というこのプロジェクトの決まりに従うため本体側に置く）。"""
+        if event_type not in (QtCore.QEvent.Type.PaletteChange,
+                              QtCore.QEvent.Type.ThemeChange):
+            return
+        name = getattr(self, "_ui_style_name", None)
+        if not name:
+            return
+        QtCore.QTimer.singleShot(0, lambda: self._apply_ui_style(name))
 
     def _build_toolbar(self):
         """よく使う操作をワンクリックで呼べるツールバー（メニューと同じ機能）。"""
@@ -4504,14 +4984,26 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         for d in self.left_docks[1:]:           # 既定はタブ化（従来の見た目）
             self.tabifyDockWidget(self.left_docks[0], d)
 
-        # 中央：グラフ表示＋データ編集
+        # 中央：通知バー＋進捗＋（グラフ表示／データ編集）
         center = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.center_splitter = center
         center.addWidget(self._build_plot_area())
         center.addWidget(self._build_preview())
         center.setStretchFactor(0, 4)
         center.setStretchFactor(1, 1)
-        self.setCentralWidget(center)
+        holder = QtWidgets.QWidget()
+        hlay = QtWidgets.QVBoxLayout(holder)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        hlay.setSpacing(2)
+        # 告知はここに出す（モーダルダイアログで操作を止めない）
+        self.notify_bar = NotificationBar(holder)
+        hlay.addWidget(self.notify_bar)
+        # 読み込みなどの進行状況（非モーダル。キャンセル可）
+        self.progress_strip = ProgressStrip(holder)
+        self.progress_strip.canceled.connect(self._cancel_background)
+        hlay.addWidget(self.progress_strip)
+        hlay.addWidget(center, 1)
+        self.setCentralWidget(holder)
 
         # 右端：グラフ書式調整パネル（書式コントロール＋系列スタイル表）
         fdock = QtWidgets.QDockWidget("グラフ書式調整", self)
@@ -4553,10 +5045,12 @@ QToolBar { background:#e4e4e4; spacing:1px; }
             float_menu.addAction(a)
             self._palette_register("表示", f"{d.windowTitle()} を別ウィンドウで表示", a)
             self._float_actions[d.objectName()] = a
-        # ワンクリックのレイアウトプリセット（GUIが評価の高いツールの配置を再現）
-        lay_menu = vm.addMenu("レイアウト")
+        # 見た目のプリセット。以前は「レイアウト」と「UIスタイル（外観のみ）」の
+        # 2メニューに分かれていて、片方だけ変えると中途半端な画面になっていた。
+        # 既定は配置＋外観をまとめて適用し、外観だけの切替は下位メニューに置く。
+        lay_menu = vm.addMenu("見た目（配置＋外観）")
         self._menu_action(lay_menu, "標準（3ペイン）", lambda: self._apply_layout_preset("standard"),
-                          tip="左パネル＋中央グラフ＋右書式の標準配置に戻す")
+                          tip="左パネル＋中央グラフ＋右書式の標準配置・標準の外観に戻す")
         self._menu_action(lay_menu, "グラフ集中（Saleae風）",
                           lambda: self._apply_layout_preset("graph"),
                           tip="パネルを全部たたみ、グラフをほぼ全画面に（波形をじっくり見る）")
@@ -4567,39 +5061,35 @@ QToolBar { background:#e4e4e4; spacing:1px; }
                           lambda: self._apply_layout_preset("data"),
                           tip="データパネル＋大きなデータ編集表（読み込み・クレンジング向け）")
         lay_menu.addSeparator()
-        self._menu_action(lay_menu, "LabPlot風（配置＋外観）",
+        self._menu_action(lay_menu, "LabPlot風",
                           lambda: self._apply_layout_preset("labplot"),
                           tip="左にプロジェクトツリー＋統計解析タブ・右にプロパティ・下にスプレッドシート、"
                               "外観はBreeze調（LabPlotの標準画面）")
-        self._menu_action(lay_menu, "Veusz風（配置＋外観）",
+        self._menu_action(lay_menu, "Veusz風",
                           lambda: self._apply_layout_preset("veusz"),
                           tip="ツールバーを左縦に移し、左にデータツリー（上）＋書式（下）の縦積み、"
                               "右は大きなグラフ。外観はコンパクト（Veuszの編集画面）")
-        self._menu_action(lay_menu, "KST2風（配置＋外観）",
+        self._menu_action(lay_menu, "KST2風",
                           lambda: self._apply_layout_preset("kst"),
                           tip="プロットを全画面にし、データはフロートの小窓（データマネージャ風）。"
                               "外観はミニマル（KST2のライブ監視画面）")
-        self._menu_action(lay_menu, "Igor Pro風（配置＋外観）",
+        self._menu_action(lay_menu, "Igor Pro風",
                           lambda: self._apply_layout_preset("igor"),
                           tip="データ・オシロ解析・書式の3枚をカスケードのフロートウィンドウにし、"
                               "メインはグラフ専用。外観はクラシック高密度（IgorのMDI風）")
-        # 外観テーマ（配置は保ったまま、ボタンの大きさ・余白・密度・配色だけ切り替える）
-        style_menu = vm.addMenu("UIスタイル（外観のみ）")
-        self._menu_action(style_menu, "標準", lambda: self._set_ui_style("standard"),
-                          tip="既定の外観に戻す（配置はそのまま）")
-        self._menu_action(style_menu, "LabPlot風（ゆったりモダン）",
-                          lambda: self._set_ui_style("labplot"),
-                          tip="外観のみ: Breeze調の大きめボタン・角丸・青アクセント。配置も変えるなら レイアウト→LabPlot風")
-        self._menu_action(style_menu, "Veusz風（コンパクト）",
-                          lambda: self._set_ui_style("veusz"),
-                          tip="外観のみ: 小さいフォントと詰めた余白。配置も変えるなら レイアウト→Veusz風")
-        self._menu_action(style_menu, "KST2風（ミニマル）",
-                          lambda: self._set_ui_style("kst"),
-                          tip="外観のみ: 枠線・装飾を減らした薄いクローム。配置も変えるなら レイアウト→KST2風")
-        self._menu_action(style_menu, "Igor Pro風（クラシック高密度）",
-                          lambda: self._set_ui_style("igor"),
-                          tip="外観のみ: グレー基調・小さな立体ボタン。配置も変えるなら レイアウト→Igor Pro風")
+        # 配置は保ったまま、ボタンの大きさ・余白・密度だけ変えたい人向け（下位扱い）
+        lay_menu.addSeparator()
+        style_menu = lay_menu.addMenu("配置は変えずに外観だけ")
+        for key, label, tip in (
+                ("standard", "標準", "既定の外観に戻す（配置はそのまま）"),
+                ("labplot", "LabPlot風（ゆったり）", "大きめボタン・角丸・広い余白"),
+                ("veusz", "Veusz風（コンパクト）", "小さいフォントと詰めた余白"),
+                ("kst", "KST2風（ミニマル）", "枠線・装飾を減らした薄いクローム"),
+                ("igor", "Igor Pro風（高密度）", "小さな立体ボタン・詰めた行間")):
+            self._menu_action(style_menu, label, lambda k=key: self._set_ui_style(k), tip=tip)
         vm.addSeparator()
+        self._menu_action(vm, "メッセージ履歴…", self.show_message_log,
+                          tip="これまでのメッセージ・警告・エラーを一覧で見る")
         self._menu_action(vm, "パネル配置をリセット", self._reset_panel_layout,
                           tip="パネルのドッキング配置・表示状態を初期状態に戻す")
         # 読み込み済みファイルは既定で独立ウィンドウとして浮かべる
@@ -4612,6 +5102,8 @@ QToolBar { background:#e4e4e4; spacing:1px; }
 
         self._wire_live_signals()
         self._add_tooltips()
+        self._build_setting_index()   # 設定検索の索引（この時点で全部組み上がっている）
+        self._apply_accessibility()   # アクセシブル名・buddy・Tab順・ニーモニック
 
     # ---- ネイティブ枠フロートの「戻す」操作（スナップと両立させる）----
     # OSスナップ=画面の端／ドッキング=メインウィンドウの左右端ゾーン、と場所で
@@ -4749,7 +5241,14 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         """ワンクリックのレイアウトプリセット。
 
         graph=Saleae風（グラフほぼ全画面）／analysis=オシロ作業／data=データ整備。
-        隠したパネルは表示メニュー（またはレイアウト→標準）でいつでも戻せる。"""
+        隠したパネルは表示メニュー（またはレイアウト→標準）でいつでも戻せる。
+
+        レイアウトは「どのパネルをどこに置くか」を直接決めるものなので、
+        表示レベルとは競合する。プリセットを選んだ時点でレベルは「全部」に
+        上げる（そうしないと、プリセットが出したパネルをレベルが隠し返す）。"""
+        if self.ui_level() != "全部":
+            self._apply_ui_level("全部")
+            self._ui_settings().setValue("ui/level", "全部")
         total = max(sum(self.center_splitter.sizes()), 400)
         for d in [self.files_dock, *self.left_docks, self.format_dock]:
             d.setFloating(False)
@@ -5167,7 +5666,7 @@ QToolBar { background:#e4e4e4; spacing:1px; }
                 try:   # 種別ごとのOS実物アイコン（VS Code同様に拡張子で見分けられる）
                     icon = self._icon_provider.icon(QtCore.QFileInfo(path))
                 except Exception:
-                    pass
+                    get_logger().debug("make_file_node: 無視した例外", exc_info=True)
             node.setIcon(0, icon)
             node.setFlags(flags_file)
             node.setCheckState(0, QtCore.Qt.CheckState.Unchecked)
@@ -5472,7 +5971,7 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         """データセットの表示名を付け替える（スタイル・チェック・プレビューも追従）。
         ディスク上のファイル名は変更しない（表示名のみ）。"""
         if new in self.datasets:
-            QtWidgets.QMessageBox.warning(self, "名前の変更", "同名のデータが既にあります。")
+            self.notify("同名のデータが既にあります。", "warn")
             return
         if old not in self.datasets:
             return
@@ -5530,7 +6029,22 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         return box
 
     def _build_format_panel(self):
-        """右端のグラフ書式調整パネル（上：グラフ書式コントロール／下：系列スタイル表）。"""
+        """右端のグラフ書式調整パネル（上：設定検索／中：書式コントロール／下：系列スタイル表）。"""
+        wrap = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(wrap)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+        # 設定はこのパネル・データパネル・描画バー・ツールバーに分かれて置かれている。
+        # 「どこにあるか」を覚えていなくても名前で辿り着けるように検索を用意する。
+        self.setting_search = QtWidgets.QLineEdit()
+        self.setting_search.setPlaceholderText("設定を検索（例: 凡例, 対数, DPI）")
+        self.setting_search.setToolTip(
+            "設定名の一部を入力して Enter。該当のパネルを開いて、その項目まで移動します。")
+        self.setting_search.setAccessibleName("設定の検索")
+        self.setting_search.setClearButtonEnabled(True)
+        self.setting_search.returnPressed.connect(self._jump_to_setting)
+        outer.addWidget(self.setting_search)
+
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.format_splitter = split
         scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
@@ -5540,7 +6054,272 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         split.addWidget(self._build_style_box())     # 系列スタイル表
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
-        return split
+        outer.addWidget(split, 1)
+        return wrap
+
+    # ---- 設定検索（散らばった設定へジャンプする）----
+    def _build_setting_index(self):
+        """全パネルのコントロールを「セクション › 名前」で引ける索引にする。"""
+        self._setting_index = []
+        docks = [getattr(self, "files_dock", None), *getattr(self, "left_docks", []),
+                 getattr(self, "format_dock", None)]
+        for dock in [d for d in docks if d is not None]:
+            if dock.widget() is not None:
+                self._index_widget(dock.widget(), dock, "", ["", None])
+        # ドックの外にある常設コントロール（描画バー・系列バー・データ編集バー）も
+        # 索引に入れる。索引に無い＝名前で呼び戻せない＝隠せない、なので網羅が要る。
+        for holder, section in ((getattr(self, "series_bar", None), "描画バー"),
+                                (getattr(self, "_preview_bar_host", None), "データ編集")):
+            if holder is not None and holder.layout() is not None:
+                self._index_layout(holder.layout(), None, section, ["", None])
+        for w, name in ((getattr(self, "draw_button", None), "グラフを描画 (F5)"),
+                        (getattr(self, "live_check", None), "リアルタイム更新"),
+                        (getattr(self, "decimate_check", None), "間引き表示"),
+                        (getattr(self, "batch_button", None), "一括画像保存..."),
+                        (getattr(self, "_level_button", None), "表示レベルの切替"),
+                        (getattr(self, "_msg_button", None), "メッセージ履歴")):
+            if w is not None and not any(e["widget"] is w for e in self._setting_index):
+                self._setting_index.append(
+                    {"name": name, "section": "描画バー", "dock": None,
+                     "widget": w, "label": None})
+        # 表示名は重複しうる（「自動」チェックが軸ごとに並ぶなど）。同じ見出しが
+        # 並ぶと候補一覧で選び分けられないので、2つ目以降に連番を付けて区別する。
+        seen = {}
+        for e in self._setting_index:
+            label = f"{e['section']} › {e['name']}" if e["section"] else e["name"]
+            seen[label] = seen.get(label, 0) + 1
+            e["key"] = label if seen[label] == 1 else f"{label} ({seen[label]})"
+        comp = QtWidgets.QCompleter([e["key"] for e in self._setting_index], self)
+        comp.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+        comp.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
+        comp.activated.connect(lambda text: QtCore.QTimer.singleShot(
+            0, lambda: self._jump_to_setting(text)))
+        if hasattr(self, "setting_search"):
+            self.setting_search.setCompleter(comp)
+        # 「設定を検索」は _build_menu で正規の QAction として登録済み（Ctrl+F）。
+        # ここで重ねて登録しない（メソッドを渡すとパレット全体が壊れる）。
+        return self._setting_index
+
+    def _index_layout(self, layout, dock, section, last_label):
+        """レイアウトを再帰的にたどってコントロールを索引に積む。
+
+        コントロール自身に文字が無い（コンボや入力欄）ときは、直前に置かれた
+        QLabel を名前として使う。画面での読み取り方と同じ順序で拾う。"""
+        controls = (QtWidgets.QAbstractButton, QtWidgets.QComboBox,
+                    QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox)
+        # 見出しラベル（_bold）に出会ったら、そこから下を新しいセクションとして扱う。
+        # オシロ/高度解析/統計解析タブは CollapsibleBox ではなく太字ラベルで
+        # 区切られているため、これが無いと索引がセクション名なしになる。
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            sub = item.layout()
+            if sub is not None:
+                self._index_layout(sub, dock, section, last_label)
+                continue
+            w = item.widget()
+            if w is None:
+                continue
+            if isinstance(w, QtWidgets.QLabel) and w.property("section_header"):
+                section = w.text().strip()
+                last_label[0], last_label[1] = "", None
+                continue
+            self._index_widget(w, dock, section, last_label)
+
+    def _index_widget(self, w, dock, section, last_label):
+        """ウィジェット1つを索引に積む（コンテナなら中身へ降りる）。
+
+        レイアウトに入らないコンテナ（スプリッタ・タブ・スクロール領域）は
+        レイアウト走査では辿れないので、種類ごとに明示的に降りる。"""
+        controls = (QtWidgets.QAbstractButton, QtWidgets.QComboBox,
+                    QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox)
+        if isinstance(w, QtWidgets.QLabel):
+            text = w.text().strip()
+            if text:
+                last_label[0], last_label[1] = text, w
+            return
+        if isinstance(w, CollapsibleBox):
+            if w.body.layout() is not None:
+                self._index_layout(w.body.layout(), dock, w.title(), ["", None])
+            return
+        if isinstance(w, QtWidgets.QScrollArea):
+            if w.widget() is not None:
+                self._index_widget(w.widget(), dock, section, last_label)
+            return
+        if isinstance(w, QtWidgets.QSplitter):
+            for i in range(w.count()):
+                self._index_widget(w.widget(i), dock, section, last_label)
+            return
+        if isinstance(w, QtWidgets.QTabWidget):
+            for i in range(w.count()):
+                self._index_widget(w.widget(i), dock, w.tabText(i), ["", None])
+            return
+        if isinstance(w, QtWidgets.QGroupBox) and w.title().strip():
+            section = w.title().strip()      # グループ名をセクション名として使う
+        if isinstance(w, controls):
+            own = ""
+            if isinstance(w, QtWidgets.QAbstractButton):
+                own = w.text()
+            elif isinstance(w, QtWidgets.QLineEdit):
+                own = w.placeholderText()
+            # 明示した accessibleName を最優先にする（索引はこの後の
+            # _apply_accessibility より先に作られるので、名前を効かせたい
+            # コントロールは _build_* の中で付ける必要がある）
+            name = (w.accessibleName() or own or last_label[0] or "").strip()
+            name = name.replace("&", "").rstrip(":：") or name.replace("&", "").strip()
+            if name:
+                self._setting_index.append(
+                    {"name": name, "section": section, "dock": dock, "widget": w,
+                     # 自前の文字を持たない入力欄は、直前のラベルと結び付ける
+                     # （スクリーンリーダーが「編集欄」としか読まないのを防ぐ）
+                     "label": None if own else last_label[1]})
+            return
+        if w.layout() is not None:     # グループボックス等の入れ子
+            self._index_layout(w.layout(), dock, section, last_label)
+
+    def _focus_setting_search(self):
+        """設定検索へフォーカスを移す（コマンドパレット・ショートカットから）。"""
+        if not hasattr(self, "setting_search"):
+            return
+        if getattr(self, "format_dock", None) is not None:
+            self.format_dock.show()
+            self.format_dock.raise_()
+        self.setting_search.setFocus()
+        self.setting_search.selectAll()
+
+    def _find_setting(self, text):
+        """検索語に最もよく合う索引項目を返す（完全一致→前方一致→部分一致）。"""
+        needle = (text or "").strip().lower()
+        if not needle:
+            return None
+        index = getattr(self, "_setting_index", None) or []
+        for pred in (lambda e: e["key"].lower() == needle,
+                     lambda e: e["name"].lower() == needle,
+                     lambda e: e["name"].lower().startswith(needle),
+                     lambda e: needle in e["key"].lower()):
+            for e in index:
+                if pred(e):
+                    return e
+        return None
+
+    def _jump_to_setting(self, text=None):
+        """検索語に対応する設定コントロールを画面に出して選択状態にする。"""
+        if text is None and hasattr(self, "setting_search"):
+            text = self.setting_search.text()
+        entry = self._find_setting(text)
+        if entry is None:
+            self.notify(f"「{text}」に一致する設定は見つかりませんでした。", "warn")
+            return None
+        w = entry["widget"]
+        dock = entry["dock"]
+        # 表示レベルで隠れている項目なら、レベルを上げてから出す。
+        # これが「隠す」と「機能を失う」を分ける仕組みの要。
+        raised = self._raise_level_for(w)
+        if dock is not None:
+            dock.show()
+            dock.raise_()
+            if dock.isFloating():
+                dock.activateWindow()
+        # 折りたたまれたセクションの中なら開く
+        p = w.parentWidget()
+        while p is not None:
+            if isinstance(p, CollapsibleBox):
+                p.set_expanded(True)
+            p = p.parentWidget()
+        # スクロール領域なら見える位置まで送る
+        area = w.parentWidget()
+        while area is not None and not isinstance(area, QtWidgets.QScrollArea):
+            area = area.parentWidget()
+        if isinstance(area, QtWidgets.QScrollArea):
+            area.ensureWidgetVisible(w, 50, 50)
+        w.setFocus(QtCore.Qt.FocusReason.ShortcutFocusReason)
+        self._flash_widget(w)
+        note = f"（表示レベルを「{self.ui_level()}」に上げました）" if raised else ""
+        self._set_status(f"設定: {entry['key']}{note}")
+        return entry
+
+    def _raise_level_for(self, widget):
+        """対象が現在のレベルで隠れているなら、見えるレベルまで上げる。
+
+        「基本」で隠した項目でも Ctrl+F で名前を入れれば必ずたどり着ける、を
+        成立させるための逃がし口。上げた場合 True を返す。"""
+        if self.ui_level() == "全部":
+            return False
+        if widget.isVisibleTo(self):
+            return False
+        for level in self.UI_LEVELS[self.UI_LEVELS.index(self.ui_level()) + 1:]:
+            self._apply_ui_level(level)
+            self._ui_settings().setValue("ui/level", level)
+            if widget.isVisibleTo(self):
+                return True
+        return True     # 「全部」まで上げても隠れている＝折りたたみ側の問題
+
+    def _flash_widget(self, w, ms=1600):
+        """見つけた項目を一時的に縁取りして目立たせる。"""
+        try:
+            before = w.styleSheet()
+            w.setStyleSheet(before + f"\nborder:2px solid {palette_tokens()['accent']};")
+            QtCore.QTimer.singleShot(ms, lambda: w.setStyleSheet(before))
+        except Exception:   # noqa: BLE001  強調は飾りなので失敗しても進む
+            get_logger().debug("設定のハイライトに失敗", exc_info=True)
+
+    # ---- アクセシビリティ（スクリーンリーダー・キーボード操作）----
+    # 主要ボタンの Alt ショートカット。日本語ラベルには自然な頭文字が無いので、
+    # 英字を明示的に割り当てる（重複しないよう1か所で管理する）。
+    _MNEMONICS = {
+        "グラフを描画 (F5)": "D",
+        "自動スケール": "A",
+        "ファイル追加": "O",
+        "フォルダを開く": "F",
+        "解析実行": "R",
+        "一括画像保存...": "B",
+        "画像として保存": "S",
+    }
+
+    def _apply_accessibility(self):
+        """アクセシブル名・buddy・Tab順・ニーモニックをまとめて設定する。
+
+        個々の構築コードに散らかさず、索引（_build_setting_index）を使って
+        画面に並んでいる順序どおりに一括で付ける。新しいコントロールを足しても
+        索引に乗れば自動で対象になる。"""
+        index = getattr(self, "_setting_index", None) or []
+        per_dock = {}
+        for e in index:
+            w, label = e["widget"], e.get("label")
+            if not w.accessibleName():
+                w.setAccessibleName(e["key"])
+            if not w.accessibleDescription() and w.toolTip():
+                w.setAccessibleDescription(w.toolTip().replace("\n", " "))
+            # ラベルと入力欄を結び付ける（読み上げの対応づけ＋Altでのフォーカス移動）
+            if label is not None and isinstance(label, QtWidgets.QLabel) \
+                    and label.buddy() is None:
+                label.setBuddy(w)
+            # 主要ボタンにだけ Alt ショートカットを与える
+            if isinstance(w, QtWidgets.QAbstractButton):
+                key = self._MNEMONICS.get(w.text())
+                if key and "&" not in w.text():
+                    w.setText(f"{w.text()}(&{key})")
+            per_dock.setdefault(id(e["dock"]), []).append(w)
+        # Tab の移動順を画面の並び順に合わせる（生成順のままだと飛び回る）
+        for widgets in per_dock.values():
+            focusable = [w for w in widgets
+                         if w.focusPolicy() != QtCore.Qt.FocusPolicy.NoFocus]
+            for prev, cur in zip(focusable, focusable[1:]):
+                self.setTabOrder(prev, cur)
+        # グラフ本体もキーボードで到達できるようにする（ツールバーのショートカット用）
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            canvas.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+            canvas.setAccessibleName("グラフ")
+            canvas.setAccessibleDescription(
+                "描画したグラフ。ホイールで拡大縮小、ダブルクリックで全体表示。")
+        for name, acc in (("explorer", "ファイルと列のツリー"),
+                          ("preview", "データ編集表"),
+                          ("style_table", "系列スタイル表"),
+                          ("y_list", "Y軸の系列一覧")):
+            w = getattr(self, name, None)
+            if w is not None and not w.accessibleName():
+                w.setAccessibleName(acc)
+        return index
 
     # ---- グラフ書式コントロール（右パネル上段）----
     def _fmt_section(self, title, key, default_open):
@@ -5807,7 +6586,10 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         ar.addWidget(self.aspect_combo)
         ar.addWidget(QtWidgets.QLabel("カスタム W:H"))
         self.aspect_w = QtWidgets.QSpinBox(); self.aspect_w.setRange(1, 100); self.aspect_w.setValue(16)
+        self.aspect_w.setAccessibleName("縦横比 横")
         self.aspect_h = QtWidgets.QSpinBox(); self.aspect_h.setRange(1, 100); self.aspect_h.setValue(9)
+        # 直前のラベルが「:」だけなので、名前を明示しないと索引から漏れる
+        self.aspect_h.setAccessibleName("縦横比 縦")
         ar.addWidget(self.aspect_w); ar.addWidget(QtWidgets.QLabel(":")); ar.addWidget(self.aspect_h)
         ar.addStretch(1)
         sec_ar.set_content_layout(ar)
@@ -6040,10 +6822,13 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         v.addWidget(self._bold("マスク試験 / アイダイアグラム / ジッタ"))
         mk = QtWidgets.QGridLayout()
         mk.addWidget(QtWidgets.QLabel("上限"), 0, 0)
+        # プレースホルダが「なし」なので、名前を明示しないと索引で区別できない
         self.mask_upper = QtWidgets.QLineEdit(); self.mask_upper.setPlaceholderText("なし")
+        self.mask_upper.setAccessibleName("マスク上限")
         mk.addWidget(self.mask_upper, 0, 1)
         mk.addWidget(QtWidgets.QLabel("下限"), 0, 2)
         self.mask_lower = QtWidgets.QLineEdit(); self.mask_lower.setPlaceholderText("なし")
+        self.mask_lower.setAccessibleName("マスク下限")
         mk.addWidget(self.mask_lower, 0, 3)
         b_mask = QtWidgets.QPushButton("マスク判定"); b_mask.clicked.connect(self.run_mask_test)
         mk.addWidget(b_mask, 1, 0, 1, 2)
@@ -6199,6 +6984,7 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         b_draw = QtWidgets.QPushButton("グラフを描画 (F5)")
         b_draw.setStyleSheet("font-weight:bold;")
         b_draw.clicked.connect(self.draw_graph)
+        self.draw_button = b_draw        # 設定検索・アクセシビリティから参照する
         drawbar.addWidget(b_draw)
         self.live_check = QtWidgets.QCheckBox("リアルタイム更新")
         self.live_check.setChecked(True)
@@ -6214,19 +7000,43 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         b_batch2.setToolTip("読み込んだ各ファイルを個別に描画し、ファイル名ごとの画像として一括保存します"
                             "（タイトル・形式・DPI等は次の画面で調整できます）。")
         b_batch2.clicked.connect(self.batch_export)
+        self.batch_button = b_batch2     # 同上
         drawbar.addWidget(b_batch2)
         lay.addLayout(drawbar)
-        # グラフ上部の系列ON/OFFバー（折れ線/散布図の表示切替）
-        self.series_bar = QtWidgets.QScrollArea()
-        self.series_bar.setWidgetResizable(True)
-        self.series_bar.setFixedHeight(34)
-        self.series_bar.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        self.series_bar.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.series_bar.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # グラフ上部の系列ON/OFFバー（折れ線/散布図の表示切替）。
+        # 系列が数百・数千になると横スクロールでは探せないので、絞り込み入力を
+        # 左に固定し、並べる数には上限を設けて超過分は一覧ダイアログから選ぶ。
+        self.series_bar = QtWidgets.QWidget()
+        sb_lay = QtWidgets.QHBoxLayout(self.series_bar)
+        sb_lay.setContentsMargins(6, 2, 6, 2)
+        sb_lay.setSpacing(4)
+        self.series_filter = QtWidgets.QLineEdit()
+        self.series_filter.setPlaceholderText("系列を絞り込み")
+        self.series_filter.setToolTip("入力した文字を含む系列だけをこのバーに表示します。")
+        self.series_filter.setAccessibleName("系列の絞り込み")
+        self.series_filter.setClearButtonEnabled(True)
+        self.series_filter.setFixedWidth(140)
+        self.series_filter.textChanged.connect(lambda _t: self._rebuild_series_bar())
+        sb_lay.addWidget(self.series_filter)
+        self._series_scroll = QtWidgets.QScrollArea()
+        self._series_scroll.setWidgetResizable(True)
+        self._series_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._series_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._series_scroll.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         bar_inner = QtWidgets.QWidget()
         self.series_bar_layout = QtWidgets.QHBoxLayout(bar_inner)
-        self.series_bar_layout.setContentsMargins(6, 2, 6, 2)
-        self.series_bar.setWidget(bar_inner)
+        self.series_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self._series_scroll.setWidget(bar_inner)
+        sb_lay.addWidget(self._series_scroll, 1)
+        self.series_more_btn = QtWidgets.QPushButton("他0件…")
+        self.series_more_btn.setToolTip("バーに収まらない系列を一覧から選びます。")
+        self.series_more_btn.setAccessibleName("残りの系列を一覧から選ぶ")
+        self.series_more_btn.clicked.connect(self.show_series_picker)
+        self.series_more_btn.setVisible(False)
+        sb_lay.addWidget(self.series_more_btn)
+        self.series_bar.setFixedHeight(34)
         self.series_bar.setVisible(False)
         lay.addWidget(self.series_bar)
 
@@ -6294,20 +7104,38 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         if chart_type not in ("折れ線", "散布図"):
             self.series_bar.setVisible(False)
             return
-        items = [(self.y_list.item(i),) for i in range(self.y_list.count())]
+        items = [self.y_list.item(i) for i in range(self.y_list.count())]
         if not items:
             self.series_bar.setVisible(False)
             return
+        # 絞り込み → チェック済みを先に並べる → 上限で打ち切り、の順で選ぶ。
+        # チェック済みを優先するのは、今描いている系列こそ切り替えたいため。
+        needle = ""
+        if hasattr(self, "series_filter"):
+            needle = self.series_filter.text().strip().lower()
+
+        def _label_of(it):
+            st = self.series_styles.get(self._style_key(*it.data(UserRole))) or {}
+            return st.get("label") or it.text()
+
+        matched = [it for it in items if not needle or needle in _label_of(it).lower()]
+        checked_first = ([it for it in matched
+                          if it.checkState() == QtCore.Qt.CheckState.Checked]
+                         + [it for it in matched
+                            if it.checkState() != QtCore.Qt.CheckState.Checked])
+        shown = checked_first[:SERIES_BAR_MAX]
+        hidden = len(checked_first) - len(shown)
+
+        tok = palette_tokens()
         self._series_bar_building = True
-        for (it,) in items:
-            fl, col = it.data(UserRole)
-            st = self.series_styles.get(self._style_key(fl, col)) or {}
+        for it in shown:
+            st = self.series_styles.get(self._style_key(*it.data(UserRole))) or {}
             checked = it.checkState() == QtCore.Qt.CheckState.Checked
-            label = st.get("label") or it.text()
-            color = st.get("color") or ("#333" if checked else "#888")
-            cb = QtWidgets.QCheckBox(label)
+            color = st.get("color") or (tok["fg"] if checked else tok["muted"])
+            cb = QtWidgets.QCheckBox(_label_of(it))
             cb.setChecked(checked)
             cb.setToolTip("右クリック=この系列だけ表示／非表示／すべて表示")
+            cb.setAccessibleName(f"系列 {_label_of(it)} の表示")
             cb.setStyleSheet(f"QCheckBox {{ color:{color}; "
                              f"font-weight:{'bold' if checked else 'normal'}; }}")
             cb.toggled.connect(lambda on, item=it: self._toggle_series_select(item, on))
@@ -6317,7 +7145,49 @@ QToolBar { background:#e4e4e4; spacing:1px; }
             lay.addWidget(cb)
         lay.addStretch(1)
         self._series_bar_building = False
+        if hasattr(self, "series_more_btn"):
+            self.series_more_btn.setText(f"他{hidden}件…")
+            self.series_more_btn.setVisible(hidden > 0)
+        if needle and not matched:
+            self._set_status(f"「{needle}」に一致する系列はありません。")
         self.series_bar.setVisible(True)
+
+    def show_series_picker(self):
+        """全系列をチェックリストで選ぶダイアログ（バーに収まらないとき用）。"""
+        items = [self.y_list.item(i) for i in range(self.y_list.count())]
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("系列の選択")
+        dlg.resize(420, 520)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        edit = QtWidgets.QLineEdit()
+        edit.setPlaceholderText("絞り込み")
+        edit.setAccessibleName("系列の絞り込み")
+        lay.addWidget(edit)
+        lst = QtWidgets.QListWidget()
+        lst.setAccessibleName("系列の一覧")
+        lay.addWidget(lst, 1)
+        rows = []
+        for it in items:
+            st = self.series_styles.get(self._style_key(*it.data(UserRole))) or {}
+            row = QtWidgets.QListWidgetItem(st.get("label") or it.text())
+            row.setFlags(row.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            row.setCheckState(it.checkState())
+            lst.addItem(row)
+            rows.append((row, it))
+        edit.textChanged.connect(lambda t: [
+            r.setHidden(bool(t) and t.strip().lower() not in r.text().lower())
+            for r, _ in rows])
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+        self._series_picker = dlg     # テストから参照できるように保持
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            for row, it in rows:
+                if row.checkState() != it.checkState():
+                    it.setCheckState(row.checkState())
 
     def _toggle_series_select(self, item, on):
         """系列バーのチェックで左Yリストの選択を切り替える（→自動再描画）。"""
@@ -6328,6 +7198,7 @@ QToolBar { background:#e4e4e4; spacing:1px; }
 
     def _build_preview(self):
         box = QtWidgets.QGroupBox("データ編集（選択中ファイル・先頭100行）")
+        self._preview_bar_host = box     # 設定検索の索引がここを走査する
         lay = QtWidgets.QVBoxLayout(box); lay.setContentsMargins(4, 4, 4, 4)
         self._preview_label = None
         self._preview_loading = False
@@ -6362,10 +7233,94 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         self.status = self.statusBar()
         # マウス近傍のデータ値の常時表示（右端。通常のステータス文言とは独立）
         self._hover_label = QtWidgets.QLabel("")
-        self._hover_label.setStyleSheet("color:#0a7a55;")
+        self._hover_label.setStyleSheet(f"color:{palette_tokens()['accent']};")
+        self._hover_label.setAccessibleName("カーソル位置の値")
         self.status.addPermanentWidget(self._hover_label)
+        # 直近メッセージを開くボタン（ステータスの1行は次の表示で消えてしまうため、
+        # 「さっき何か出たが読めなかった」を履歴で追えるようにする）
+        # 表示レベルの切替（メニューを開かずに増減できるように常設）
+        self._level_button = QtWidgets.QToolButton()
+        self._level_button.setText(f"表示: {self.ui_level()} ▾")
+        self._level_button.setToolTip("画面に出す設定の量を切り替えます。"
+                                      "隠れた項目も Ctrl+F で名前を入れれば出てきます。")
+        self._level_button.setAccessibleName("表示レベルの切替")
+        self._level_button.setPopupMode(
+            QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        lv_menu = QtWidgets.QMenu(self._level_button)
+        for lv, act in getattr(self, "_level_actions", {}).items():
+            lv_menu.addAction(act)
+        self._level_button.setMenu(lv_menu)
+        self.status.addPermanentWidget(self._level_button)
+        self._msg_button = QtWidgets.QToolButton()
+        self._msg_button.setText("履歴")
+        self._msg_button.setToolTip("これまでのメッセージ・警告・エラーの一覧を開きます")
+        self._msg_button.setAccessibleName("メッセージ履歴を開く")
+        self._msg_button.clicked.connect(self.show_message_log)
+        self.status.addPermanentWidget(self._msg_button)
         fi = f"日本語: {self.font_name}" if self.font_name else "日本語フォント未検出"
         self.status.addPermanentWidget(QtWidgets.QLabel(fi))
+
+    # ------------------------------------------------------------ 通知と履歴
+    # 方針: 告知はモーダルダイアログではなく画面内の通知バーで出す（操作を止めない）。
+    # ステータスバーの1行は次のメッセージで消えるので、すべて履歴にも残す。
+    def _log_message(self, text, level="info", detail=""):
+        """メッセージを履歴に積む（表示は呼び出し側）。"""
+        log = getattr(self, "_message_log", None)
+        if log is None:
+            log = self._message_log = []
+        stamp = QtCore.QDateTime.currentDateTime().toString("HH:mm:ss")
+        log.append({"time": stamp, "level": level, "text": str(text),
+                    "detail": str(detail or "")})
+        if len(log) > MESSAGE_LOG_MAX:
+            del log[:len(log) - MESSAGE_LOG_MAX]
+        logger = get_logger()
+        {"error": logger.error, "warn": logger.warning}.get(level, logger.info)(
+            "%s%s", text, f" / {detail}" if detail else "")
+
+    def notify(self, text, level="info", detail="", timeout_ms=NOTIFY_MS):
+        """画面内の通知バーにメッセージを出す（非モーダル）。
+
+        level: info / ok / warn / error。error は自動で消えない。"""
+        bar = getattr(self, "notify_bar", None)
+        if bar is not None:
+            bar.show_message(text, level, detail, timeout_ms)
+        if getattr(self, "status", None) is not None:
+            self._set_status(text, level, detail)     # 履歴への記録もここで行う
+        else:                                          # 構築途中（ステータスバー未生成）
+            self._log_message(text, level, detail)
+
+    def show_message_log(self):
+        """メッセージ履歴のウィンドウを開く。"""
+        log = getattr(self, "_message_log", None) or []
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("メッセージ履歴")
+        dlg.resize(760, 420)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        table = QtWidgets.QTableWidget(len(log), 3)
+        table.setHorizontalHeaderLabels(["時刻", "種別", "内容"])
+        table.setAccessibleName("メッセージ履歴")
+        table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        names = {"info": "情報", "ok": "完了", "warn": "警告", "error": "エラー"}
+        for r, m in enumerate(reversed(log)):     # 新しいものを上に
+            body = m["text"] + (f"\n{m['detail']}" if m["detail"] else "")
+            for c, v in enumerate((m["time"], names.get(m["level"], m["level"]), body)):
+                table.setItem(r, c, QtWidgets.QTableWidgetItem(v))
+        table.resizeColumnsToContents()
+        table.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(table)
+        self._wire_table_export(table, "メッセージ履歴")
+        bar = QtWidgets.QHBoxLayout()
+        bar.addStretch(1)
+        b_clear = QtWidgets.QPushButton("履歴を消去(&C)")
+        b_clear.clicked.connect(lambda: (setattr(self, "_message_log", []),
+                                         table.setRowCount(0)))
+        bar.addWidget(b_clear)
+        b_close = QtWidgets.QPushButton("閉じる(&X)")
+        b_close.clicked.connect(dlg.accept)
+        bar.addWidget(b_close)
+        lay.addLayout(bar)
+        self._message_log_dialog = dlg    # テストから参照できるように保持
+        dlg.exec()
 
     # ---- 表の右クリック：コピー / CSV保存（結果表を報告に持ち出せるように）----
     def _wire_table_export(self, table, name):
@@ -6436,7 +7391,16 @@ QToolBar { background:#e4e4e4; spacing:1px; }
 
     @staticmethod
     def _bold(text):
-        l = QtWidgets.QLabel(text); f = l.font(); f.setBold(True); l.setFont(f); return l
+        """パネル内の見出しラベル。
+
+        section_header プロパティを立てておくと、設定検索の索引が
+        「ここから下は別セクション」と解釈して名前に階層を付けられる
+        （CollapsibleBox に作り替えなくてもセクション名が付く）。"""
+        l = QtWidgets.QLabel(text)
+        f = l.font(); f.setBold(True); l.setFont(f)
+        l.setProperty("section_header", True)
+        l.setWordWrap(True)
+        return l
 
     @staticmethod
     def _hline():
@@ -6535,12 +7499,8 @@ class DataIOMixin:
                 paths.append(p)
         if not paths:
             return
-        for p in paths:
-            self._load_file(p)
         self.last_dir = os.path.dirname(paths[-1])
-        self._refresh_columns()
-        if self._has_drawn:
-            self.draw_graph()
+        self._load_files_async(paths)
 
     # ------------------------------------------------------------ ファイル
     def add_file(self):
@@ -6550,11 +7510,9 @@ class DataIOMixin:
             "Excel (*.xlsx *.xls *.xlsm);;CSV/TSV (*.csv *.tsv *.txt);;"
             "波形/計測 (*.wav *.raw *.tdms *.mf4 *.mdf *.h5 *.hdf5);;"
             "LTspice回路 (*.asc *.net);;すべて (*.*)")
-        for p in paths:
-            self._load_file(p)
         if paths:
             self.last_dir = os.path.dirname(paths[-1])
-            self._refresh_columns()
+            self._load_files_async(paths)
 
     def paste_from_clipboard(self):
         """クリップボードの表データ（Excel等からのコピー＝TSV/CSV）を新規データとして読み込む。"""
@@ -6562,7 +7520,7 @@ class DataIOMixin:
         import pandas as pd
         text = QtWidgets.QApplication.clipboard().text()
         if not text or not text.strip():
-            QtWidgets.QMessageBox.information(self, "貼り付け", "クリップボードに表データがありません。")
+            self.notify("クリップボードに表データがありません。", "info")
             return
         first = text.splitlines()[0]
         sep = "\t" if first.count("\t") >= first.count(",") else ","   # Excelコピーはタブ区切り
@@ -6570,10 +7528,10 @@ class DataIOMixin:
             df = pd.read_csv(io.StringIO(text), sep=sep, engine="python", skip_blank_lines=True)
             df = _normalize_columns(df)
         except Exception as e:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "貼り付け", f"表として読み取れませんでした:\n{e}")
+            self.notify(f"表として読み取れませんでした:\n{e}", "warn")
             return
         if df.shape[1] == 0 or len(df) == 0:
-            QtWidgets.QMessageBox.warning(self, "貼り付け", "表として読み取れませんでした。")
+            self.notify("表として読み取れませんでした。", "warn")
             return
         label, i = "貼り付け", 2
         while label in self.datasets:
@@ -6585,10 +7543,11 @@ class DataIOMixin:
         self._refresh_columns()
         self._set_status(f"クリップボードから {len(df)}行 × {len(df.columns)}列 を貼り付けました。")
 
-    def _load_file(self, path):
-        if os.path.splitext(path)[1].lower() in (".asc", ".net"):
-            self.run_ltspice_asc(path)   # 回路図/ネットリストは実行→.raw読込
-            return
+    # ------------------------------------------------------------ 読み込み
+    # 読み込みは「GUI が必要な準備」「重い解析」「GUI への登録」の3段に分かれる。
+    # 重い部分だけをワーカースレッドへ出せるように分割してある。
+    def _load_job(self, path):
+        """読み込みの準備（GUIスレッドで行う部分）。ジョブ辞書か None を返す。"""
         enc = self.enc_combo.currentText()
         enc = None if enc.startswith("自動") else enc
         delim = None
@@ -6601,28 +7560,24 @@ class DataIOMixin:
         # Excelで複数シートがある場合はどのシートを読むか選んでもらう
         sheet = None
         if os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm", ".xls"):
-            sheets = excel_sheet_names(path)
+            try:
+                sheets = excel_sheet_names(path)
+            except Exception as e:  # noqa: BLE001  壊れたブックはここで弾く
+                self.notify(f"{os.path.basename(path)} のシートを読めませんでした。",
+                            "error", str(e))
+                return None
             if len(sheets) > 1:
                 sheet, ok = QtWidgets.QInputDialog.getItem(
                     self, "シートの選択", f"{os.path.basename(path)} のシート:",
                     sheets, 0, False)
                 if not ok:
-                    return
-        size = os.path.getsize(path) if os.path.isfile(path) else 0
-        busy = size > 5_000_000   # 5MB 超は待機カーソル＋進捗
-        if busy:
-            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
-            self._set_status(f"読み込み中… {os.path.basename(path)}")
-            QtWidgets.QApplication.processEvents()
-        try:
-            df, used_enc, used_delim = load_table(
-                path, encoding=enc, delimiter=delim, sheet=sheet)
-        except Exception as e:  # noqa: BLE001
-            QtWidgets.QMessageBox.critical(self, "読み込みエラー", f"{os.path.basename(path)}\n\n{e}")
-            return
-        finally:
-            if busy:
-                QtWidgets.QApplication.restoreOverrideCursor()
+                    return None
+        return {"path": path, "enc": enc, "delim": delim, "sheet": sheet}
+
+    def _register_loaded(self, job, result):
+        """読み込み結果をデータセットへ登録する（GUIスレッドで行う部分）。"""
+        path, sheet = job["path"], job.get("sheet")
+        df, used_enc, used_delim = result
         label = os.path.basename(path)
         if sheet:
             label = f"{label}[{sheet}]"   # シート違いを別データとして区別できるように
@@ -6636,6 +7591,162 @@ class DataIOMixin:
             self._add_file_item(label)
         self._push_recent(path)
         self._set_status(f"{label} を読み込み（{len(df)}行 × {len(df.columns)}列, {used_enc}）")
+        return label
+
+    def _load_file(self, path):
+        """1ファイルを同期読み込みする（小さいファイル・スクリプト用の従来API）。"""
+        if os.path.splitext(path)[1].lower() in (".asc", ".net"):
+            self.run_ltspice_asc(path)   # 回路図/ネットリストは実行→.raw読込
+            return
+        job = self._load_job(path)
+        if job is None:
+            return
+        size = os.path.getsize(path) if os.path.isfile(path) else 0
+        busy = size > 5_000_000   # 5MB 超は待機カーソル
+        if busy:
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+            self._set_status(f"読み込み中… {os.path.basename(path)}")
+            QtWidgets.QApplication.processEvents()
+        try:
+            result = load_table(
+                path, encoding=job["enc"], delimiter=job["delim"], sheet=job["sheet"])
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"{os.path.basename(path)} を読み込めませんでした。", "error", str(e))
+            return
+        finally:
+            if busy:
+                QtWidgets.QApplication.restoreOverrideCursor()
+        self._register_loaded(job, result)
+
+    # ---- 非同期読み込み（GUIを固まらせない）----
+    def _load_files_async(self, paths, on_finished=None):
+        """複数ファイルをワーカースレッドで読み込む。
+
+        pandas の解析は Qt に触らないのでスレッドで実行できる。GUI が必要な
+        準備（シート選択）と登録だけをメインスレッドで行い、その間ウィンドウは
+        操作可能なまま。進捗バーの「キャンセル」で途中中止できる。"""
+        paths = list(paths)
+        for p in [p for p in paths if os.path.splitext(p)[1].lower() in (".asc", ".net")]:
+            self.run_ltspice_asc(p)       # 回路は別系統（QProcess）で非同期実行
+        targets = [p for p in paths
+                   if os.path.splitext(p)[1].lower() not in (".asc", ".net")]
+        jobs = []
+        for p in targets:
+            job = self._load_job(p)       # シート選択などはここで先に済ませる
+            if job is not None:
+                jobs.append(job)
+        if not jobs:
+            if on_finished:
+                on_finished([])
+            return None
+        if getattr(self, "_load_thread", None) is not None:
+            self.notify("前の読み込みが実行中です。終わるまでお待ちください。", "warn")
+            return None
+
+        loaded, errors = [], []
+
+        # 小さくて少ない読み込みは、その場で済ませる。スレッド起動と進捗バーの
+        # 明滅のほうが待ち時間より長く、呼び出し側から見た完了タイミングも
+        # 素直になる（フリーズが問題になるのは大きい・多いときだけ）。
+        total_bytes = 0
+        for job in jobs:
+            try:
+                total_bytes += os.path.getsize(job["path"])
+            except OSError:
+                get_logger().debug("_load_files_async: 無視した例外", exc_info=True)
+        if len(jobs) <= ASYNC_LOAD_COUNT and total_bytes <= ASYNC_LOAD_BYTES:
+            for job in jobs:
+                name = os.path.basename(job["path"])
+                try:
+                    res = load_table(
+                        job["path"], encoding=job["enc"], delimiter=job["delim"],
+                        sheet=job["sheet"])
+                    loaded.append(self._register_loaded(job, res))
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{name}: {e}")
+            self._refresh_columns()
+            if loaded and self._has_drawn:
+                self.draw_graph()
+            if errors:
+                self.notify(f"{len(errors)} 件のファイルを読み込めませんでした。",
+                            "error", "\n".join(errors))
+            if on_finished:
+                on_finished(loaded)
+            return None
+
+        def _on_one(index, result, err):
+            job = jobs[index]
+            name = os.path.basename(job["path"])
+            if result is None:
+                errors.append(f"{name}: {err}")
+            else:
+                try:
+                    loaded.append(self._register_loaded(job, result))
+                except Exception as e:  # noqa: BLE001  登録側の失敗も1件ずつ報告
+                    errors.append(f"{name}: {e}")
+            self.progress_strip.update(index + 1)
+
+        def _on_progress(done, name):
+            self.progress_strip.update(done, f"読み込み中… {name}（{done + 1}/{len(jobs)}）")
+
+        def _on_finished():
+            thread = getattr(self, "_load_thread", None)
+            canceled = bool(thread is not None and thread.is_canceled())
+            self._load_thread = None
+            self.progress_strip.finish()
+            self._refresh_columns()
+            if loaded and self._has_drawn:
+                self.draw_graph()
+            if errors:
+                self.notify(f"{len(errors)} 件のファイルを読み込めませんでした。",
+                            "error", "\n".join(errors))
+            elif canceled:
+                self.notify(f"読み込みを中止しました（{len(loaded)} 件は読み込み済み）。", "warn")
+            elif loaded:
+                self.notify(f"{len(loaded)} 件のファイルを読み込みました。", "ok")
+            if on_finished:
+                on_finished(loaded)
+
+        thread = TableLoadThread(jobs, self)
+        self._load_thread = thread
+        thread.one_done.connect(_on_one)
+        thread.progressed.connect(_on_progress)
+        thread.finished.connect(_on_finished)
+        self.progress_strip.start(f"読み込み中…（0/{len(jobs)}）", len(jobs))
+        thread.start()
+        return thread
+
+    def _cancel_background(self):
+        """進捗バーのキャンセルボタン。実行中のワーカーへ中止を伝える。"""
+        thread = getattr(self, "_load_thread", None)
+        if thread is not None:
+            thread.cancel()
+            self._set_status("読み込みの中止を要求しました（実行中の1件が終わり次第停止）。")
+
+    def _stop_background_tasks(self):
+        """終了時にワーカースレッドを止める（スレッド生存中の破棄を避ける）。"""
+        thread = getattr(self, "_load_thread", None)
+        if thread is not None:
+            thread.cancel()
+            thread.wait(5000)
+            self._load_thread = None
+
+    def wait_for_loads(self, timeout_ms=30000):
+        """非同期読み込みの完了を待つ（スクリプト・テストから使う同期用）。
+
+        イベントループを回しながら待つので、登録処理（メインスレッド側）も
+        きちんと進む。GUI 操作からは使わない。"""
+        app = QtWidgets.QApplication.instance()
+        deadline = QtCore.QElapsedTimer()
+        deadline.start()
+        while getattr(self, "_load_thread", None) is not None:
+            if deadline.hasExpired(timeout_ms):
+                return False
+            if app is not None:
+                app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 20)
+        if app is not None:
+            app.processEvents()
+        return True
 
     # ------------------------------------------------------------ フォルダを開く
     def add_folder(self):
@@ -6655,8 +7766,7 @@ class DataIOMixin:
                  if os.path.splitext(f)[1].lower() in exts
                  and os.path.isfile(os.path.join(d, f))]
         if not files:
-            QtWidgets.QMessageBox.information(
-                self, "情報", "このフォルダに読み込めるデータファイルがありません。")
+            self.notify("このフォルダに読み込めるデータファイルがありません。", "warn")
             return
         if len(files) > 40:
             ret = QtWidgets.QMessageBox.question(
@@ -6664,13 +7774,12 @@ class DataIOMixin:
                 f"{len(files)} 個のファイルが見つかりました。すべて読み込みますか？")
             if ret != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
-        for p in files:
-            self._load_file(p)
         self.last_dir = d
-        self._refresh_columns()
-        if self._has_drawn:
-            self.draw_graph()
-        self._set_status(f"フォルダを読み込みました: {os.path.basename(d)}（{len(files)}ファイル）")
+        self._load_files_async(
+            files,
+            on_finished=lambda labels: self.notify(
+                f"フォルダを読み込みました: {os.path.basename(d)}"
+                f"（{len(labels)}/{len(files)} ファイル）", "ok"))
 
     # ------------------------------------------------------------ LTspice 連携
     # .asc 回路をバッチ実行し、生成された .raw を自動で読み込む。ファイル監視を
@@ -6697,7 +7806,7 @@ class DataIOMixin:
                 if os.path.isfile(str(c)):
                     return str(c)
         except Exception:
-            pass
+            get_logger().debug("_ltspice_exe: 無視した例外", exc_info=True)
         import shutil
         return shutil.which("LTspice") or shutil.which("XVIIx64")
 
@@ -6748,10 +7857,8 @@ class DataIOMixin:
     def _on_ltspice_finished(self, code, asc_path, raw_path):
         self._lt_proc = None
         if not os.path.isfile(raw_path):
-            QtWidgets.QMessageBox.warning(
-                self, "LTspice",
-                f"シミュレーションは終了しましたが .raw が見つかりません（終了コード {code}）。\n"
-                f"回路にエラーがないか LTspice で確認してください:\n{asc_path}")
+            self.notify(f"シミュレーションは終了しましたが .raw が見つかりません（終了コード {code}）。\n"
+                        f"回路にエラーがないか LTspice で確認してください:\n{asc_path}", "warn")
             return
         self._load_file(raw_path)
         self._refresh_columns()
@@ -6885,7 +7992,7 @@ class DataIOMixin:
 
     def _open_recent(self, path):
         if not os.path.isfile(path):
-            QtWidgets.QMessageBox.information(self, "情報", f"ファイルが見つかりません:\n{path}")
+            self.notify(f"ファイルが見つかりません:\n{path}", "warn")
             self.recent_files = [q for q in self.recent_files if q != path]
             self._rebuild_recent_menu()
             return
@@ -6901,7 +8008,7 @@ class DataIOMixin:
             items = [self.file_list.currentItem()]
         labels = [it.text() for it in items]
         if not labels:
-            QtWidgets.QMessageBox.information(self, "情報", "削除するファイルを選択してください。")
+            self.notify("削除するファイルを選択してください。", "warn")
             return
         if len(labels) > 1:
             ret = QtWidgets.QMessageBox.question(
@@ -6914,7 +8021,7 @@ class DataIOMixin:
     def clear_all_files(self):
         """読み込み済みファイルをすべて削除する。"""
         if not self.datasets:
-            QtWidgets.QMessageBox.information(self, "情報", "読み込み済みファイルがありません。")
+            self.notify("読み込み済みファイルがありません。", "warn")
             return
         ret = QtWidgets.QMessageBox.question(
             self, "全削除", f"読み込み済みの {len(self.datasets)} 個すべてを一覧から削除しますか？")
@@ -6961,7 +8068,7 @@ class DataIOMixin:
     def reload_current(self):
         it = self.file_list.currentItem()
         if not it:
-            QtWidgets.QMessageBox.information(self, "情報", "ファイルを選択してください。")
+            self.notify("ファイルを選択してください。", "warn")
             return
         path = self.meta[it.text()]["path"]
         self.datasets.pop(it.text(), None)
@@ -7130,7 +8237,7 @@ class DataIOMixin:
     def _edit_target(self):
         lbl = getattr(self, "_preview_label", None)
         if not lbl or lbl not in self.datasets:
-            QtWidgets.QMessageBox.information(self, "情報", "左の一覧でファイルを選択してください。")
+            self.notify("左の一覧でファイルを選択してください。", "warn")
             return None
         return lbl
 
@@ -7174,7 +8281,7 @@ class DataIOMixin:
             return
         df = self.datasets[lbl]
         if name in df.columns:
-            QtWidgets.QMessageBox.warning(self, "列追加", "同名の列が既にあります。")
+            self.notify("同名の列が既にあります。", "warn")
             return
         df[name] = 0.0
         self._data_record({"kind": "col_add", "label": lbl, "name": name})
@@ -7419,7 +8526,24 @@ class StyleTableMixin:
     def _on_y_check_changed(self, _item):
         if self._suspend_redraw:
             return
-        self._on_y_selection_changed()
+        # ツリーのチェックと系列バーは「今つけた印」なので即座に反映する。
+        # 一方、系列スタイル表と解析候補の作り直しは1列あたり全行を作り直す
+        # ので、連続操作（ファイル単位のチェック・すべて選択・まとめてドロップ）
+        # では列数の2乗に比例して待たされる。そちらだけ後回しにして
+        # 一連の操作が終わってから1回だけ実行する。
+        self._rebuild_series_bar()          # 内部で _sync_explorer_checks も呼ぶ
+        timer = getattr(self, "_ysel_timer", None)
+        if timer is None:
+            timer = self._ysel_timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._apply_y_selection_deferred)
+        timer.start(30)
+
+    def _apply_y_selection_deferred(self):
+        """まとめた選択変更の重い側（系列表・解析候補・再描画）を反映する。"""
+        self._rebuild_style_table()
+        self._update_analysis_targets()
+        self._request_redraw()
 
     def _set_all_checks(self, func):
         """func(item) -> bool で各行のチェック状態を一括設定し、まとめて更新。"""
@@ -7973,7 +9097,7 @@ class PlotMixin:
                                   azim=self.azim_spin.value())
                 self.canvas.draw_idle()
             except Exception:
-                pass
+                get_logger().debug("_on_view_angle_changed: 無視した例外", exc_info=True)
 
     def _on_aspect_changed(self, *_):
         custom = self.aspect_combo.currentText() == "カスタム"
@@ -8005,7 +9129,7 @@ class PlotMixin:
             if ax2 is not None:
                 ax2.set_box_aspect(ratio)
         except Exception:
-            pass
+            get_logger().debug("_apply_aspect: 無視した例外", exc_info=True)
 
     def _export_figsize(self, base=7.0):
         """出力画像のサイズ(インチ)。選択比率があれば画像そのものをその比率にする。
@@ -8073,7 +9197,7 @@ class PlotMixin:
             yscale=self.yscale_edit.text(),
             xunit=self.xunit_edit.text().strip(),
             yunit=self.yunit_edit.text().strip(),
-            bg_color=getattr(self, "bg_color", "") or "",
+            bg_color=self._effective_bg_color(),   # 未指定ならウィンドウの配色に追従
             grid_width=self.grid_width.value(),
             frame_width=self.frame_width.value(),
             xinvert=self.xinvert_check.isChecked(),
@@ -8093,15 +9217,41 @@ class PlotMixin:
         finally:
             self._drawing = False
 
+    def _confirm_heavy_draw(self, n):
+        """系列が極端に多いときだけ、描画前に一度だけ確認する。
+
+        数百系列を一度に描くと凡例とレイアウト計算でウィンドウが数十秒固まる
+        （前回セッションの復元でこの状態のまま起動して操作不能になり得る）。
+        承諾は同一セッション内で覚えるので、リアルタイム更新中に何度も
+        聞かれることはない。"""
+        if n <= HEAVY_SERIES or getattr(self, "_heavy_draw_ok", False):
+            return True
+        ret = QtWidgets.QMessageBox.question(
+            self, "系列数の確認",
+            f"{n} 系列を一度に描画します。表示が終わるまで時間がかかり、"
+            f"操作できなくなることがあります。\n\n続けますか？"
+            f"\n（{HEAVY_SERIES} 系列以下に減らすと快適に操作できます）")
+        if ret == QtWidgets.QMessageBox.StandardButton.Yes:
+            self._heavy_draw_ok = True
+            return True
+        return False
+
     def _draw_graph_body(self):
         if not self.datasets:
-            QtWidgets.QMessageBox.information(self, "情報", "先にファイルを追加してください。")
+            self.notify("先にファイルを追加してください。", "warn")
             return
         # Y系列未選択は正常な一時状態。エラーのポップアップは出さず、空表示＋案内のみ。
-        if not self._selected_series_items():
+        selected = self._selected_series_items()
+        if not selected:
             self._draw_placeholder()
             self._rebuild_series_bar(self.chart_combo.currentText())
             self._set_status("Y軸（値）の系列をチェックするとグラフを表示します。")
+            return
+        if not self._confirm_heavy_draw(len(selected)):
+            self._draw_placeholder()
+            self._rebuild_series_bar(self.chart_combo.currentText())
+            self.notify(f"描画を中止しました（{len(selected)} 系列）。"
+                        "系列バーの絞り込みでチェックを減らせます。", "warn")
             return
         ctype = self.chart_combo.currentText()
         issues = []
@@ -8184,10 +9334,13 @@ class PlotMixin:
                 self._apply_fill_between(ctype, series)   # 系列間の塗りつぶし（選択時）
                 self._draw_ds_annotations()              # データサイエンス注記（選択時）
                 self._draw_proto_overlay(ctype)          # プロトコル解読の波形上注記
+                # 地色が暗いときは目盛り・軸ラベル・凡例の文字色も明るくする
+                # （plot_series は地色しか塗らないので、ここで対比を確保する）
+                self._apply_figure_theme(redraw=False)
                 try:
                     self.fig.tight_layout()
                 except Exception:
-                    pass
+                    get_logger().debug("_draw_graph_body: 無視した例外", exc_info=True)
                 self.canvas.draw()
             finally:
                 if busy:
@@ -8224,7 +9377,7 @@ class PlotMixin:
         各ウィンドウは自分のズームツールバーを持ち、「現在の設定で更新」で
         メイン画面のいまの選択・書式を使って描き直せる。"""
         if not self.datasets or not self._selected_series_items():
-            QtWidgets.QMessageBox.information(self, "情報", "先にY系列を選択してください。")
+            self.notify("先にY系列を選択してください。", "warn")
             return
         dlg = QtWidgets.QDialog(self)
         # 通常ウィンドウ扱いにして、Windowsのスナップ（画面端ドラッグ・
@@ -8276,7 +9429,7 @@ class PlotMixin:
                 try:
                     fig.tight_layout()
                 except Exception:
-                    pass
+                    get_logger().debug("render: 無視した例外", exc_info=True)
                 canvas.draw()
             except Exception as e:  # noqa: BLE001
                 QtWidgets.QMessageBox.critical(dlg, "描画エラー", str(e))
@@ -8302,7 +9455,7 @@ class PlotMixin:
             try:
                 a.remove()
             except Exception:
-                pass
+                get_logger().debug("_draw_stacked: 無視した例外", exc_info=True)
         n = len(series)
         axes = self.fig.subplots(n, 1, sharex=True)
         if n == 1:
@@ -8325,10 +9478,11 @@ class PlotMixin:
             ax._twin_secondary = None
         self.ax = axes[-1]   # 以降の操作（区間測定・注記等）は最下段を基準にする
         self._draw_ds_annotations()
+        self._apply_figure_theme(redraw=False)   # 段分けでも全段の文字色を地色に合わせる
         try:
             self.fig.tight_layout()
         except Exception:
-            pass
+            get_logger().debug("_draw_stacked: 無視した例外", exc_info=True)
         self.canvas.draw()
         self._plotted_artists = [(ln.get_label(), ln) for a in axes for ln in a.get_lines()
                                  if "近似" not in str(ln.get_label())]
@@ -8398,7 +9552,7 @@ class PlotMixin:
                     art.set_picker(6)
                     self._legend_pick_map[art] = key
                 except Exception:
-                    pass
+                    get_logger().debug("_wire_legend_picking: 無視した例外", exc_info=True)
         # データ線のクリック → プレビュー表の行を選択（JMP風リンク選択）。
         # skey→Line2D の即時反映マップがある単純な折れ線のみ（間引き時は行対応が崩れるため無効）
         self._line_pick_map = {}
@@ -8407,7 +9561,7 @@ class PlotMixin:
                 ln.set_picker(5)
                 self._line_pick_map[ln] = skey
             except Exception:
-                pass
+                get_logger().debug("_wire_legend_picking: 無視した例外", exc_info=True)
 
     def _on_legend_pick(self, event):
         key = getattr(self, "_legend_pick_map", {}).get(event.artist)
@@ -8459,7 +9613,7 @@ class PlotMixin:
             try:
                 a.remove()
             except Exception:
-                pass
+                get_logger().debug("_on_preview_selection_changed: 無視した例外", exc_info=True)
         self._link_artists = []
         lbl = getattr(self, "_preview_label", None)
         rows = sorted({i.row() for i in self.table.selectedIndexes()})
@@ -8511,14 +9665,14 @@ class PlotMixin:
                 try:
                     self.ax.xaxis.set_major_locator(MultipleLocator(dx))
                 except Exception:
-                    pass
+                    get_logger().debug("_apply_tick_spacing: 無視した例外", exc_info=True)
         if dy and dy > 0 and self.ax.get_yscale() != "log":
             y0, y1 = self.ax.get_ylim()
             if not _too_many(y0, y1, dy):
                 try:
                     self.ax.yaxis.set_major_locator(MultipleLocator(dy))
                 except Exception:
-                    pass
+                    get_logger().debug("_apply_tick_spacing: 無視した例外", exc_info=True)
 
     def _apply_fill_between(self, ctype, series):
         """系列A と 系列B（または X軸=0）の間を塗りつぶす。折れ線/散布図のみ。
@@ -8576,7 +9730,7 @@ class PlotMixin:
             target.fill_between(xa, ya, yb, where=m, color=color,
                                 alpha=self.fill_alpha.value(), zorder=0, linewidth=0)
         except Exception:
-            pass
+            get_logger().debug("_apply_fill_between: 無視した例外", exc_info=True)
 
     def _draw_ds_annotations(self):
         """『表示』にチェックした指標をグラフへ注記する。
@@ -8599,7 +9753,7 @@ class PlotMixin:
                 ha=ha, va=va, fontsize=fs, zorder=20,
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="#888"))
         except Exception:
-            pass
+            get_logger().debug("_draw_annotation_box: 無視した例外", exc_info=True)
 
     def _reset_figure_axes(self):
         """メイン軸以外（カラーバー等）を図から取り除く。"""
@@ -8608,7 +9762,7 @@ class PlotMixin:
                 try:
                     a.remove()
                 except Exception:
-                    pass
+                    get_logger().debug("_reset_figure_axes: 無視した例外", exc_info=True)
         # 系列選択バーの表示/非表示は _rebuild_series_bar が管理する（ここでは触らない）
 
     def _is_3d(self):
@@ -8645,7 +9799,7 @@ class PlotMixin:
             try:
                 a.remove()
             except Exception:
-                pass
+                get_logger().debug("_ensure_axes_projection: 無視した例外", exc_info=True)
         if want_3d:
             from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  '3d' 投影を登録
             self.ax = self.fig.add_subplot(111, projection="3d")
@@ -8665,7 +9819,7 @@ class PlotMixin:
             try:
                 self.ax.callbacks.disconnect(self._dyn_cid)
             except Exception:
-                pass
+                get_logger().debug("_clear_dynamic_resample: 無視した例外", exc_info=True)
             self._dyn_cid = None
         self._dyn = []
 
@@ -8734,8 +9888,13 @@ class PlotMixin:
         self.ax.set_xticks([]); self.ax.set_yticks([])
         self.canvas.draw()
 
-    def _set_status(self, text):
-        self.status.showMessage(text)
+    def _set_status(self, text, level="info", detail=""):
+        """ステータスバーに1行出し、同じ内容をメッセージ履歴にも残す。
+
+        ステータスの1行は次のメッセージで消えてしまい、見逃すと二度と読めない。
+        すべてここを通して履歴（表示→メッセージ履歴）から追えるようにする。"""
+        self.status.showMessage(str(text))
+        self._log_message(text, level, detail)
 
 # ======================================================================
 # ↑ graph_app_mixins/plotting.py
@@ -8772,7 +9931,7 @@ class ScopeCursorMixin:
             try:
                 a.remove()
             except Exception:
-                pass
+                get_logger().debug("_clear_cursor_artists: 無視した例外", exc_info=True)
         self._cursor_artists = []
         self._cursors = []
         self._cursor_text = None
@@ -8806,7 +9965,7 @@ class ScopeCursorMixin:
                 if abs(event.x - cx_px) < 8:
                     return i
             except Exception:
-                pass
+                get_logger().debug("_cursor_near: 無視した例外", exc_info=True)
         return None
 
     def _on_cursor_press(self, event):
@@ -8842,7 +10001,7 @@ class ScopeCursorMixin:
             try:
                 self._cursor_text.remove()
             except Exception:
-                pass
+                get_logger().debug("_update_cursor_readout: 無視した例外", exc_info=True)
             self._cursor_text = None
         if len(self._cursors) == 2:
             x1, x2 = self._cursors[0]["x"], self._cursors[1]["x"]
@@ -8881,7 +10040,7 @@ class ScopeCursorMixin:
             try:
                 self._scope_ov.remove()
             except Exception:
-                pass
+                get_logger().debug("_remove_scope_overlay: 無視した例外", exc_info=True)
             self._scope_ov = None
 
     def _shift_held(self, event=None):
@@ -8892,7 +10051,7 @@ class ScopeCursorMixin:
             if bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier):
                 return True
         except Exception:
-            pass
+            get_logger().debug("_shift_held: 無視した例外", exc_info=True)
         return bool(event is not None and event.key and "shift" in str(event.key))
 
     def _scope_on_press(self, event):
@@ -9024,7 +10183,7 @@ class ScopeCursorMixin:
                     sp.set_visible(False)
                     sp.disconnect_events()
                 except Exception:
-                    pass
+                    get_logger().debug("toggle_gate: 無視した例外", exc_info=True)
             self._gate_span = None
             self.canvas.draw_idle()
 
@@ -9155,7 +10314,7 @@ class ScopeCursorMixin:
             self.canvas.restore_region(self._xhair_bg)
             self.canvas.blit(self.fig.bbox)
         except Exception:
-            pass
+            get_logger().debug("_hide_hover_ui: 無視した例外", exc_info=True)
         self._xhair_bg = None
 
     def _invalidate_crosshair(self, *_):
@@ -9176,7 +10335,7 @@ class ScopeCursorMixin:
                     try:
                         a.remove()
                     except Exception:
-                        pass
+                        get_logger().debug("_draw_crosshair: 無視した例外", exc_info=True)
             v = ax.axvline(x, color="#888", lw=0.7, ls="--", animated=True, zorder=30)
             h = ax.axhline(y, color="#888", lw=0.7, ls="--", animated=True, zorder=30)
             self._xhair = (v, h)
@@ -9219,7 +10378,7 @@ class ScopeCursorMixin:
         import pandas as pd
         items = self._selected_series_items()
         if not items:
-            QtWidgets.QMessageBox.information(self, "情報", "データタブでY系列を選択してください。")
+            self.notify("データタブでY系列を選択してください。", "warn")
             return
         xname = self.x_combo.currentText()
         xspec = self.xscale_edit.text()   # 表示と同じ単位変換（倍率/式）を反映して範囲を求める
@@ -9240,7 +10399,7 @@ class ScopeCursorMixin:
             if yy.size:
                 ymins.append(yy.min()); ymaxs.append(yy.max())
         if not tmins or not ymins:
-            QtWidgets.QMessageBox.information(self, "情報", "数値データがありません。")
+            self.notify("数値データがありません。", "warn")
             return
         tmin, tmax = min(tmins), max(tmaxs)
         ymin, ymax = min(ymins), max(ymaxs)
@@ -9321,7 +10480,7 @@ class AnalysisMixin:
     def run_analysis(self):
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         import numpy as np
         y = np.asarray(y, float)
@@ -9395,7 +10554,7 @@ class AnalysisMixin:
         """選択中の全系列のFFTスペクトルを1枚に重ね描き（系列ごとに色分け・凡例）。"""
         items = self._selected_series_items()
         if not items:
-            QtWidgets.QMessageBox.information(self, "情報", "解析する系列を選択してください。")
+            self.notify("解析する系列を選択してください。", "warn")
             return
         import numpy as np
         win = self.fft_window.currentText() if hasattr(self, "fft_window") else "hann"
@@ -9420,7 +10579,7 @@ class AnalysisMixin:
                                 "text": f"{p['frequency']:.0f}Hz", "color": color})
             drawn += 1
         if drawn == 0:
-            QtWidgets.QMessageBox.warning(self, "FFT", "FFT を計算できませんでした。")
+            self.notify("FFT を計算できませんでした。", "warn")
             return
         self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
         self._reset_figure_axes()
@@ -9432,7 +10591,7 @@ class AnalysisMixin:
         try:
             self.fig.tight_layout()
         except Exception:
-            pass
+            get_logger().debug("show_fft: 無視した例外", exc_info=True)
         self.canvas.draw()
         self._set_status(f"FFT表示: {drawn}系列を重ね描き")
 
@@ -9441,7 +10600,7 @@ class AnalysisMixin:
         """選択中の全系列のピーク＋測定を計算し、別ウィンドウ（表＋CSV保存）で表示する。"""
         items = self._selected_series_items()
         if not items:
-            QtWidgets.QMessageBox.information(self, "情報", "解析する系列を選択してください。")
+            self.notify("解析する系列を選択してください。", "warn")
             return
         import numpy as np
         peak_rows, meas_rows = [], []
@@ -9457,7 +10616,7 @@ class AnalysisMixin:
             for m in r["measurements"]:
                 meas_rows.append((disp, m["name"], m["value"], m["unit"]))
         if not peak_rows and not meas_rows:
-            QtWidgets.QMessageBox.information(self, "情報", "解析できる系列がありません。")
+            self.notify("解析できる系列がありません。", "warn")
             return
         self._show_analysis_window(peak_rows, meas_rows)
 
@@ -9563,13 +10722,13 @@ class AdvancedMixin:
         op = self.math_op.currentText()
         ta, ya = self._xy_by_disp(self.math_a.currentText())
         if ta is None:
-            QtWidgets.QMessageBox.information(self, "情報", "演算対象Aをデータタブで選択してください。")
+            self.notify("演算対象Aをデータタブで選択してください。", "warn")
             return
         try:
             if op in BINARY_OPS:
                 tb, yb = self._xy_by_disp(self.math_b.currentText())
                 if tb is None:
-                    QtWidgets.QMessageBox.information(self, "情報", "演算対象Bを選択してください。")
+                    self.notify("演算対象Bを選択してください。", "warn")
                     return
                 x, r = binary(ta, ya, tb, yb, op)
             else:
@@ -9595,11 +10754,11 @@ class AdvancedMixin:
         import pandas as pd
         expr = self.math_expr.text().strip()
         if not expr:
-            QtWidgets.QMessageBox.information(self, "情報", "数式を入力してください。")
+            self.notify("数式を入力してください。", "warn")
             return
         ta, ya = self._xy_by_disp(self.math_a.currentText())
         if ta is None:
-            QtWidgets.QMessageBox.information(self, "情報", "変数Aの系列をデータタブで選択してください。")
+            self.notify("変数Aの系列をデータタブで選択してください。", "warn")
             return
         variables = {"A": ya, "t": ta,
                      "VAR1": parse_eng(self.math_var1.text(), 0.0) or 0.0,
@@ -9628,7 +10787,7 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         yv = np.asarray(y, float)
         self._show_param_stats_window(label, cycle_statistics(t, yv),
@@ -9685,7 +10844,7 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         win = self.fft_window.currentText()
         yv = np.asarray(y, float)
@@ -9714,12 +10873,12 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         f, tt, S = spectrogram(t, np.asarray(y, float),
                                         window=self.fft_window.currentText())
         if S is None:
-            QtWidgets.QMessageBox.warning(self, "スペクトログラム", "計算できませんでした。")
+            self.notify("計算できませんでした。", "warn")
             return
         self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
         self._reset_figure_axes()
@@ -9731,12 +10890,12 @@ class AdvancedMixin:
         try:
             self.fig.colorbar(mesh, ax=self.ax, label="dB")
         except Exception:
-            pass
+            get_logger().debug("show_spectrogram: 無視した例外", exc_info=True)
         self._apply_aspect()   # 縦横比の設定をスペクトログラムにも適用
         try:
             self.fig.tight_layout()
         except Exception:
-            pass
+            get_logger().debug("show_spectrogram: 無視した例外", exc_info=True)
         self.canvas.draw()
         self._has_drawn = False  # カラーバー付き特殊表示。次のdrawで作り直す
         self._set_status(f"スペクトログラム表示: {label}")
@@ -9746,12 +10905,12 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         f, tt, S = spectrogram(t, np.asarray(y, float),
                                         window=self.fft_window.currentText())
         if S is None:
-            QtWidgets.QMessageBox.warning(self, "ウォーターフォール", "計算できませんでした。")
+            self.notify("計算できませんでした。", "warn")
             return
         self._ensure_axes_projection(True)   # 3D軸で描く
         self._reset_figure_axes()
@@ -9770,11 +10929,11 @@ class AdvancedMixin:
         try:
             self.ax.view_init(elev=self.elev_spin.value(), azim=self.azim_spin.value())
         except Exception:
-            pass
+            get_logger().debug("show_waterfall: 無視した例外", exc_info=True)
         try:
             self.fig.tight_layout()
         except Exception:
-            pass
+            get_logger().debug("show_waterfall: 無視した例外", exc_info=True)
         self.canvas.draw()
         self._has_drawn = False  # 特殊表示。次の「グラフを描画」で通常表示に戻る
         self._set_status(f"FFTウォーターフォール表示: {label}（{(n + step - 1) // step}スライス・"
@@ -9784,12 +10943,12 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         up = parse_eng(self.mask_upper.text(), None)
         lo = parse_eng(self.mask_lower.text(), None)
         if up is None and lo is None:
-            QtWidgets.QMessageBox.information(self, "情報", "上限または下限を入力してください。")
+            self.notify("上限または下限を入力してください。", "warn")
             return
         res = mask_test(t, np.asarray(y, float), upper=up, lower=lo)
         # マスク線と違反点を重畳（現在のグラフに重ねる。3Dの上には重ねない）
@@ -9812,7 +10971,7 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         val = parse_eng(self.eye_rate.text(), 1e6)
         # シンボルレート[Hz] と解釈（>1 ならレート、<1 なら周期[s]とみなす）
@@ -9842,7 +11001,7 @@ class AdvancedMixin:
         try:
             self.fig.tight_layout()
         except Exception:
-            pass
+            get_logger().debug("show_eye_diagram: 無視した例外", exc_info=True)
         self.canvas.draw()
         self._has_drawn = False
         self._set_status(f"アイダイアグラム表示: {label}")
@@ -9851,11 +11010,11 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         jr = jitter_tie(t, np.asarray(y, float))
         if not jr:
-            QtWidgets.QMessageBox.warning(self, "ジッタ", "エッジが不足し計算できませんでした。")
+            self.notify("エッジが不足し計算できませんでした。", "warn")
             return
         msg = (f"ジッタ: RMS={format_eng(jr['rms'])}s  "
                f"pp={format_eng(jr['pp'])}s  "
@@ -9867,7 +11026,7 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         cm = cycle_measurements(t, np.asarray(y, float))
         fs = measurement_stats(cm["freq"])
@@ -9886,11 +11045,11 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         cm = cycle_measurements(t, np.asarray(y, float))
         if len(cm["cycle_time"]) < 2:
-            QtWidgets.QMessageBox.warning(self, "トレンド", "サイクルが不足しています。")
+            self.notify("サイクルが不足しています。", "warn")
             return
         self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
         self._reset_figure_axes()
@@ -9903,7 +11062,7 @@ class AdvancedMixin:
         try:
             self.fig.tight_layout()
         except Exception:
-            pass
+            get_logger().debug("show_trend: 無視した例外", exc_info=True)
         self.canvas.draw()
         self._has_drawn = False
         self._set_status(f"トレンド表示: {label}")
@@ -9913,11 +11072,11 @@ class AdvancedMixin:
         t1, y1, l1 = self._analysis_xy()
         t2, y2 = self._xy_by_disp(self.phase_target2.currentText())
         if t1 is None or t2 is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象と対象2を選択してください。")
+            self.notify("解析対象と対象2を選択してください。", "warn")
             return
         delay, phase = phase_delay(t1, np.asarray(y1, float), np.asarray(y2, float))
         if delay is None:
-            QtWidgets.QMessageBox.warning(self, "位相差", "計算できませんでした。")
+            self.notify("計算できませんでした。", "warn")
             return
         ph = "-" if phase is None else f"{phase:.1f}°"
         msg = f"位相差/遅延（{l1} vs {self.phase_target2.currentText()}）: 遅延={format_eng(delay)}s  位相={ph}"
@@ -9946,7 +11105,7 @@ class AdvancedMixin:
         proto = self.proto_combo.currentText()
         t1, y1 = self._xy_by_disp(self.proto_ch[0].currentText())
         if t1 is None:
-            QtWidgets.QMessageBox.information(self, "情報", "Ch1（信号線）をデータタブで選択してください。")
+            self.notify("Ch1（信号線）をデータタブで選択してください。", "warn")
             return
         try:
             if proto == "UART":
@@ -9956,7 +11115,7 @@ class AdvancedMixin:
             elif proto == "I2C":
                 t2, y2 = self._xy_by_disp(self.proto_ch[1].currentText())
                 if t2 is None:
-                    QtWidgets.QMessageBox.information(self, "情報", "SDA(Ch2)も選択してください。"); return
+                    self.notify("SDA(Ch2)も選択してください。", "warn"); return
                 ev = decode_i2c(t1, np.asarray(y1, float), np.asarray(y2, float))
                 rows = []
                 for e in ev:
@@ -9968,7 +11127,7 @@ class AdvancedMixin:
             elif proto == "SPI":
                 t2, y2 = self._xy_by_disp(self.proto_ch[1].currentText())
                 if t2 is None:
-                    QtWidgets.QMessageBox.information(self, "情報", "MOSI(Ch2)も選択してください。"); return
+                    self.notify("MOSI(Ch2)も選択してください。", "warn"); return
                 cs = None
                 if self.proto_ch[2].currentText():
                     _, cs = self._xy_by_disp(self.proto_ch[2].currentText())
@@ -10040,11 +11199,11 @@ class DataSciMixin:
         """データサイエンスタブの対象コンボから (x, y) を取得。x は現在のX軸列。"""
         disp = self.ds_target.currentText()
         if not disp:
-            QtWidgets.QMessageBox.information(self, "情報", "データタブでY系列を選択してください。")
+            self.notify("データタブでY系列を選択してください。", "warn")
             return None, None, None
         t, y = self._xy_by_disp(disp)   # AdvancedMixin と共用（同一クラスのメソッド）
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "対象の数値データが取得できません。")
+            self.notify("対象の数値データが取得できません。", "warn")
             return None, None, None
         return disp, t, y
 
@@ -10098,7 +11257,7 @@ class DataSciMixin:
             return
         d = linear_regression(t, y)
         if not d:
-            QtWidgets.QMessageBox.information(self, "情報", "回帰に十分なデータがありません。")
+            self.notify("回帰に十分なデータがありません。", "warn")
             return
         f = self._fmt
         rows = [
@@ -10128,7 +11287,7 @@ class DataSciMixin:
             return
         d = describe(y)
         if not d:
-            QtWidgets.QMessageBox.information(self, "情報", "数値データがありません。")
+            self.notify("数値データがありません。", "warn")
             return
         f = self._fmt
         order = [
@@ -10147,8 +11306,7 @@ class DataSciMixin:
             return
         d = normality(y)
         if not d:
-            QtWidgets.QMessageBox.information(
-                self, "情報", "正規性検定には scipy が必要です（または点数不足）。")
+            self.notify("正規性検定には scipy が必要です（または点数不足）。", "warn")
             return
         f = self._fmt
         rows = [
@@ -10162,8 +11320,7 @@ class DataSciMixin:
     def show_corr_matrix(self):
         items = self._selected_series_items()
         if len(items) < 2:
-            QtWidgets.QMessageBox.information(
-                self, "情報", "相関行列には2系列以上をデータタブで選択してください。")
+            self.notify("相関行列には2系列以上をデータタブで選択してください。", "warn")
             return
         named = []
         for fl, col, disp in items:
@@ -10172,7 +11329,7 @@ class DataSciMixin:
                 named.append((disp, y))
         names, mat = correlation_matrix(named, "pearson")
         if mat is None:
-            QtWidgets.QMessageBox.information(self, "情報", "相関行列を計算できませんでした。")
+            self.notify("相関行列を計算できませんでした。", "warn")
             return
         self._show_corr_window(names, mat)
 
@@ -10238,23 +11395,20 @@ class DataSciMixin:
         try:
             p0 = [float(v) for v in e_p0.text().split(",")]
         except ValueError:
-            QtWidgets.QMessageBox.warning(self, "任意関数フィット", "初期値は数値をカンマ区切りで入力してください。")
+            self.notify("初期値は数値をカンマ区切りで入力してください。", "warn")
             return
         if not expr or not params or len(p0) != len(params):
-            QtWidgets.QMessageBox.warning(self, "任意関数フィット",
-                                          "式・パラメータ名・初期値（同数）を入力してください。")
+            self.notify("式・パラメータ名・初期値（同数）を入力してください。", "warn")
             return
         self._fit_last = {"expr": expr, "params": e_par.text(), "p0": e_p0.text()}
         try:
             d = fit_custom(t, y, expr, params, p0)
         except Exception as e:  # noqa: BLE001  収束失敗・式エラーなど
-            QtWidgets.QMessageBox.warning(self, "任意関数フィット",
-                                          f"フィットできませんでした:\n{e}\n\n"
-                                          "初期値を変える・式を見直すと収束することがあります。")
+            self.notify(f"フィットできませんでした:\n{e}\n\n"
+                        "初期値を変える・式を見直すと収束することがあります。", "warn")
             return
         if not d:
-            QtWidgets.QMessageBox.information(self, "情報",
-                                              "フィットに十分なデータがありません（要scipy・点数>パラメータ数+1）。")
+            self.notify("フィットに十分なデータがありません（要scipy・点数>パラメータ数+1）。", "warn")
             return
         f = self._fmt
         rows = [("モデル式", f"f(x) = {expr}"), ("点数 n", f(d["n"]))]
@@ -10306,15 +11460,13 @@ class DataSciMixin:
         b = None
         if ki > 0:
             if not cb_b.currentText():
-                QtWidgets.QMessageBox.information(self, "情報",
-                                                  "2標本の検定には対象Bの系列もデータタブで選択してください。")
+                self.notify("2標本の検定には対象Bの系列もデータタブで選択してください。", "warn")
                 return
             _tb, b = self._xy_by_disp(cb_b.currentText())
         d = t_test(y, b=b, mu=_parse_float(e_mu.text(), 0.0) or 0.0,
                            paired=(ki == 2))
         if not d:
-            QtWidgets.QMessageBox.information(self, "情報",
-                                              "t検定を計算できませんでした（要scipy・点数を確認）。")
+            self.notify("t検定を計算できませんでした（要scipy・点数を確認）。", "warn")
             return
         f = self._fmt
         name = ["1標本", "対応なし(Welch)", "対応あり"][ki]
@@ -10332,8 +11484,7 @@ class DataSciMixin:
         """一元配置分散分析。選択中の全Y系列を群として比較する。"""
         items = self._selected_series_items()
         if len(items) < 2:
-            QtWidgets.QMessageBox.information(
-                self, "情報", "分散分析には2系列以上をデータタブで選択してください。")
+            self.notify("分散分析には2系列以上をデータタブで選択してください。", "warn")
             return
         groups = []
         for _fl, _c, disp in items:
@@ -10342,8 +11493,7 @@ class DataSciMixin:
                 groups.append((disp, y))
         d = anova_oneway(groups)
         if not d:
-            QtWidgets.QMessageBox.information(self, "情報",
-                                              "分散分析を計算できませんでした（要scipy）。")
+            self.notify("分散分析を計算できませんでした（要scipy）。", "warn")
             return
         f = self._fmt
         rows = [("F統計量", f(d["F"])), ("p値", f(d["p_value"])),
@@ -10358,10 +11508,8 @@ class DataSciMixin:
         作成後は『データ』タブで選び、3D表示（散布図/折れ線）で確認できる。"""
         items = self._selected_series_items()
         if len(items) < 2:
-            QtWidgets.QMessageBox.information(
-                self, "情報",
-                "主成分分析には特徴量として2系列以上をデータタブで選択してください。\n"
-                "（例: 複数のセンサ列や測定列。PC1〜3 を作れば3D散布図で確認できます）")
+            self.notify("主成分分析には特徴量として2系列以上をデータタブで選択してください。\n"
+                        "（例: 複数のセンサ列や測定列。PC1〜3 を作れば3D散布図で確認できます）", "warn")
             return
         named = []
         for fl, col, disp in items:
@@ -10369,14 +11517,12 @@ class DataSciMixin:
             if y is not None:
                 named.append((disp, y))
         if len(named) < 2:
-            QtWidgets.QMessageBox.information(self, "情報", "有効な数値系列が不足しています。")
+            self.notify("有効な数値系列が不足しています。", "warn")
             return
         res = pca(named, n_components=self.pca_ncomp.value(),
                           standardize=self.pca_std.isChecked())
         if not res:
-            QtWidgets.QMessageBox.information(
-                self, "情報",
-                "主成分分析を計算できませんでした（系列数・点数・数値を確認してください）。")
+            self.notify("主成分分析を計算できませんでした（系列数・点数・数値を確認してください）。", "warn")
             return
         import pandas as pd
         df = pd.DataFrame({name: arr for name, arr in res["scores"]})
@@ -10429,7 +11575,7 @@ class BatchMixin:
             try:
                 self.fig.tight_layout()
             except Exception:
-                pass
+                get_logger().debug("_save_current_figure: 無視した例外", exc_info=True)
             self.fig.savefig(target, dpi=dpi, transparent=transparent, format=fmt)
         finally:
             self.fig.set_size_inches(orig)        # 画面表示用に元のサイズへ戻す
@@ -10437,7 +11583,7 @@ class BatchMixin:
             try:
                 self.fig.tight_layout()
             except Exception:
-                pass
+                get_logger().debug("_save_current_figure: 無視した例外", exc_info=True)
             self.canvas.draw_idle()
 
     def save_figure(self):
@@ -10557,7 +11703,7 @@ class BatchMixin:
     def batch_export(self):
         """読み込んだ各ファイルを、現在の設定で個別に描画してファイル名ごとに一括保存する。"""
         if not self.datasets:
-            QtWidgets.QMessageBox.information(self, "情報", "先にファイルを追加してください。")
+            self.notify("先にファイルを追加してください。", "warn")
             return
         ctype = self.chart_combo.currentText()
         # テンプレート＝選択中Y系列の「列名」（順序保持・重複除去）とそのスタイル
@@ -10571,10 +11717,8 @@ class BatchMixin:
                   if (style_by_col.get(c) or {}).get("axis", "primary") != "secondary"]
         auto_ylabel = self.ylabel_edit.text() or self._auto_y_label(prim_y, ctype)
         if not y_names:
-            QtWidgets.QMessageBox.information(
-                self, "情報",
-                "Y軸（値）の系列を1つ以上選んでください。\n"
-                "その列名を各ファイルに適用し、ファイルごとに1枚ずつ出力します。")
+            self.notify("Y軸（値）の系列を1つ以上選んでください。\n"
+                        "その列名を各ファイルに適用し、ファイルごとに1枚ずつ出力します。", "warn")
             return
         x_name = self.x_combo.currentText()
         x_names = self._selected_x_columns()   # 複数X対応（[None]=一番左/単一）
@@ -10713,7 +11857,7 @@ class BatchMixin:
         if skipped:
             head = " / ".join(str(s) for s in skipped[:5])
             msg += f"\n\nスキップ {len(skipped)} 件: {head}" + (" ほか" if len(skipped) > 5 else "")
-        QtWidgets.QMessageBox.information(self, "一括出力", msg)
+        self.notify(msg, "info")
         self._set_status(f"一括出力: {len(saved)} 件保存（{out_dir}）")
 
 # ======================================================================
@@ -10724,33 +11868,54 @@ class BatchMixin:
 
 class PersistenceMixin:
     def show_help(self):
-        QtWidgets.QMessageBox.information(
-            self, "使い方",
-            "【基本の流れ】\n"
-            "1. 『データ』パネルで「ファイル追加」（ドラッグ&ドロップ可）\n"
-            "2. ツリーでファイルを展開し、描きたい列（Y軸）にチェック（行クリックでON/OFF・\n"
-            "   ダブルクリック=その列だけ表示・右クリックでメニュー）。X軸の列は下のコンボで選択\n"
-            "3. 「グラフを描画」(F5)。『リアルタイム更新』ONなら設定変更が即反映\n"
-            "4. 右端の『グラフ書式調整』パネルで種別・色・軸範囲・系列スタイルなどを編集\n"
-            "   （項目は見出しクリックで開閉できます。開閉状態・ウィンドウ配置は次回起動時に復元）\n"
-            "※ パネルの切り離し（別ウィンドウ化）は3通り:\n"
-            "   ①タブをダブルクリック ②タブを外へドラッグ ③表示メニュー「別ウィンドウで表示」\n"
-            "   切り離したウィンドウはWindowsのスナップ対応（画面端へドラッグ／Win+矢印／\n"
-            "   最大化ボタンにマウスでレイアウト選択）。元に戻す: タイトルバーをダブルクリック、\n"
-            "   メインウィンドウの左右端へドロップ、または表示メニューのチェックを外す。\n"
-            "   ✕で閉じたパネルは表示メニューで再表示、「パネル配置をリセット」で初期配置へ\n"
-            "5. 波形は『オシロ/解析』パネルで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
-            "【グラフ上の操作】ホバー=近傍点の値を右下に表示／ホイール=ズーム"
-            "（Shift+ホイール=X方向のみ）／ダブルクリック=全体表示／凡例クリック=系列ON/OFF\n"
-            "【区間測定】『オシロ/解析』の「区間測定」ONでドラッグした区間だけを測定\n"
-            "【結果の持ち出し】各結果表を右クリック→コピー/CSV保存。"
-            "「ファイル→Excelレポート出力」でグラフ+表を1つのExcelブックに\n"
-            "【その他】Ctrl+Shift+P=コマンドパレット（全操作を検索実行）／"
-            "「ファイル→ファイルの変更を監視」=更新されたCSVを自動再読込／\n"
-            "　書式パネル「系列ごとに段を分ける」=サブプロット表示／"
-            "データ編集バーの「編集を戻す/やり直す」\n"
-            "【出力】右端パネルの画像出力、またはメニュー「ファイル」から保存／コピー\n"
-            "【グラフ種別と列】棒/円は1ファイル、折れ線/散布図は複数ファイル重ね描き可")
+        # 使い方は読み込む文章なので、通知バーではなくスクロールできる窓で出す。
+        self._show_text_window("使い方", self._HELP_TEXT)
+
+    def _show_text_window(self, title, text):
+        """長い文章を読むための独立ウィンドウ（選択・コピー可・スクロール可）。"""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(760, 560)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        view = QtWidgets.QPlainTextEdit(text)
+        view.setReadOnly(True)
+        view.setAccessibleName(title)
+        lay.addWidget(view)
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        lay.addWidget(btns)
+        self._text_window = dlg     # テストから参照できるように保持
+        dlg.exec()
+        return dlg
+
+    _HELP_TEXT = ("【基本の流れ】\n"
+                    "1. 『データ』パネルで「ファイル追加」（ドラッグ&ドロップ可）\n"
+                    "2. ツリーでファイルを展開し、描きたい列（Y軸）にチェック（行クリックでON/OFF・\n"
+                    "   ダブルクリック=その列だけ表示・右クリックでメニュー）。X軸の列は下のコンボで選択\n"
+                    "3. 「グラフを描画」(F5)。『リアルタイム更新』ONなら設定変更が即反映\n"
+                    "4. 右端の『グラフ書式調整』パネルで種別・色・軸範囲・系列スタイルなどを編集\n"
+                    "   （項目は見出しクリックで開閉できます。開閉状態・ウィンドウ配置は次回起動時に復元）\n"
+                    "※ パネルの切り離し（別ウィンドウ化）は3通り:\n"
+                    "   ①タブをダブルクリック ②タブを外へドラッグ ③表示メニュー「別ウィンドウで表示」\n"
+                    "   切り離したウィンドウはWindowsのスナップ対応（画面端へドラッグ／Win+矢印／\n"
+                    "   最大化ボタンにマウスでレイアウト選択）。元に戻す: タイトルバーをダブルクリック、\n"
+                    "   メインウィンドウの左右端へドロップ、または表示メニューのチェックを外す。\n"
+                    "   ✕で閉じたパネルは表示メニューで再表示、「パネル配置をリセット」で初期配置へ\n"
+                    "5. 波形は『オシロ/解析』パネルで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
+                    "【グラフ上の操作】ホバー=近傍点の値を右下に表示／ホイール=ズーム"
+                    "（Shift+ホイール=X方向のみ）／ダブルクリック=全体表示／凡例クリック=系列ON/OFF\n"
+                    "【区間測定】『オシロ/解析』の「区間測定」ONでドラッグした区間だけを測定\n"
+                    "【結果の持ち出し】各結果表を右クリック→コピー/CSV保存。"
+                    "「ファイル→Excelレポート出力」でグラフ+表を1つのExcelブックに\n"
+                    "【その他】Ctrl+Shift+P=コマンドパレット（全操作を検索実行）／"
+                    "「ファイル→ファイルの変更を監視」=更新されたCSVを自動再読込／\n"
+                    "　書式パネル「系列ごとに段を分ける」=サブプロット表示／"
+                    "データ編集バーの「編集を戻す/やり直す」\n"
+                    "【出力】右端パネルの画像出力、またはメニュー「ファイル」から保存／コピー\n"
+                    "【グラフ種別と列】棒/円は1ファイル、折れ線/散布図は複数ファイル重ね描き可\n"
+                    "【設定が見つからないとき】Ctrl+F＝設定を検索（パネルを横断して該当項目へ移動）\n"
+                    "【見逃したメッセージ】ステータスバー右の「履歴」ボタンで過去の通知を確認")
 
     def show_about(self):
         QtWidgets.QMessageBox.about(
@@ -10783,6 +11948,9 @@ class PersistenceMixin:
             self._watch_action.setChecked(True)   # → toggle_file_watch で監視開始
         # UIスタイル（外観）を復元。標準でも基準QSS（ボタン高さ統一）を必ず適用する
         self._apply_ui_style(str(s.value("ui/style") or "standard"))
+        # 表示レベルを復元。既定は「全部」＝従来と同じ見た目（減らすのは明示操作のみ）。
+        # シンプル版（graph_app_simple.py）は DEFAULT_UI_LEVEL を上書きして起動する。
+        self._apply_ui_level(str(s.value("ui/level") or self.DEFAULT_UI_LEVEL))
         # 復元した切り離し状態をメニューのチェックへ反映し、タブバーも配線し直す
         if hasattr(self, "_float_actions"):
             for d in [*self.left_docks, self.format_dock]:
@@ -10802,6 +11970,7 @@ class PersistenceMixin:
                 s.setValue(key, sp.saveState())
         for k, box in getattr(self, "_fmt_sections", {}).items():
             s.setValue("fmt_section/" + k, "1" if box.is_expanded() else "0")
+        s.setValue("ui/level", self.ui_level())
 
     # ------------------------------------------------------------ Excelレポート出力
     def export_excel_report(self):
@@ -10810,7 +11979,7 @@ class PersistenceMixin:
         測定値・ピーク・FFT指標・統計解析の表は、値が入っていれば別シートで同梱する。"""
         items = self._selected_series_items()
         if not items:
-            QtWidgets.QMessageBox.information(self, "情報", "先にY系列を選択してください。")
+            self.notify("先にY系列を選択してください。", "warn")
             return
         src = items[0][0]   # 棒グラフ等と同じく、最初に選んだ系列のファイルを対象にする
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -11041,7 +12210,7 @@ class PersistenceMixin:
             return
         cfg = load_config(path)
         if not cfg:
-            QtWidgets.QMessageBox.warning(self, "読込エラー", "設定を読み込めませんでした。")
+            self.notify("設定を読み込めませんでした。", "warn")
             return
         self._apply_config(cfg)
         self.draw_graph()
@@ -11054,10 +12223,21 @@ class PersistenceMixin:
         try:
             self._apply_config(cfg)
             if self.datasets:
+                # 前回大量の系列を選んだまま終了していると、起動直後の自動描画で
+                # 固まって操作できなくなる（そのまま落ちると復元→再クラッシュの
+                # ループになる）。多いときは描かずに案内だけ出す。
+                n = len(self._selected_series_items())
+                if n > HEAVY_SERIES:
+                    self._draw_placeholder()
+                    self.notify(
+                        f"前回の選択（{n} 系列）は多いため自動描画を省略しました。"
+                        "系列を減らすか「グラフを描画」で明示的に実行してください。", "warn")
+                    return True
                 self.draw_graph()
             self._set_status("前回のセッションを復元しました。")
             return True
         except Exception:
+            get_logger().exception("前回セッションの復元に失敗")
             return False
 
     # ------------------------------------------------------------ 書式プリセット
@@ -11073,7 +12253,7 @@ class PersistenceMixin:
         try:
             os.makedirs(d, exist_ok=True)
         except OSError:
-            pass
+            get_logger().debug("_presets_dir: 無視した例外", exc_info=True)
         return d
 
     def _list_presets(self):
@@ -11102,7 +12282,7 @@ class PersistenceMixin:
             with open(os.path.join(self._presets_dir(), name + ".json"), "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except OSError as e:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "保存", str(e))
+            self.notify(str(e), "warn")
             return
         self._refresh_preset_combo(select=name)
         self._set_status(f"書式プリセット「{name}」を保存しました。")
@@ -11116,7 +12296,7 @@ class PersistenceMixin:
             with open(os.path.join(self._presets_dir(), name + ".json"), encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, ValueError):
-            QtWidgets.QMessageBox.warning(self, "適用", "プリセットを読み込めませんでした。")
+            self.notify("プリセットを読み込めませんでした。", "warn")
             return
         self._apply_format(data)
         self._set_status(f"書式プリセット「{name}」を適用しました。")
@@ -11128,7 +12308,7 @@ class PersistenceMixin:
         try:
             os.remove(os.path.join(self._presets_dir(), name + ".json"))
         except OSError:
-            pass
+            get_logger().debug("delete_preset: 無視した例外", exc_info=True)
         self._refresh_preset_combo()
 
     def _apply_format(self, d):
@@ -11316,7 +12496,20 @@ class GraphApp(UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin,
             self._set_status("『データ』タブで「ファイル追加」、またはCSV/TSVファイルをドラッグ&ドロップして読み込んでください。")
         self._suspend_redraw = False  # 構築完了。以降は変更で自動再描画
 
+    def changeEvent(self, event):
+        # OS のライト⇔ダーク切替に追従して外観を作り直す。
+        # （super() を呼ぶメソッドは Mixin ではなく本体に置く決まり）
+        try:
+            self._on_palette_changed(event.type())
+        except Exception:
+            get_logger().debug("テーマ変更の追従に失敗", exc_info=True)
+        super().changeEvent(event)
+
     def closeEvent(self, event):
+        try:
+            self._stop_background_tasks()
+        except Exception:
+            get_logger().debug("バックグラウンド処理の停止に失敗", exc_info=True)
         try:
             save_last_session(self._collect_config())
         except Exception:
@@ -11340,7 +12533,7 @@ def main():
             QtWidgets.QMessageBox.critical(None, "予期しないエラー",
                                            f"{text}\n\n詳細は app.log を確認してください:\n{LOG_FILE}")
         except Exception:  # noqa: BLE001
-            pass
+            get_logger().debug("_notify: 無視した例外", exc_info=True)
 
     install_excepthook(on_error=_notify)   # 未捕捉例外もログ＋通知（無言終了の防止）
     try:

@@ -23,7 +23,7 @@ class BatchMixin:
             try:
                 self.fig.tight_layout()
             except Exception:
-                pass
+                applog.get_logger().debug("_save_current_figure: 無視した例外", exc_info=True)
             self.fig.savefig(target, dpi=dpi, transparent=transparent, format=fmt)
         finally:
             self.fig.set_size_inches(orig)        # 画面表示用に元のサイズへ戻す
@@ -31,7 +31,7 @@ class BatchMixin:
             try:
                 self.fig.tight_layout()
             except Exception:
-                pass
+                applog.get_logger().debug("_save_current_figure: 無視した例外", exc_info=True)
             self.canvas.draw_idle()
 
     def save_figure(self):
@@ -151,7 +151,7 @@ class BatchMixin:
     def batch_export(self):
         """読み込んだ各ファイルを、現在の設定で個別に描画してファイル名ごとに一括保存する。"""
         if not self.datasets:
-            QtWidgets.QMessageBox.information(self, "情報", "先にファイルを追加してください。")
+            self.notify("先にファイルを追加してください。", "warn")
             return
         ctype = self.chart_combo.currentText()
         # テンプレート＝選択中Y系列の「列名」（順序保持・重複除去）とそのスタイル
@@ -165,10 +165,8 @@ class BatchMixin:
                   if (style_by_col.get(c) or {}).get("axis", "primary") != "secondary"]
         auto_ylabel = self.ylabel_edit.text() or self._auto_y_label(prim_y, ctype)
         if not y_names:
-            QtWidgets.QMessageBox.information(
-                self, "情報",
-                "Y軸（値）の系列を1つ以上選んでください。\n"
-                "その列名を各ファイルに適用し、ファイルごとに1枚ずつ出力します。")
+            self.notify("Y軸（値）の系列を1つ以上選んでください。\n"
+                        "その列名を各ファイルに適用し、ファイルごとに1枚ずつ出力します。", "warn")
             return
         x_name = self.x_combo.currentText()
         x_names = self._selected_x_columns()   # 複数X対応（[None]=一番左/単一）
@@ -308,5 +306,5 @@ class BatchMixin:
         if skipped:
             head = " / ".join(str(s) for s in skipped[:5])
             msg += f"\n\nスキップ {len(skipped)} 件: {head}" + (" ほか" if len(skipped) > 5 else "")
-        QtWidgets.QMessageBox.information(self, "一括出力", msg)
+        self.notify(msg, "info")
         self._set_status(f"一括出力: {len(saved)} 件保存（{out_dir}）")

@@ -13,11 +13,11 @@ class DataSciMixin:
         """データサイエンスタブの対象コンボから (x, y) を取得。x は現在のX軸列。"""
         disp = self.ds_target.currentText()
         if not disp:
-            QtWidgets.QMessageBox.information(self, "情報", "データタブでY系列を選択してください。")
+            self.notify("データタブでY系列を選択してください。", "warn")
             return None, None, None
         t, y = self._xy_by_disp(disp)   # AdvancedMixin と共用（同一クラスのメソッド）
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "対象の数値データが取得できません。")
+            self.notify("対象の数値データが取得できません。", "warn")
             return None, None, None
         return disp, t, y
 
@@ -71,7 +71,7 @@ class DataSciMixin:
             return
         d = datasci.linear_regression(t, y)
         if not d:
-            QtWidgets.QMessageBox.information(self, "情報", "回帰に十分なデータがありません。")
+            self.notify("回帰に十分なデータがありません。", "warn")
             return
         f = self._fmt
         rows = [
@@ -101,7 +101,7 @@ class DataSciMixin:
             return
         d = datasci.describe(y)
         if not d:
-            QtWidgets.QMessageBox.information(self, "情報", "数値データがありません。")
+            self.notify("数値データがありません。", "warn")
             return
         f = self._fmt
         order = [
@@ -120,8 +120,7 @@ class DataSciMixin:
             return
         d = datasci.normality(y)
         if not d:
-            QtWidgets.QMessageBox.information(
-                self, "情報", "正規性検定には scipy が必要です（または点数不足）。")
+            self.notify("正規性検定には scipy が必要です（または点数不足）。", "warn")
             return
         f = self._fmt
         rows = [
@@ -135,8 +134,7 @@ class DataSciMixin:
     def show_corr_matrix(self):
         items = self._selected_series_items()
         if len(items) < 2:
-            QtWidgets.QMessageBox.information(
-                self, "情報", "相関行列には2系列以上をデータタブで選択してください。")
+            self.notify("相関行列には2系列以上をデータタブで選択してください。", "warn")
             return
         named = []
         for fl, col, disp in items:
@@ -145,7 +143,7 @@ class DataSciMixin:
                 named.append((disp, y))
         names, mat = datasci.correlation_matrix(named, "pearson")
         if mat is None:
-            QtWidgets.QMessageBox.information(self, "情報", "相関行列を計算できませんでした。")
+            self.notify("相関行列を計算できませんでした。", "warn")
             return
         self._show_corr_window(names, mat)
 
@@ -211,23 +209,20 @@ class DataSciMixin:
         try:
             p0 = [float(v) for v in e_p0.text().split(",")]
         except ValueError:
-            QtWidgets.QMessageBox.warning(self, "任意関数フィット", "初期値は数値をカンマ区切りで入力してください。")
+            self.notify("初期値は数値をカンマ区切りで入力してください。", "warn")
             return
         if not expr or not params or len(p0) != len(params):
-            QtWidgets.QMessageBox.warning(self, "任意関数フィット",
-                                          "式・パラメータ名・初期値（同数）を入力してください。")
+            self.notify("式・パラメータ名・初期値（同数）を入力してください。", "warn")
             return
         self._fit_last = {"expr": expr, "params": e_par.text(), "p0": e_p0.text()}
         try:
             d = datasci.fit_custom(t, y, expr, params, p0)
         except Exception as e:  # noqa: BLE001  収束失敗・式エラーなど
-            QtWidgets.QMessageBox.warning(self, "任意関数フィット",
-                                          f"フィットできませんでした:\n{e}\n\n"
-                                          "初期値を変える・式を見直すと収束することがあります。")
+            self.notify(f"フィットできませんでした:\n{e}\n\n"
+                        "初期値を変える・式を見直すと収束することがあります。", "warn")
             return
         if not d:
-            QtWidgets.QMessageBox.information(self, "情報",
-                                              "フィットに十分なデータがありません（要scipy・点数>パラメータ数+1）。")
+            self.notify("フィットに十分なデータがありません（要scipy・点数>パラメータ数+1）。", "warn")
             return
         f = self._fmt
         rows = [("モデル式", f"f(x) = {expr}"), ("点数 n", f(d["n"]))]
@@ -279,15 +274,13 @@ class DataSciMixin:
         b = None
         if ki > 0:
             if not cb_b.currentText():
-                QtWidgets.QMessageBox.information(self, "情報",
-                                                  "2標本の検定には対象Bの系列もデータタブで選択してください。")
+                self.notify("2標本の検定には対象Bの系列もデータタブで選択してください。", "warn")
                 return
             _tb, b = self._xy_by_disp(cb_b.currentText())
         d = datasci.t_test(y, b=b, mu=_parse_float(e_mu.text(), 0.0) or 0.0,
                            paired=(ki == 2))
         if not d:
-            QtWidgets.QMessageBox.information(self, "情報",
-                                              "t検定を計算できませんでした（要scipy・点数を確認）。")
+            self.notify("t検定を計算できませんでした（要scipy・点数を確認）。", "warn")
             return
         f = self._fmt
         name = ["1標本", "対応なし(Welch)", "対応あり"][ki]
@@ -305,8 +298,7 @@ class DataSciMixin:
         """一元配置分散分析。選択中の全Y系列を群として比較する。"""
         items = self._selected_series_items()
         if len(items) < 2:
-            QtWidgets.QMessageBox.information(
-                self, "情報", "分散分析には2系列以上をデータタブで選択してください。")
+            self.notify("分散分析には2系列以上をデータタブで選択してください。", "warn")
             return
         groups = []
         for _fl, _c, disp in items:
@@ -315,8 +307,7 @@ class DataSciMixin:
                 groups.append((disp, y))
         d = datasci.anova_oneway(groups)
         if not d:
-            QtWidgets.QMessageBox.information(self, "情報",
-                                              "分散分析を計算できませんでした（要scipy）。")
+            self.notify("分散分析を計算できませんでした（要scipy）。", "warn")
             return
         f = self._fmt
         rows = [("F統計量", f(d["F"])), ("p値", f(d["p_value"])),
@@ -331,10 +322,8 @@ class DataSciMixin:
         作成後は『データ』タブで選び、3D表示（散布図/折れ線）で確認できる。"""
         items = self._selected_series_items()
         if len(items) < 2:
-            QtWidgets.QMessageBox.information(
-                self, "情報",
-                "主成分分析には特徴量として2系列以上をデータタブで選択してください。\n"
-                "（例: 複数のセンサ列や測定列。PC1〜3 を作れば3D散布図で確認できます）")
+            self.notify("主成分分析には特徴量として2系列以上をデータタブで選択してください。\n"
+                        "（例: 複数のセンサ列や測定列。PC1〜3 を作れば3D散布図で確認できます）", "warn")
             return
         named = []
         for fl, col, disp in items:
@@ -342,14 +331,12 @@ class DataSciMixin:
             if y is not None:
                 named.append((disp, y))
         if len(named) < 2:
-            QtWidgets.QMessageBox.information(self, "情報", "有効な数値系列が不足しています。")
+            self.notify("有効な数値系列が不足しています。", "warn")
             return
         res = datasci.pca(named, n_components=self.pca_ncomp.value(),
                           standardize=self.pca_std.isChecked())
         if not res:
-            QtWidgets.QMessageBox.information(
-                self, "情報",
-                "主成分分析を計算できませんでした（系列数・点数・数値を確認してください）。")
+            self.notify("主成分分析を計算できませんでした（系列数・点数・数値を確認してください）。", "warn")
             return
         import pandas as pd
         df = pd.DataFrame({name: arr for name, arr in res["scores"]})

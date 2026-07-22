@@ -32,7 +32,7 @@ class ScopeCursorMixin:
             try:
                 a.remove()
             except Exception:
-                pass
+                applog.get_logger().debug("_clear_cursor_artists: 無視した例外", exc_info=True)
         self._cursor_artists = []
         self._cursors = []
         self._cursor_text = None
@@ -66,7 +66,7 @@ class ScopeCursorMixin:
                 if abs(event.x - cx_px) < 8:
                     return i
             except Exception:
-                pass
+                applog.get_logger().debug("_cursor_near: 無視した例外", exc_info=True)
         return None
 
     def _on_cursor_press(self, event):
@@ -102,7 +102,7 @@ class ScopeCursorMixin:
             try:
                 self._cursor_text.remove()
             except Exception:
-                pass
+                applog.get_logger().debug("_update_cursor_readout: 無視した例外", exc_info=True)
             self._cursor_text = None
         if len(self._cursors) == 2:
             x1, x2 = self._cursors[0]["x"], self._cursors[1]["x"]
@@ -141,7 +141,7 @@ class ScopeCursorMixin:
             try:
                 self._scope_ov.remove()
             except Exception:
-                pass
+                applog.get_logger().debug("_remove_scope_overlay: 無視した例外", exc_info=True)
             self._scope_ov = None
 
     def _shift_held(self, event=None):
@@ -152,7 +152,7 @@ class ScopeCursorMixin:
             if bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier):
                 return True
         except Exception:
-            pass
+            applog.get_logger().debug("_shift_held: 無視した例外", exc_info=True)
         return bool(event is not None and event.key and "shift" in str(event.key))
 
     def _scope_on_press(self, event):
@@ -284,7 +284,7 @@ class ScopeCursorMixin:
                     sp.set_visible(False)
                     sp.disconnect_events()
                 except Exception:
-                    pass
+                    applog.get_logger().debug("toggle_gate: 無視した例外", exc_info=True)
             self._gate_span = None
             self.canvas.draw_idle()
 
@@ -415,7 +415,7 @@ class ScopeCursorMixin:
             self.canvas.restore_region(self._xhair_bg)
             self.canvas.blit(self.fig.bbox)
         except Exception:
-            pass
+            applog.get_logger().debug("_hide_hover_ui: 無視した例外", exc_info=True)
         self._xhair_bg = None
 
     def _invalidate_crosshair(self, *_):
@@ -436,7 +436,7 @@ class ScopeCursorMixin:
                     try:
                         a.remove()
                     except Exception:
-                        pass
+                        applog.get_logger().debug("_draw_crosshair: 無視した例外", exc_info=True)
             v = ax.axvline(x, color="#888", lw=0.7, ls="--", animated=True, zorder=30)
             h = ax.axhline(y, color="#888", lw=0.7, ls="--", animated=True, zorder=30)
             self._xhair = (v, h)
@@ -479,7 +479,7 @@ class ScopeCursorMixin:
         import pandas as pd
         items = self._selected_series_items()
         if not items:
-            QtWidgets.QMessageBox.information(self, "情報", "データタブでY系列を選択してください。")
+            self.notify("データタブでY系列を選択してください。", "warn")
             return
         xname = self.x_combo.currentText()
         xspec = self.xscale_edit.text()   # 表示と同じ単位変換（倍率/式）を反映して範囲を求める
@@ -500,7 +500,7 @@ class ScopeCursorMixin:
             if yy.size:
                 ymins.append(yy.min()); ymaxs.append(yy.max())
         if not tmins or not ymins:
-            QtWidgets.QMessageBox.information(self, "情報", "数値データがありません。")
+            self.notify("数値データがありません。", "warn")
             return
         tmin, tmax = min(tmins), max(tmaxs)
         ymin, ymax = min(ymins), max(ymaxs)

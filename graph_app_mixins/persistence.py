@@ -5,33 +5,54 @@ from graph_app_common import *  # noqa: F401,F403
 
 class PersistenceMixin:
     def show_help(self):
-        QtWidgets.QMessageBox.information(
-            self, "使い方",
-            "【基本の流れ】\n"
-            "1. 『データ』パネルで「ファイル追加」（ドラッグ&ドロップ可）\n"
-            "2. ツリーでファイルを展開し、描きたい列（Y軸）にチェック（行クリックでON/OFF・\n"
-            "   ダブルクリック=その列だけ表示・右クリックでメニュー）。X軸の列は下のコンボで選択\n"
-            "3. 「グラフを描画」(F5)。『リアルタイム更新』ONなら設定変更が即反映\n"
-            "4. 右端の『グラフ書式調整』パネルで種別・色・軸範囲・系列スタイルなどを編集\n"
-            "   （項目は見出しクリックで開閉できます。開閉状態・ウィンドウ配置は次回起動時に復元）\n"
-            "※ パネルの切り離し（別ウィンドウ化）は3通り:\n"
-            "   ①タブをダブルクリック ②タブを外へドラッグ ③表示メニュー「別ウィンドウで表示」\n"
-            "   切り離したウィンドウはWindowsのスナップ対応（画面端へドラッグ／Win+矢印／\n"
-            "   最大化ボタンにマウスでレイアウト選択）。元に戻す: タイトルバーをダブルクリック、\n"
-            "   メインウィンドウの左右端へドロップ、または表示メニューのチェックを外す。\n"
-            "   ✕で閉じたパネルは表示メニューで再表示、「パネル配置をリセット」で初期配置へ\n"
-            "5. 波形は『オシロ/解析』パネルで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
-            "【グラフ上の操作】ホバー=近傍点の値を右下に表示／ホイール=ズーム"
-            "（Shift+ホイール=X方向のみ）／ダブルクリック=全体表示／凡例クリック=系列ON/OFF\n"
-            "【区間測定】『オシロ/解析』の「区間測定」ONでドラッグした区間だけを測定\n"
-            "【結果の持ち出し】各結果表を右クリック→コピー/CSV保存。"
-            "「ファイル→Excelレポート出力」でグラフ+表を1つのExcelブックに\n"
-            "【その他】Ctrl+Shift+P=コマンドパレット（全操作を検索実行）／"
-            "「ファイル→ファイルの変更を監視」=更新されたCSVを自動再読込／\n"
-            "　書式パネル「系列ごとに段を分ける」=サブプロット表示／"
-            "データ編集バーの「編集を戻す/やり直す」\n"
-            "【出力】右端パネルの画像出力、またはメニュー「ファイル」から保存／コピー\n"
-            "【グラフ種別と列】棒/円は1ファイル、折れ線/散布図は複数ファイル重ね描き可")
+        # 使い方は読み込む文章なので、通知バーではなくスクロールできる窓で出す。
+        self._show_text_window("使い方", self._HELP_TEXT)
+
+    def _show_text_window(self, title, text):
+        """長い文章を読むための独立ウィンドウ（選択・コピー可・スクロール可）。"""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(760, 560)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        view = QtWidgets.QPlainTextEdit(text)
+        view.setReadOnly(True)
+        view.setAccessibleName(title)
+        lay.addWidget(view)
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        lay.addWidget(btns)
+        self._text_window = dlg     # テストから参照できるように保持
+        dlg.exec()
+        return dlg
+
+    _HELP_TEXT = ("【基本の流れ】\n"
+                    "1. 『データ』パネルで「ファイル追加」（ドラッグ&ドロップ可）\n"
+                    "2. ツリーでファイルを展開し、描きたい列（Y軸）にチェック（行クリックでON/OFF・\n"
+                    "   ダブルクリック=その列だけ表示・右クリックでメニュー）。X軸の列は下のコンボで選択\n"
+                    "3. 「グラフを描画」(F5)。『リアルタイム更新』ONなら設定変更が即反映\n"
+                    "4. 右端の『グラフ書式調整』パネルで種別・色・軸範囲・系列スタイルなどを編集\n"
+                    "   （項目は見出しクリックで開閉できます。開閉状態・ウィンドウ配置は次回起動時に復元）\n"
+                    "※ パネルの切り離し（別ウィンドウ化）は3通り:\n"
+                    "   ①タブをダブルクリック ②タブを外へドラッグ ③表示メニュー「別ウィンドウで表示」\n"
+                    "   切り離したウィンドウはWindowsのスナップ対応（画面端へドラッグ／Win+矢印／\n"
+                    "   最大化ボタンにマウスでレイアウト選択）。元に戻す: タイトルバーをダブルクリック、\n"
+                    "   メインウィンドウの左右端へドロップ、または表示メニューのチェックを外す。\n"
+                    "   ✕で閉じたパネルは表示メニューで再表示、「パネル配置をリセット」で初期配置へ\n"
+                    "5. 波形は『オシロ/解析』パネルで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
+                    "【グラフ上の操作】ホバー=近傍点の値を右下に表示／ホイール=ズーム"
+                    "（Shift+ホイール=X方向のみ）／ダブルクリック=全体表示／凡例クリック=系列ON/OFF\n"
+                    "【区間測定】『オシロ/解析』の「区間測定」ONでドラッグした区間だけを測定\n"
+                    "【結果の持ち出し】各結果表を右クリック→コピー/CSV保存。"
+                    "「ファイル→Excelレポート出力」でグラフ+表を1つのExcelブックに\n"
+                    "【その他】Ctrl+Shift+P=コマンドパレット（全操作を検索実行）／"
+                    "「ファイル→ファイルの変更を監視」=更新されたCSVを自動再読込／\n"
+                    "　書式パネル「系列ごとに段を分ける」=サブプロット表示／"
+                    "データ編集バーの「編集を戻す/やり直す」\n"
+                    "【出力】右端パネルの画像出力、またはメニュー「ファイル」から保存／コピー\n"
+                    "【グラフ種別と列】棒/円は1ファイル、折れ線/散布図は複数ファイル重ね描き可\n"
+                    "【設定が見つからないとき】Ctrl+F＝設定を検索（パネルを横断して該当項目へ移動）\n"
+                    "【見逃したメッセージ】ステータスバー右の「履歴」ボタンで過去の通知を確認")
 
     def show_about(self):
         QtWidgets.QMessageBox.about(
@@ -64,6 +85,9 @@ class PersistenceMixin:
             self._watch_action.setChecked(True)   # → toggle_file_watch で監視開始
         # UIスタイル（外観）を復元。標準でも基準QSS（ボタン高さ統一）を必ず適用する
         self._apply_ui_style(str(s.value("ui/style") or "standard"))
+        # 表示レベルを復元。既定は「全部」＝従来と同じ見た目（減らすのは明示操作のみ）。
+        # シンプル版（graph_app_simple.py）は DEFAULT_UI_LEVEL を上書きして起動する。
+        self._apply_ui_level(str(s.value("ui/level") or self.DEFAULT_UI_LEVEL))
         # 復元した切り離し状態をメニューのチェックへ反映し、タブバーも配線し直す
         if hasattr(self, "_float_actions"):
             for d in [*self.left_docks, self.format_dock]:
@@ -83,6 +107,7 @@ class PersistenceMixin:
                 s.setValue(key, sp.saveState())
         for k, box in getattr(self, "_fmt_sections", {}).items():
             s.setValue("fmt_section/" + k, "1" if box.is_expanded() else "0")
+        s.setValue("ui/level", self.ui_level())
 
     # ------------------------------------------------------------ Excelレポート出力
     def export_excel_report(self):
@@ -91,7 +116,7 @@ class PersistenceMixin:
         測定値・ピーク・FFT指標・統計解析の表は、値が入っていれば別シートで同梱する。"""
         items = self._selected_series_items()
         if not items:
-            QtWidgets.QMessageBox.information(self, "情報", "先にY系列を選択してください。")
+            self.notify("先にY系列を選択してください。", "warn")
             return
         src = items[0][0]   # 棒グラフ等と同じく、最初に選んだ系列のファイルを対象にする
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -322,7 +347,7 @@ class PersistenceMixin:
             return
         cfg = config_io.load_config(path)
         if not cfg:
-            QtWidgets.QMessageBox.warning(self, "読込エラー", "設定を読み込めませんでした。")
+            self.notify("設定を読み込めませんでした。", "warn")
             return
         self._apply_config(cfg)
         self.draw_graph()
@@ -335,10 +360,21 @@ class PersistenceMixin:
         try:
             self._apply_config(cfg)
             if self.datasets:
+                # 前回大量の系列を選んだまま終了していると、起動直後の自動描画で
+                # 固まって操作できなくなる（そのまま落ちると復元→再クラッシュの
+                # ループになる）。多いときは描かずに案内だけ出す。
+                n = len(self._selected_series_items())
+                if n > HEAVY_SERIES:
+                    self._draw_placeholder()
+                    self.notify(
+                        f"前回の選択（{n} 系列）は多いため自動描画を省略しました。"
+                        "系列を減らすか「グラフを描画」で明示的に実行してください。", "warn")
+                    return True
                 self.draw_graph()
             self._set_status("前回のセッションを復元しました。")
             return True
         except Exception:
+            applog.get_logger().exception("前回セッションの復元に失敗")
             return False
 
     # ------------------------------------------------------------ 書式プリセット
@@ -354,7 +390,7 @@ class PersistenceMixin:
         try:
             os.makedirs(d, exist_ok=True)
         except OSError:
-            pass
+            applog.get_logger().debug("_presets_dir: 無視した例外", exc_info=True)
         return d
 
     def _list_presets(self):
@@ -383,7 +419,7 @@ class PersistenceMixin:
             with open(os.path.join(self._presets_dir(), name + ".json"), "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except OSError as e:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "保存", str(e))
+            self.notify(str(e), "warn")
             return
         self._refresh_preset_combo(select=name)
         self._set_status(f"書式プリセット「{name}」を保存しました。")
@@ -397,7 +433,7 @@ class PersistenceMixin:
             with open(os.path.join(self._presets_dir(), name + ".json"), encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, ValueError):
-            QtWidgets.QMessageBox.warning(self, "適用", "プリセットを読み込めませんでした。")
+            self.notify("プリセットを読み込めませんでした。", "warn")
             return
         self._apply_format(data)
         self._set_status(f"書式プリセット「{name}」を適用しました。")
@@ -409,7 +445,7 @@ class PersistenceMixin:
         try:
             os.remove(os.path.join(self._presets_dir(), name + ".json"))
         except OSError:
-            pass
+            applog.get_logger().debug("delete_preset: 無視した例外", exc_info=True)
         self._refresh_preset_combo()
 
     def _apply_format(self, d):

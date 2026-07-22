@@ -32,13 +32,13 @@ class AdvancedMixin:
         op = self.math_op.currentText()
         ta, ya = self._xy_by_disp(self.math_a.currentText())
         if ta is None:
-            QtWidgets.QMessageBox.information(self, "情報", "演算対象Aをデータタブで選択してください。")
+            self.notify("演算対象Aをデータタブで選択してください。", "warn")
             return
         try:
             if op in mathchan.BINARY_OPS:
                 tb, yb = self._xy_by_disp(self.math_b.currentText())
                 if tb is None:
-                    QtWidgets.QMessageBox.information(self, "情報", "演算対象Bを選択してください。")
+                    self.notify("演算対象Bを選択してください。", "warn")
                     return
                 x, r = mathchan.binary(ta, ya, tb, yb, op)
             else:
@@ -64,11 +64,11 @@ class AdvancedMixin:
         import pandas as pd
         expr = self.math_expr.text().strip()
         if not expr:
-            QtWidgets.QMessageBox.information(self, "情報", "数式を入力してください。")
+            self.notify("数式を入力してください。", "warn")
             return
         ta, ya = self._xy_by_disp(self.math_a.currentText())
         if ta is None:
-            QtWidgets.QMessageBox.information(self, "情報", "変数Aの系列をデータタブで選択してください。")
+            self.notify("変数Aの系列をデータタブで選択してください。", "warn")
             return
         variables = {"A": ya, "t": ta,
                      "VAR1": plotter.parse_eng(self.math_var1.text(), 0.0) or 0.0,
@@ -97,7 +97,7 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         yv = np.asarray(y, float)
         self._show_param_stats_window(label, analysis.cycle_statistics(t, yv),
@@ -154,7 +154,7 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         win = self.fft_window.currentText()
         yv = np.asarray(y, float)
@@ -183,12 +183,12 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         f, tt, S = analysis.spectrogram(t, np.asarray(y, float),
                                         window=self.fft_window.currentText())
         if S is None:
-            QtWidgets.QMessageBox.warning(self, "スペクトログラム", "計算できませんでした。")
+            self.notify("計算できませんでした。", "warn")
             return
         self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
         self._reset_figure_axes()
@@ -200,12 +200,12 @@ class AdvancedMixin:
         try:
             self.fig.colorbar(mesh, ax=self.ax, label="dB")
         except Exception:
-            pass
+            applog.get_logger().debug("show_spectrogram: 無視した例外", exc_info=True)
         self._apply_aspect()   # 縦横比の設定をスペクトログラムにも適用
         try:
             self.fig.tight_layout()
         except Exception:
-            pass
+            applog.get_logger().debug("show_spectrogram: 無視した例外", exc_info=True)
         self.canvas.draw()
         self._has_drawn = False  # カラーバー付き特殊表示。次のdrawで作り直す
         self._set_status(f"スペクトログラム表示: {label}")
@@ -215,12 +215,12 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         f, tt, S = analysis.spectrogram(t, np.asarray(y, float),
                                         window=self.fft_window.currentText())
         if S is None:
-            QtWidgets.QMessageBox.warning(self, "ウォーターフォール", "計算できませんでした。")
+            self.notify("計算できませんでした。", "warn")
             return
         self._ensure_axes_projection(True)   # 3D軸で描く
         self._reset_figure_axes()
@@ -239,11 +239,11 @@ class AdvancedMixin:
         try:
             self.ax.view_init(elev=self.elev_spin.value(), azim=self.azim_spin.value())
         except Exception:
-            pass
+            applog.get_logger().debug("show_waterfall: 無視した例外", exc_info=True)
         try:
             self.fig.tight_layout()
         except Exception:
-            pass
+            applog.get_logger().debug("show_waterfall: 無視した例外", exc_info=True)
         self.canvas.draw()
         self._has_drawn = False  # 特殊表示。次の「グラフを描画」で通常表示に戻る
         self._set_status(f"FFTウォーターフォール表示: {label}（{(n + step - 1) // step}スライス・"
@@ -253,12 +253,12 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         up = plotter.parse_eng(self.mask_upper.text(), None)
         lo = plotter.parse_eng(self.mask_lower.text(), None)
         if up is None and lo is None:
-            QtWidgets.QMessageBox.information(self, "情報", "上限または下限を入力してください。")
+            self.notify("上限または下限を入力してください。", "warn")
             return
         res = advanced.mask_test(t, np.asarray(y, float), upper=up, lower=lo)
         # マスク線と違反点を重畳（現在のグラフに重ねる。3Dの上には重ねない）
@@ -281,7 +281,7 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         val = plotter.parse_eng(self.eye_rate.text(), 1e6)
         # シンボルレート[Hz] と解釈（>1 ならレート、<1 なら周期[s]とみなす）
@@ -311,7 +311,7 @@ class AdvancedMixin:
         try:
             self.fig.tight_layout()
         except Exception:
-            pass
+            applog.get_logger().debug("show_eye_diagram: 無視した例外", exc_info=True)
         self.canvas.draw()
         self._has_drawn = False
         self._set_status(f"アイダイアグラム表示: {label}")
@@ -320,11 +320,11 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         jr = advanced.jitter_tie(t, np.asarray(y, float))
         if not jr:
-            QtWidgets.QMessageBox.warning(self, "ジッタ", "エッジが不足し計算できませんでした。")
+            self.notify("エッジが不足し計算できませんでした。", "warn")
             return
         msg = (f"ジッタ: RMS={plotter.format_eng(jr['rms'])}s  "
                f"pp={plotter.format_eng(jr['pp'])}s  "
@@ -336,7 +336,7 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         cm = analysis.cycle_measurements(t, np.asarray(y, float))
         fs = analysis.measurement_stats(cm["freq"])
@@ -355,11 +355,11 @@ class AdvancedMixin:
         import numpy as np
         t, y, label = self._analysis_xy()
         if t is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象の系列を選択してください。")
+            self.notify("解析対象の系列を選択してください。", "warn")
             return
         cm = analysis.cycle_measurements(t, np.asarray(y, float))
         if len(cm["cycle_time"]) < 2:
-            QtWidgets.QMessageBox.warning(self, "トレンド", "サイクルが不足しています。")
+            self.notify("サイクルが不足しています。", "warn")
             return
         self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
         self._reset_figure_axes()
@@ -372,7 +372,7 @@ class AdvancedMixin:
         try:
             self.fig.tight_layout()
         except Exception:
-            pass
+            applog.get_logger().debug("show_trend: 無視した例外", exc_info=True)
         self.canvas.draw()
         self._has_drawn = False
         self._set_status(f"トレンド表示: {label}")
@@ -382,11 +382,11 @@ class AdvancedMixin:
         t1, y1, l1 = self._analysis_xy()
         t2, y2 = self._xy_by_disp(self.phase_target2.currentText())
         if t1 is None or t2 is None:
-            QtWidgets.QMessageBox.information(self, "情報", "解析対象と対象2を選択してください。")
+            self.notify("解析対象と対象2を選択してください。", "warn")
             return
         delay, phase = analysis.phase_delay(t1, np.asarray(y1, float), np.asarray(y2, float))
         if delay is None:
-            QtWidgets.QMessageBox.warning(self, "位相差", "計算できませんでした。")
+            self.notify("計算できませんでした。", "warn")
             return
         ph = "-" if phase is None else f"{phase:.1f}°"
         msg = f"位相差/遅延（{l1} vs {self.phase_target2.currentText()}）: 遅延={plotter.format_eng(delay)}s  位相={ph}"
@@ -415,7 +415,7 @@ class AdvancedMixin:
         proto = self.proto_combo.currentText()
         t1, y1 = self._xy_by_disp(self.proto_ch[0].currentText())
         if t1 is None:
-            QtWidgets.QMessageBox.information(self, "情報", "Ch1（信号線）をデータタブで選択してください。")
+            self.notify("Ch1（信号線）をデータタブで選択してください。", "warn")
             return
         try:
             if proto == "UART":
@@ -425,7 +425,7 @@ class AdvancedMixin:
             elif proto == "I2C":
                 t2, y2 = self._xy_by_disp(self.proto_ch[1].currentText())
                 if t2 is None:
-                    QtWidgets.QMessageBox.information(self, "情報", "SDA(Ch2)も選択してください。"); return
+                    self.notify("SDA(Ch2)も選択してください。", "warn"); return
                 ev = advanced.decode_i2c(t1, np.asarray(y1, float), np.asarray(y2, float))
                 rows = []
                 for e in ev:
@@ -437,7 +437,7 @@ class AdvancedMixin:
             elif proto == "SPI":
                 t2, y2 = self._xy_by_disp(self.proto_ch[1].currentText())
                 if t2 is None:
-                    QtWidgets.QMessageBox.information(self, "情報", "MOSI(Ch2)も選択してください。"); return
+                    self.notify("MOSI(Ch2)も選択してください。", "warn"); return
                 cs = None
                 if self.proto_ch[2].currentText():
                     _, cs = self._xy_by_disp(self.proto_ch[2].currentText())

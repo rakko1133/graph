@@ -176,7 +176,7 @@ class PlotMixin:
                                   azim=self.azim_spin.value())
                 self.canvas.draw_idle()
             except Exception:
-                pass
+                applog.get_logger().debug("_on_view_angle_changed: 無視した例外", exc_info=True)
 
     def _on_aspect_changed(self, *_):
         custom = self.aspect_combo.currentText() == "カスタム"
@@ -208,7 +208,7 @@ class PlotMixin:
             if ax2 is not None:
                 ax2.set_box_aspect(ratio)
         except Exception:
-            pass
+            applog.get_logger().debug("_apply_aspect: 無視した例外", exc_info=True)
 
     def _export_figsize(self, base=7.0):
         """出力画像のサイズ(インチ)。選択比率があれば画像そのものをその比率にする。
@@ -276,7 +276,7 @@ class PlotMixin:
             yscale=self.yscale_edit.text(),
             xunit=self.xunit_edit.text().strip(),
             yunit=self.yunit_edit.text().strip(),
-            bg_color=getattr(self, "bg_color", "") or "",
+            bg_color=self._effective_bg_color(),   # 未指定ならウィンドウの配色に追従
             grid_width=self.grid_width.value(),
             frame_width=self.frame_width.value(),
             xinvert=self.xinvert_check.isChecked(),
@@ -296,15 +296,41 @@ class PlotMixin:
         finally:
             self._drawing = False
 
+    def _confirm_heavy_draw(self, n):
+        """系列が極端に多いときだけ、描画前に一度だけ確認する。
+
+        数百系列を一度に描くと凡例とレイアウト計算でウィンドウが数十秒固まる
+        （前回セッションの復元でこの状態のまま起動して操作不能になり得る）。
+        承諾は同一セッション内で覚えるので、リアルタイム更新中に何度も
+        聞かれることはない。"""
+        if n <= HEAVY_SERIES or getattr(self, "_heavy_draw_ok", False):
+            return True
+        ret = QtWidgets.QMessageBox.question(
+            self, "系列数の確認",
+            f"{n} 系列を一度に描画します。表示が終わるまで時間がかかり、"
+            f"操作できなくなることがあります。\n\n続けますか？"
+            f"\n（{HEAVY_SERIES} 系列以下に減らすと快適に操作できます）")
+        if ret == QtWidgets.QMessageBox.StandardButton.Yes:
+            self._heavy_draw_ok = True
+            return True
+        return False
+
     def _draw_graph_body(self):
         if not self.datasets:
-            QtWidgets.QMessageBox.information(self, "情報", "先にファイルを追加してください。")
+            self.notify("先にファイルを追加してください。", "warn")
             return
         # Y系列未選択は正常な一時状態。エラーのポップアップは出さず、空表示＋案内のみ。
-        if not self._selected_series_items():
+        selected = self._selected_series_items()
+        if not selected:
             self._draw_placeholder()
             self._rebuild_series_bar(self.chart_combo.currentText())
             self._set_status("Y軸（値）の系列をチェックするとグラフを表示します。")
+            return
+        if not self._confirm_heavy_draw(len(selected)):
+            self._draw_placeholder()
+            self._rebuild_series_bar(self.chart_combo.currentText())
+            self.notify(f"描画を中止しました（{len(selected)} 系列）。"
+                        "系列バーの絞り込みでチェックを減らせます。", "warn")
             return
         ctype = self.chart_combo.currentText()
         issues = []
@@ -387,10 +413,13 @@ class PlotMixin:
                 self._apply_fill_between(ctype, series)   # 系列間の塗りつぶし（選択時）
                 self._draw_ds_annotations()              # データサイエンス注記（選択時）
                 self._draw_proto_overlay(ctype)          # プロトコル解読の波形上注記
+                # 地色が暗いときは目盛り・軸ラベル・凡例の文字色も明るくする
+                # （plot_series は地色しか塗らないので、ここで対比を確保する）
+                self._apply_figure_theme(redraw=False)
                 try:
                     self.fig.tight_layout()
                 except Exception:
-                    pass
+                    applog.get_logger().debug("_draw_graph_body: 無視した例外", exc_info=True)
                 self.canvas.draw()
             finally:
                 if busy:
@@ -427,7 +456,7 @@ class PlotMixin:
         各ウィンドウは自分のズームツールバーを持ち、「現在の設定で更新」で
         メイン画面のいまの選択・書式を使って描き直せる。"""
         if not self.datasets or not self._selected_series_items():
-            QtWidgets.QMessageBox.information(self, "情報", "先にY系列を選択してください。")
+            self.notify("先にY系列を選択してください。", "warn")
             return
         dlg = QtWidgets.QDialog(self)
         # 通常ウィンドウ扱いにして、Windowsのスナップ（画面端ドラッグ・
@@ -479,7 +508,7 @@ class PlotMixin:
                 try:
                     fig.tight_layout()
                 except Exception:
-                    pass
+                    applog.get_logger().debug("render: 無視した例外", exc_info=True)
                 canvas.draw()
             except Exception as e:  # noqa: BLE001
                 QtWidgets.QMessageBox.critical(dlg, "描画エラー", str(e))
@@ -505,7 +534,7 @@ class PlotMixin:
             try:
                 a.remove()
             except Exception:
-                pass
+                applog.get_logger().debug("_draw_stacked: 無視した例外", exc_info=True)
         n = len(series)
         axes = self.fig.subplots(n, 1, sharex=True)
         if n == 1:
@@ -528,10 +557,11 @@ class PlotMixin:
             ax._twin_secondary = None
         self.ax = axes[-1]   # 以降の操作（区間測定・注記等）は最下段を基準にする
         self._draw_ds_annotations()
+        self._apply_figure_theme(redraw=False)   # 段分けでも全段の文字色を地色に合わせる
         try:
             self.fig.tight_layout()
         except Exception:
-            pass
+            applog.get_logger().debug("_draw_stacked: 無視した例外", exc_info=True)
         self.canvas.draw()
         self._plotted_artists = [(ln.get_label(), ln) for a in axes for ln in a.get_lines()
                                  if "近似" not in str(ln.get_label())]
@@ -601,7 +631,7 @@ class PlotMixin:
                     art.set_picker(6)
                     self._legend_pick_map[art] = key
                 except Exception:
-                    pass
+                    applog.get_logger().debug("_wire_legend_picking: 無視した例外", exc_info=True)
         # データ線のクリック → プレビュー表の行を選択（JMP風リンク選択）。
         # skey→Line2D の即時反映マップがある単純な折れ線のみ（間引き時は行対応が崩れるため無効）
         self._line_pick_map = {}
@@ -610,7 +640,7 @@ class PlotMixin:
                 ln.set_picker(5)
                 self._line_pick_map[ln] = skey
             except Exception:
-                pass
+                applog.get_logger().debug("_wire_legend_picking: 無視した例外", exc_info=True)
 
     def _on_legend_pick(self, event):
         key = getattr(self, "_legend_pick_map", {}).get(event.artist)
@@ -662,7 +692,7 @@ class PlotMixin:
             try:
                 a.remove()
             except Exception:
-                pass
+                applog.get_logger().debug("_on_preview_selection_changed: 無視した例外", exc_info=True)
         self._link_artists = []
         lbl = getattr(self, "_preview_label", None)
         rows = sorted({i.row() for i in self.table.selectedIndexes()})
@@ -714,14 +744,14 @@ class PlotMixin:
                 try:
                     self.ax.xaxis.set_major_locator(MultipleLocator(dx))
                 except Exception:
-                    pass
+                    applog.get_logger().debug("_apply_tick_spacing: 無視した例外", exc_info=True)
         if dy and dy > 0 and self.ax.get_yscale() != "log":
             y0, y1 = self.ax.get_ylim()
             if not _too_many(y0, y1, dy):
                 try:
                     self.ax.yaxis.set_major_locator(MultipleLocator(dy))
                 except Exception:
-                    pass
+                    applog.get_logger().debug("_apply_tick_spacing: 無視した例外", exc_info=True)
 
     def _apply_fill_between(self, ctype, series):
         """系列A と 系列B（または X軸=0）の間を塗りつぶす。折れ線/散布図のみ。
@@ -779,7 +809,7 @@ class PlotMixin:
             target.fill_between(xa, ya, yb, where=m, color=color,
                                 alpha=self.fill_alpha.value(), zorder=0, linewidth=0)
         except Exception:
-            pass
+            applog.get_logger().debug("_apply_fill_between: 無視した例外", exc_info=True)
 
     def _draw_ds_annotations(self):
         """『表示』にチェックした指標をグラフへ注記する。
@@ -802,7 +832,7 @@ class PlotMixin:
                 ha=ha, va=va, fontsize=fs, zorder=20,
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="#888"))
         except Exception:
-            pass
+            applog.get_logger().debug("_draw_annotation_box: 無視した例外", exc_info=True)
 
     def _reset_figure_axes(self):
         """メイン軸以外（カラーバー等）を図から取り除く。"""
@@ -811,7 +841,7 @@ class PlotMixin:
                 try:
                     a.remove()
                 except Exception:
-                    pass
+                    applog.get_logger().debug("_reset_figure_axes: 無視した例外", exc_info=True)
         # 系列選択バーの表示/非表示は _rebuild_series_bar が管理する（ここでは触らない）
 
     def _is_3d(self):
@@ -848,7 +878,7 @@ class PlotMixin:
             try:
                 a.remove()
             except Exception:
-                pass
+                applog.get_logger().debug("_ensure_axes_projection: 無視した例外", exc_info=True)
         if want_3d:
             from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  '3d' 投影を登録
             self.ax = self.fig.add_subplot(111, projection="3d")
@@ -868,7 +898,7 @@ class PlotMixin:
             try:
                 self.ax.callbacks.disconnect(self._dyn_cid)
             except Exception:
-                pass
+                applog.get_logger().debug("_clear_dynamic_resample: 無視した例外", exc_info=True)
             self._dyn_cid = None
         self._dyn = []
 
@@ -937,5 +967,10 @@ class PlotMixin:
         self.ax.set_xticks([]); self.ax.set_yticks([])
         self.canvas.draw()
 
-    def _set_status(self, text):
-        self.status.showMessage(text)
+    def _set_status(self, text, level="info", detail=""):
+        """ステータスバーに1行出し、同じ内容をメッセージ履歴にも残す。
+
+        ステータスの1行は次のメッセージで消えてしまい、見逃すと二度と読めない。
+        すべてここを通して履歴（表示→メッセージ履歴）から追えるようにする。"""
+        self.status.showMessage(str(text))
+        self._log_message(text, level, detail)

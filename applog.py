@@ -16,6 +16,24 @@ _logger = None
 _crash_file = None   # faulthandler の出力先（GCで閉じないよう保持）
 
 
+class _TolerantRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """ローテーションに失敗しても落ちないファイルハンドラ。
+
+    Windows では別のプロセス（同時に起動したアプリ・テスト）が app.log を
+    開いていると os.rename が PermissionError になり、標準のハンドラは
+    そのたびに「--- Logging error ---」とトレースバックを吐く。ログが
+    肥大するだけで実害は無いので、失敗したら今回のローテーションを諦めて
+    そのまま書き続ける。"""
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except OSError:
+            # 回せなかった。ファイルを開き直して追記を続ける（記録は止めない）
+            if self.stream is None:
+                self.stream = self._open()
+
+
 def setup_logging(level=logging.INFO):
     """ロガーを構成して返す（多重構成しない）。"""
     global _logger
@@ -27,7 +45,7 @@ def setup_logging(level=logging.INFO):
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
-        fh = logging.handlers.RotatingFileHandler(
+        fh = _TolerantRotatingFileHandler(
             LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
         fh.setFormatter(fmt)
         logger.addHandler(fh)

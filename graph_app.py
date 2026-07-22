@@ -85,7 +85,20 @@ class GraphApp(UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin,
             self._set_status("『データ』タブで「ファイル追加」、またはCSV/TSVファイルをドラッグ&ドロップして読み込んでください。")
         self._suspend_redraw = False  # 構築完了。以降は変更で自動再描画
 
+    def changeEvent(self, event):
+        # OS のライト⇔ダーク切替に追従して外観を作り直す。
+        # （super() を呼ぶメソッドは Mixin ではなく本体に置く決まり）
+        try:
+            self._on_palette_changed(event.type())
+        except Exception:
+            applog.get_logger().debug("テーマ変更の追従に失敗", exc_info=True)
+        super().changeEvent(event)
+
     def closeEvent(self, event):
+        try:
+            self._stop_background_tasks()
+        except Exception:
+            applog.get_logger().debug("バックグラウンド処理の停止に失敗", exc_info=True)
         try:
             config_io.save_last_session(self._collect_config())
         except Exception:
@@ -109,7 +122,7 @@ def main():
             QtWidgets.QMessageBox.critical(None, "予期しないエラー",
                                            f"{text}\n\n詳細は app.log を確認してください:\n{applog.LOG_FILE}")
         except Exception:  # noqa: BLE001
-            pass
+            applog.get_logger().debug("_notify: 無視した例外", exc_info=True)
 
     applog.install_excepthook(on_error=_notify)   # 未捕捉例外もログ＋通知（無言終了の防止）
     try:

@@ -21,9 +21,18 @@ class UIBuildMixin:
 
         メニューを動的に走査すると PySide6 の QAction.menu() が返す一時ラッパーの
         破棄で C++ 側の QMenu ごと削除される（所有権の罠）ため、構築時に登録した
-        アクションだけを候補にする。"""
+        アクションだけを候補にする。
+
+        QAction 以外（メソッドなど）を混ぜると show_command_palette の
+        `a.isEnabled()` が AttributeError になり、**パレット全体が開かなくなる**。
+        1件の登録ミスで52コマンドが道連れになるので、ここで弾いて記録する。"""
         if not hasattr(self, "_all_actions"):
             self._all_actions = []
+        if not isinstance(act, QtGui.QAction):
+            applog.get_logger().warning(
+                "コマンドパレットに QAction 以外を登録しようとした: %s / %s (%s)",
+                category, label, type(act).__name__)
+            return
         cat = str(category).replace("&", "").replace("...", "").strip()
         self._all_actions.append((f"{cat} › {label.replace('&', '')}", act))
 
@@ -65,8 +74,31 @@ class UIBuildMixin:
         # 表示
         vm = m.addMenu("表示(&V)")
         self.view_menu = vm   # パネルの表示/非表示トグルを _build_central で追加する
+        # 表示レベル（画面に出す量）。隠れた項目は Ctrl+F / Ctrl+Shift+P から呼べる
+        level_menu = vm.addMenu("表示レベル")
+        self._level_actions = {}
+        level_group = QtGui.QActionGroup(self)
+        level_group.setExclusive(True)
+        _LEVEL_TIPS = {
+            "基本": "読み込み→列選択→描画に必要な物だけを出す（隠れた設定も Ctrl+F で呼べます）",
+            "標準": "基本＋オシロ/解析と主な書式",
+            "全部": "すべてのパネル・設定を表示（従来と同じ）",
+        }
+        for lv in self.UI_LEVELS:
+            act = QtGui.QAction(lv, self)
+            act.setCheckable(True)
+            act.setStatusTip(_LEVEL_TIPS[lv])
+            act.triggered.connect(lambda _c=False, x=lv: self.set_ui_level(x))
+            level_group.addAction(act)
+            level_menu.addAction(act)
+            self._level_actions[lv] = act
+            self._palette_register("表示レベル", lv, act)
+        vm.addSeparator()
         self._menu_action(vm, "コマンドパレット...", self.show_command_palette, "Ctrl+Shift+P",
                           tip="すべてのメニュー操作を名前で検索して実行")
+        self._menu_action(vm, "設定を検索...", self._focus_setting_search, "Ctrl+F",
+                          tip="設定名でパネルを横断検索し、その項目まで画面を移動します"
+                              "（設定はデータ・書式・描画バー・ツールバーに分かれているため）")
         vm.addSeparator()
         self._menu_action(vm, "グラフを描画", self.draw_graph, "F5")
         self._menu_action(vm, "新しいグラフウィンドウ（現在のグラフを複製）",
@@ -157,6 +189,10 @@ class UIBuildMixin:
     # ---- UIスタイル（外観テーマ）----
     # ウィジェット構成は一切変えず、QSS＋ツールバー設定で密度・大きさ・配色だけを
     # 変える。機能は全スタイルで同一（見た目の再現のみ）。
+    #
+    # 色は `$bg` `$fg` のようなトークンで書き、適用時に palette_tokens() で
+    # 現在のパレット由来の実色へ展開する。色を直書きすると OS がダークテーマの
+    # とき「白背景に白文字」になって読めなくなるため、直書きは禁止。
     _UI_STYLES = {
         # 標準にも「基準QSS」を持たせ、ボタン/入力欄の高さを統一して見切れを防ぐ
         "standard": {
@@ -168,21 +204,22 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
         "labplot": {   # KDE Breeze調: ゆったり・角丸・青アクセント
             "qss": """
 QWidget { font-size: 10pt; }
-QPushButton { background:#fcfcfc; border:1px solid #bfc4c9; border-radius:3px;
-              padding:5px 12px; }
-QPushButton:hover { border-color:#3daee9; }
-QPushButton:pressed, QPushButton:checked { background:#d6ecf8; border-color:#3daee9; }
+QPushButton { background:$button; color:$fg; border:1px solid $border;
+              border-radius:3px; padding:5px 12px; }
+QPushButton:hover { border-color:$accent; }
+QPushButton:pressed, QPushButton:checked { background:$accent_soft; border-color:$accent; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    border:1px solid #bfc4c9; border-radius:3px; padding:3px 6px; background:white; }
+    border:1px solid $border; border-radius:3px; padding:3px 6px;
+    background:$base; color:$fg; }
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
-    border-color:#3daee9; }
-QTreeWidget, QListWidget, QTableWidget { border:1px solid #cfd4d9; border-radius:3px; }
+    border-color:$accent; }
+QTreeWidget, QListWidget, QTableWidget { border:1px solid $border_soft; border-radius:3px; }
 QTreeWidget::item { min-height:24px; }
 QTabBar::tab { padding:6px 14px; }
 QToolBar { spacing:4px; padding:3px; }
 QToolButton { padding:4px; border-radius:3px; }
-QToolButton:hover { background:#d6ecf8; }
-QDockWidget::title { background:#eff0f1; padding:5px; }
+QToolButton:hover { background:$accent_soft; }
+QDockWidget::title { background:$title_bg; color:$fg; padding:5px; }
 """,
             "tb_style": "beside", "tb_icon": 22, "indent": 20},
         "veusz": {     # 実用主義コンパクト: 小さく詰めて情報密度を上げる
@@ -201,50 +238,53 @@ QDockWidget::title { padding:2px; }
             "qss": """
 QWidget { font-size: 9pt; }
 QToolBar { border:0; spacing:2px; padding:2px; background:transparent; }
-QDockWidget::title { background:transparent; padding:3px; }
-QPushButton { padding:3px 10px; border:1px solid #c9c9c9; border-radius:2px;
-              background:#f7f7f7; }
-QPushButton:checked { background:#e2e2e2; }
-QTreeWidget, QListWidget, QTableWidget { border:1px solid #dddddd; }
+QDockWidget::title { background:transparent; color:$fg; padding:3px; }
+QPushButton { padding:3px 10px; border:1px solid $border_soft; border-radius:2px;
+              background:$button; color:$fg; }
+QPushButton:checked { background:$accent_soft; }
+QTreeWidget, QListWidget, QTableWidget { border:1px solid $border_soft; }
 QTreeWidget::item { min-height:20px; }
 QTabBar::tab { padding:4px 10px; }
 """,
             "tb_style": "icon", "tb_icon": 18, "indent": 16},
-        "igor": {      # クラシック高密度: グレー基調・小さな立体ボタン
+        "igor": {      # クラシック高密度: 小さな立体ボタン・詰めた余白
             "qss": """
 QWidget { font-size: 8pt; }
-QMainWindow, QDockWidget, QTabWidget::pane { background-color:#ececec; }
-QPushButton { background:qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                                         stop:0 #fdfdfd, stop:1 #dcdcdc);
-              border:1px solid #8f8f8f; border-radius:2px; padding:2px 9px;
+QMainWindow, QDockWidget, QTabWidget::pane { background-color:$bg; }
+QPushButton { background:$button; color:$fg;
+              border:1px solid $border; border-radius:2px; padding:2px 9px;
               min-height:18px; }
-QPushButton:pressed, QPushButton:checked { background:#cfcfcf; }
+QPushButton:pressed, QPushButton:checked { background:$accent_soft; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    background:white; border:1px solid #9a9a9a; padding:1px 3px; }
-QTreeWidget, QListWidget, QTableWidget { background:white; border:1px solid #9a9a9a; }
+    background:$base; color:$fg; border:1px solid $border; padding:1px 3px; }
+QTreeWidget, QListWidget, QTableWidget { background:$base; color:$fg;
+    border:1px solid $border; }
 QTreeWidget::item { min-height:18px; }
-QDockWidget::title { background:#dcdcdc; border:1px solid #b0b0b0; padding:3px; }
-QTabBar::tab { padding:3px 10px; background:#dcdcdc; border:1px solid #b0b0b0; }
-QTabBar::tab:selected { background:#ececec; }
-QToolBar { background:#e4e4e4; spacing:1px; }
+QDockWidget::title { background:$title_bg; color:$fg;
+    border:1px solid $border_soft; padding:3px; }
+QTabBar::tab { padding:3px 10px; background:$title_bg; color:$fg;
+    border:1px solid $border_soft; }
+QTabBar::tab:selected { background:$bg; }
+QToolBar { background:$title_bg; spacing:1px; }
 """,
             "tb_style": "icon", "tb_icon": 20, "indent": 14},
     }
 
+    _UI_STYLE_NAMES = {"standard": "標準", "labplot": "LabPlot風", "veusz": "Veusz風",
+                       "kst": "KST2風", "igor": "Igor Pro風"}
+
     def _set_ui_style(self, name):
         """メニューからのUIスタイル切替（ステータス案内つき）。"""
         self._apply_ui_style(name)
-        names = {"standard": "標準", "labplot": "LabPlot風", "veusz": "Veusz風",
-                 "kst": "KST2風", "igor": "Igor Pro風"}
-        self._set_status(f"UIスタイル: {names.get(name, name)}"
-                         "（配置も合わせるなら 表示→レイアウト を併用）")
+        self._set_status(f"外観: {self._UI_STYLE_NAMES.get(name, name)}"
+                         "（配置も合わせるなら 表示→見た目 の上段を選んでください）")
 
     def _apply_ui_style(self, name):
         """UIスタイル（外観テーマ）を適用する。ウィジェット・機能は変えない。"""
         style = self._UI_STYLES.get(name)
         if style is None:
             return
-        self.setStyleSheet(style["qss"])
+        self.setStyleSheet(render_qss(style["qss"]))
         tb = getattr(self, "main_toolbar", None)
         if tb is not None:
             tb.setIconSize(QtCore.QSize(style["tb_icon"], style["tb_icon"]))
@@ -256,6 +296,187 @@ QToolBar { background:#e4e4e4; spacing:1px; }
             self.explorer.setIndentation(style["indent"])
         self._ui_settings().setValue("ui/style", name)
         self._ui_style_name = name
+        self._apply_figure_theme()
+
+    # ---- 表示レベル（画面に出す量の切り替え）----
+    # 方針: 隠すのは setVisible(False) だけ。ウィジェットは常に全部作り、
+    # self の属性として保持する。こうすると _collect_config / _apply_config /
+    # _scope_dict / _wire_live_signals / 既存テストの属性参照が無改造で動き、
+    # 「隠す＝機能を失う」にならない。隠したものは設定検索（Ctrl+F）と
+    # コマンドパレット（Ctrl+Shift+P）から名前で必ず呼び戻せる。
+    UI_LEVELS = ("基本", "標準", "全部")
+    # 通常版の既定。シンプル版はサブクラスでこれを "基本" に上書きする。
+    DEFAULT_UI_LEVEL = "全部"
+
+    # 各レベルで見せるドック（objectName）と書式セクション（_fmt_sections のキー）。
+    # 「全部」は例外扱いで、この表を参照せず全部見せる。
+    _LEVEL_VIEW = {
+        "基本": {
+            "docks": ("dock_files", "dock_data"),
+            "sections": ("axes_sel", "labels", "legend"),
+        },
+        "標準": {
+            "docks": ("dock_files", "dock_data", "dock_scope", "dock_format"),
+            "sections": ("file_ops", "axes_sel", "labels", "legend", "axis",
+                         "trend", "bins", "aspect", "export"),
+        },
+    }
+    # 基本レベルでは書式ドックも出す（種別・ラベル・凡例だけの薄い状態で）
+    _LEVEL_EXTRA_DOCKS = {"基本": ("dock_format",)}
+
+    def ui_level(self):
+        return getattr(self, "_ui_level", "全部")
+
+    def set_ui_level(self, level, announce=True):
+        """表示レベルを切り替える（メニュー・ステータスバーから）。"""
+        if level not in self.UI_LEVELS:
+            return
+        self._apply_ui_level(level)
+        self._ui_settings().setValue("ui/level", level)
+        if announce:
+            self.notify(
+                f"表示レベル: {level}"
+                + ("（隠れている設定も Ctrl+F で名前を入れれば出てきます）"
+                   if level != "全部" else ""),
+                "info")
+
+    def _apply_ui_level(self, level):
+        """レベルに応じてドック・書式セクションの表示/非表示を決める。
+
+        注意: 左のドックはタブ化されているため、背面タブの `isVisible()` は
+        False になる。「ユーザーが閉じた」の判定に visibilityChanged を使うと
+        タブ切替を閉じたと誤認するので、レベルだけが可視性を決める規約にする。"""
+        if level not in self.UI_LEVELS:
+            level = "全部"
+        self._ui_level = level
+        docks = self._all_docks()
+        visible_docks = self._visible_dock_names(level)
+        visible_sections = self._visible_section_keys(level)
+        for d in docks:
+            d.setVisible(d.objectName() in visible_docks)
+        for key, box in getattr(self, "_fmt_sections", {}).items():
+            box.setVisible(key in visible_sections)
+        # タブ化された左ドック群は、表示にした中の1枚を必ず前面に出す
+        # （全部隠して1枚だけ出したとき、そのタブが選ばれていないと空に見える）
+        for d in docks:
+            if d.objectName() in visible_docks and not d.isFloating():
+                d.raise_()
+                break
+        # ドックを出し入れすると中央の取り分が変わるので、幅を明示し直す
+        if level != "全部":
+            self._restore_dock_sizes()
+        self._sync_level_ui()
+        return level
+
+    def _visible_dock_names(self, level=None):
+        """そのレベルで出すドックの objectName 集合。"""
+        level = level or self.ui_level()
+        if level not in self._LEVEL_VIEW:
+            return {d.objectName() for d in self._all_docks()}
+        return (set(self._LEVEL_VIEW[level]["docks"])
+                | set(self._LEVEL_EXTRA_DOCKS.get(level, ())))
+
+    def _visible_section_keys(self, level=None):
+        """そのレベルで出す書式セクションのキー集合。"""
+        level = level or self.ui_level()
+        if level not in self._LEVEL_VIEW:
+            return set(getattr(self, "_fmt_sections", {}))
+        return set(self._LEVEL_VIEW[level]["sections"])
+
+    def _all_docks(self):
+        """このウィンドウが持つドックの一覧（順序は左タブ→書式）。"""
+        docks = [getattr(self, "files_dock", None)]
+        docks += list(getattr(self, "left_docks", []))
+        docks.append(getattr(self, "format_dock", None))
+        return [d for d in docks if d is not None]
+
+    def _restore_dock_sizes(self):
+        """レベル変更でドックを隠した後、残ったドックの幅を既定に戻す。"""
+        try:
+            left = getattr(self, "left_docks", None)
+            if left:
+                self.resizeDocks([left[0]], [360], QtCore.Qt.Orientation.Horizontal)
+            fdock = getattr(self, "format_dock", None)
+            if fdock is not None and not fdock.isHidden():
+                self.resizeDocks([fdock], [400], QtCore.Qt.Orientation.Horizontal)
+        except Exception:   # noqa: BLE001  幅の調整は見た目だけなので失敗しても進む
+            applog.get_logger().debug("ドック幅の再設定に失敗", exc_info=True)
+
+    def _sync_level_ui(self):
+        """メニューのチェックとステータスバーの表示をレベルに合わせる。"""
+        for lv, act in getattr(self, "_level_actions", {}).items():
+            act.blockSignals(True)
+            act.setChecked(lv == self._ui_level)
+            act.blockSignals(False)
+        btn = getattr(self, "_level_button", None)
+        if btn is not None:
+            btn.setText(f"表示: {self._ui_level} ▾")
+
+    # ---- OSのライト/ダーク切替への追従 ----
+    def _effective_bg_color(self):
+        """グラフの地色。ユーザー指定が無ければウィンドウの配色に合わせる。
+
+        ダークテーマでウィンドウだけ暗くなり、グラフだけ真っ白で残ると
+        まぶしくて読めない。明示指定があればそれを最優先する。"""
+        user_bg = (getattr(self, "bg_color", "") or "").strip()
+        if user_bg:
+            return user_bg
+        return palette_tokens()["base"] if is_dark_theme() else ""
+
+    def _apply_figure_theme(self, redraw=True):
+        """地色の明暗に合わせて、目盛り・軸ラベル・枠線・凡例の文字色を決める。
+
+        描画のたびに呼ぶ（plot_series は地色しか塗らないので、暗い地色のまま
+        だと黒い目盛り文字が読めなくなる）。"""
+        fig = getattr(self, "fig", None)
+        if fig is None:
+            return
+        try:
+            face = self._effective_bg_color() or "white"
+            import matplotlib.colors as mcolors
+            r, g, b = mcolors.to_rgb(face)
+            dark_face = (0.299 * r + 0.587 * g + 0.114 * b) < 0.5
+            fg = "#e6e6e6" if dark_face else "black"
+            fig.set_facecolor(face)
+            for ax in fig.get_axes():
+                ax.tick_params(colors=fg, which="both")
+                for spine in getattr(ax, "spines", {}).values():
+                    spine.set_color(fg)
+                axes = [ax.xaxis, ax.yaxis] + ([ax.zaxis] if hasattr(ax, "zaxis") else [])
+                for a in axes:
+                    a.label.set_color(fg)
+                if ax.get_title():
+                    ax.title.set_color(fg)
+                legend = ax.get_legend()
+                if legend is not None:
+                    # 枠も塗らないと、暗い地色の上に白い凡例だけが浮いて
+                    # その中の明るい文字が読めなくなる
+                    frame = legend.get_frame()
+                    frame.set_facecolor(face)
+                    frame.set_edgecolor(fg)
+                    for text in legend.get_texts():
+                        text.set_color(fg)
+                    title = legend.get_title()
+                    if title is not None:
+                        title.set_color(fg)
+            canvas = getattr(self, "canvas", None)
+            if canvas is not None and redraw:
+                canvas.draw_idle()
+        except Exception:   # noqa: BLE001  配色は表示上の飾りなので失敗しても続行
+            applog.get_logger().debug("グラフ配色の適用に失敗", exc_info=True)
+
+    def _on_palette_changed(self, event_type):
+        """OS のテーマ変更（ライト⇔ダーク）でスタイルを再適用する。
+
+        呼び出し元は GraphApp.changeEvent（super() を呼ぶメソッドは Mixin に
+        置かない、というこのプロジェクトの決まりに従うため本体側に置く）。"""
+        if event_type not in (QtCore.QEvent.Type.PaletteChange,
+                              QtCore.QEvent.Type.ThemeChange):
+            return
+        name = getattr(self, "_ui_style_name", None)
+        if not name:
+            return
+        QtCore.QTimer.singleShot(0, lambda: self._apply_ui_style(name))
 
     def _build_toolbar(self):
         """よく使う操作をワンクリックで呼べるツールバー（メニューと同じ機能）。"""
@@ -338,14 +559,26 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         for d in self.left_docks[1:]:           # 既定はタブ化（従来の見た目）
             self.tabifyDockWidget(self.left_docks[0], d)
 
-        # 中央：グラフ表示＋データ編集
+        # 中央：通知バー＋進捗＋（グラフ表示／データ編集）
         center = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.center_splitter = center
         center.addWidget(self._build_plot_area())
         center.addWidget(self._build_preview())
         center.setStretchFactor(0, 4)
         center.setStretchFactor(1, 1)
-        self.setCentralWidget(center)
+        holder = QtWidgets.QWidget()
+        hlay = QtWidgets.QVBoxLayout(holder)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        hlay.setSpacing(2)
+        # 告知はここに出す（モーダルダイアログで操作を止めない）
+        self.notify_bar = NotificationBar(holder)
+        hlay.addWidget(self.notify_bar)
+        # 読み込みなどの進行状況（非モーダル。キャンセル可）
+        self.progress_strip = ProgressStrip(holder)
+        self.progress_strip.canceled.connect(self._cancel_background)
+        hlay.addWidget(self.progress_strip)
+        hlay.addWidget(center, 1)
+        self.setCentralWidget(holder)
 
         # 右端：グラフ書式調整パネル（書式コントロール＋系列スタイル表）
         fdock = QtWidgets.QDockWidget("グラフ書式調整", self)
@@ -387,10 +620,12 @@ QToolBar { background:#e4e4e4; spacing:1px; }
             float_menu.addAction(a)
             self._palette_register("表示", f"{d.windowTitle()} を別ウィンドウで表示", a)
             self._float_actions[d.objectName()] = a
-        # ワンクリックのレイアウトプリセット（GUIが評価の高いツールの配置を再現）
-        lay_menu = vm.addMenu("レイアウト")
+        # 見た目のプリセット。以前は「レイアウト」と「UIスタイル（外観のみ）」の
+        # 2メニューに分かれていて、片方だけ変えると中途半端な画面になっていた。
+        # 既定は配置＋外観をまとめて適用し、外観だけの切替は下位メニューに置く。
+        lay_menu = vm.addMenu("見た目（配置＋外観）")
         self._menu_action(lay_menu, "標準（3ペイン）", lambda: self._apply_layout_preset("standard"),
-                          tip="左パネル＋中央グラフ＋右書式の標準配置に戻す")
+                          tip="左パネル＋中央グラフ＋右書式の標準配置・標準の外観に戻す")
         self._menu_action(lay_menu, "グラフ集中（Saleae風）",
                           lambda: self._apply_layout_preset("graph"),
                           tip="パネルを全部たたみ、グラフをほぼ全画面に（波形をじっくり見る）")
@@ -401,39 +636,35 @@ QToolBar { background:#e4e4e4; spacing:1px; }
                           lambda: self._apply_layout_preset("data"),
                           tip="データパネル＋大きなデータ編集表（読み込み・クレンジング向け）")
         lay_menu.addSeparator()
-        self._menu_action(lay_menu, "LabPlot風（配置＋外観）",
+        self._menu_action(lay_menu, "LabPlot風",
                           lambda: self._apply_layout_preset("labplot"),
                           tip="左にプロジェクトツリー＋統計解析タブ・右にプロパティ・下にスプレッドシート、"
                               "外観はBreeze調（LabPlotの標準画面）")
-        self._menu_action(lay_menu, "Veusz風（配置＋外観）",
+        self._menu_action(lay_menu, "Veusz風",
                           lambda: self._apply_layout_preset("veusz"),
                           tip="ツールバーを左縦に移し、左にデータツリー（上）＋書式（下）の縦積み、"
                               "右は大きなグラフ。外観はコンパクト（Veuszの編集画面）")
-        self._menu_action(lay_menu, "KST2風（配置＋外観）",
+        self._menu_action(lay_menu, "KST2風",
                           lambda: self._apply_layout_preset("kst"),
                           tip="プロットを全画面にし、データはフロートの小窓（データマネージャ風）。"
                               "外観はミニマル（KST2のライブ監視画面）")
-        self._menu_action(lay_menu, "Igor Pro風（配置＋外観）",
+        self._menu_action(lay_menu, "Igor Pro風",
                           lambda: self._apply_layout_preset("igor"),
                           tip="データ・オシロ解析・書式の3枚をカスケードのフロートウィンドウにし、"
                               "メインはグラフ専用。外観はクラシック高密度（IgorのMDI風）")
-        # 外観テーマ（配置は保ったまま、ボタンの大きさ・余白・密度・配色だけ切り替える）
-        style_menu = vm.addMenu("UIスタイル（外観のみ）")
-        self._menu_action(style_menu, "標準", lambda: self._set_ui_style("standard"),
-                          tip="既定の外観に戻す（配置はそのまま）")
-        self._menu_action(style_menu, "LabPlot風（ゆったりモダン）",
-                          lambda: self._set_ui_style("labplot"),
-                          tip="外観のみ: Breeze調の大きめボタン・角丸・青アクセント。配置も変えるなら レイアウト→LabPlot風")
-        self._menu_action(style_menu, "Veusz風（コンパクト）",
-                          lambda: self._set_ui_style("veusz"),
-                          tip="外観のみ: 小さいフォントと詰めた余白。配置も変えるなら レイアウト→Veusz風")
-        self._menu_action(style_menu, "KST2風（ミニマル）",
-                          lambda: self._set_ui_style("kst"),
-                          tip="外観のみ: 枠線・装飾を減らした薄いクローム。配置も変えるなら レイアウト→KST2風")
-        self._menu_action(style_menu, "Igor Pro風（クラシック高密度）",
-                          lambda: self._set_ui_style("igor"),
-                          tip="外観のみ: グレー基調・小さな立体ボタン。配置も変えるなら レイアウト→Igor Pro風")
+        # 配置は保ったまま、ボタンの大きさ・余白・密度だけ変えたい人向け（下位扱い）
+        lay_menu.addSeparator()
+        style_menu = lay_menu.addMenu("配置は変えずに外観だけ")
+        for key, label, tip in (
+                ("standard", "標準", "既定の外観に戻す（配置はそのまま）"),
+                ("labplot", "LabPlot風（ゆったり）", "大きめボタン・角丸・広い余白"),
+                ("veusz", "Veusz風（コンパクト）", "小さいフォントと詰めた余白"),
+                ("kst", "KST2風（ミニマル）", "枠線・装飾を減らした薄いクローム"),
+                ("igor", "Igor Pro風（高密度）", "小さな立体ボタン・詰めた行間")):
+            self._menu_action(style_menu, label, lambda k=key: self._set_ui_style(k), tip=tip)
         vm.addSeparator()
+        self._menu_action(vm, "メッセージ履歴…", self.show_message_log,
+                          tip="これまでのメッセージ・警告・エラーを一覧で見る")
         self._menu_action(vm, "パネル配置をリセット", self._reset_panel_layout,
                           tip="パネルのドッキング配置・表示状態を初期状態に戻す")
         # 読み込み済みファイルは既定で独立ウィンドウとして浮かべる
@@ -446,6 +677,8 @@ QToolBar { background:#e4e4e4; spacing:1px; }
 
         self._wire_live_signals()
         self._add_tooltips()
+        self._build_setting_index()   # 設定検索の索引（この時点で全部組み上がっている）
+        self._apply_accessibility()   # アクセシブル名・buddy・Tab順・ニーモニック
 
     # ---- ネイティブ枠フロートの「戻す」操作（スナップと両立させる）----
     # OSスナップ=画面の端／ドッキング=メインウィンドウの左右端ゾーン、と場所で
@@ -583,7 +816,14 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         """ワンクリックのレイアウトプリセット。
 
         graph=Saleae風（グラフほぼ全画面）／analysis=オシロ作業／data=データ整備。
-        隠したパネルは表示メニュー（またはレイアウト→標準）でいつでも戻せる。"""
+        隠したパネルは表示メニュー（またはレイアウト→標準）でいつでも戻せる。
+
+        レイアウトは「どのパネルをどこに置くか」を直接決めるものなので、
+        表示レベルとは競合する。プリセットを選んだ時点でレベルは「全部」に
+        上げる（そうしないと、プリセットが出したパネルをレベルが隠し返す）。"""
+        if self.ui_level() != "全部":
+            self._apply_ui_level("全部")
+            self._ui_settings().setValue("ui/level", "全部")
         total = max(sum(self.center_splitter.sizes()), 400)
         for d in [self.files_dock, *self.left_docks, self.format_dock]:
             d.setFloating(False)
@@ -1001,7 +1241,7 @@ QToolBar { background:#e4e4e4; spacing:1px; }
                 try:   # 種別ごとのOS実物アイコン（VS Code同様に拡張子で見分けられる）
                     icon = self._icon_provider.icon(QtCore.QFileInfo(path))
                 except Exception:
-                    pass
+                    applog.get_logger().debug("make_file_node: 無視した例外", exc_info=True)
             node.setIcon(0, icon)
             node.setFlags(flags_file)
             node.setCheckState(0, QtCore.Qt.CheckState.Unchecked)
@@ -1306,7 +1546,7 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         """データセットの表示名を付け替える（スタイル・チェック・プレビューも追従）。
         ディスク上のファイル名は変更しない（表示名のみ）。"""
         if new in self.datasets:
-            QtWidgets.QMessageBox.warning(self, "名前の変更", "同名のデータが既にあります。")
+            self.notify("同名のデータが既にあります。", "warn")
             return
         if old not in self.datasets:
             return
@@ -1364,7 +1604,22 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         return box
 
     def _build_format_panel(self):
-        """右端のグラフ書式調整パネル（上：グラフ書式コントロール／下：系列スタイル表）。"""
+        """右端のグラフ書式調整パネル（上：設定検索／中：書式コントロール／下：系列スタイル表）。"""
+        wrap = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(wrap)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+        # 設定はこのパネル・データパネル・描画バー・ツールバーに分かれて置かれている。
+        # 「どこにあるか」を覚えていなくても名前で辿り着けるように検索を用意する。
+        self.setting_search = QtWidgets.QLineEdit()
+        self.setting_search.setPlaceholderText("設定を検索（例: 凡例, 対数, DPI）")
+        self.setting_search.setToolTip(
+            "設定名の一部を入力して Enter。該当のパネルを開いて、その項目まで移動します。")
+        self.setting_search.setAccessibleName("設定の検索")
+        self.setting_search.setClearButtonEnabled(True)
+        self.setting_search.returnPressed.connect(self._jump_to_setting)
+        outer.addWidget(self.setting_search)
+
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.format_splitter = split
         scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
@@ -1374,7 +1629,272 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         split.addWidget(self._build_style_box())     # 系列スタイル表
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
-        return split
+        outer.addWidget(split, 1)
+        return wrap
+
+    # ---- 設定検索（散らばった設定へジャンプする）----
+    def _build_setting_index(self):
+        """全パネルのコントロールを「セクション › 名前」で引ける索引にする。"""
+        self._setting_index = []
+        docks = [getattr(self, "files_dock", None), *getattr(self, "left_docks", []),
+                 getattr(self, "format_dock", None)]
+        for dock in [d for d in docks if d is not None]:
+            if dock.widget() is not None:
+                self._index_widget(dock.widget(), dock, "", ["", None])
+        # ドックの外にある常設コントロール（描画バー・系列バー・データ編集バー）も
+        # 索引に入れる。索引に無い＝名前で呼び戻せない＝隠せない、なので網羅が要る。
+        for holder, section in ((getattr(self, "series_bar", None), "描画バー"),
+                                (getattr(self, "_preview_bar_host", None), "データ編集")):
+            if holder is not None and holder.layout() is not None:
+                self._index_layout(holder.layout(), None, section, ["", None])
+        for w, name in ((getattr(self, "draw_button", None), "グラフを描画 (F5)"),
+                        (getattr(self, "live_check", None), "リアルタイム更新"),
+                        (getattr(self, "decimate_check", None), "間引き表示"),
+                        (getattr(self, "batch_button", None), "一括画像保存..."),
+                        (getattr(self, "_level_button", None), "表示レベルの切替"),
+                        (getattr(self, "_msg_button", None), "メッセージ履歴")):
+            if w is not None and not any(e["widget"] is w for e in self._setting_index):
+                self._setting_index.append(
+                    {"name": name, "section": "描画バー", "dock": None,
+                     "widget": w, "label": None})
+        # 表示名は重複しうる（「自動」チェックが軸ごとに並ぶなど）。同じ見出しが
+        # 並ぶと候補一覧で選び分けられないので、2つ目以降に連番を付けて区別する。
+        seen = {}
+        for e in self._setting_index:
+            label = f"{e['section']} › {e['name']}" if e["section"] else e["name"]
+            seen[label] = seen.get(label, 0) + 1
+            e["key"] = label if seen[label] == 1 else f"{label} ({seen[label]})"
+        comp = QtWidgets.QCompleter([e["key"] for e in self._setting_index], self)
+        comp.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+        comp.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
+        comp.activated.connect(lambda text: QtCore.QTimer.singleShot(
+            0, lambda: self._jump_to_setting(text)))
+        if hasattr(self, "setting_search"):
+            self.setting_search.setCompleter(comp)
+        # 「設定を検索」は _build_menu で正規の QAction として登録済み（Ctrl+F）。
+        # ここで重ねて登録しない（メソッドを渡すとパレット全体が壊れる）。
+        return self._setting_index
+
+    def _index_layout(self, layout, dock, section, last_label):
+        """レイアウトを再帰的にたどってコントロールを索引に積む。
+
+        コントロール自身に文字が無い（コンボや入力欄）ときは、直前に置かれた
+        QLabel を名前として使う。画面での読み取り方と同じ順序で拾う。"""
+        controls = (QtWidgets.QAbstractButton, QtWidgets.QComboBox,
+                    QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox)
+        # 見出しラベル（_bold）に出会ったら、そこから下を新しいセクションとして扱う。
+        # オシロ/高度解析/統計解析タブは CollapsibleBox ではなく太字ラベルで
+        # 区切られているため、これが無いと索引がセクション名なしになる。
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            sub = item.layout()
+            if sub is not None:
+                self._index_layout(sub, dock, section, last_label)
+                continue
+            w = item.widget()
+            if w is None:
+                continue
+            if isinstance(w, QtWidgets.QLabel) and w.property("section_header"):
+                section = w.text().strip()
+                last_label[0], last_label[1] = "", None
+                continue
+            self._index_widget(w, dock, section, last_label)
+
+    def _index_widget(self, w, dock, section, last_label):
+        """ウィジェット1つを索引に積む（コンテナなら中身へ降りる）。
+
+        レイアウトに入らないコンテナ（スプリッタ・タブ・スクロール領域）は
+        レイアウト走査では辿れないので、種類ごとに明示的に降りる。"""
+        controls = (QtWidgets.QAbstractButton, QtWidgets.QComboBox,
+                    QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox)
+        if isinstance(w, QtWidgets.QLabel):
+            text = w.text().strip()
+            if text:
+                last_label[0], last_label[1] = text, w
+            return
+        if isinstance(w, CollapsibleBox):
+            if w.body.layout() is not None:
+                self._index_layout(w.body.layout(), dock, w.title(), ["", None])
+            return
+        if isinstance(w, QtWidgets.QScrollArea):
+            if w.widget() is not None:
+                self._index_widget(w.widget(), dock, section, last_label)
+            return
+        if isinstance(w, QtWidgets.QSplitter):
+            for i in range(w.count()):
+                self._index_widget(w.widget(i), dock, section, last_label)
+            return
+        if isinstance(w, QtWidgets.QTabWidget):
+            for i in range(w.count()):
+                self._index_widget(w.widget(i), dock, w.tabText(i), ["", None])
+            return
+        if isinstance(w, QtWidgets.QGroupBox) and w.title().strip():
+            section = w.title().strip()      # グループ名をセクション名として使う
+        if isinstance(w, controls):
+            own = ""
+            if isinstance(w, QtWidgets.QAbstractButton):
+                own = w.text()
+            elif isinstance(w, QtWidgets.QLineEdit):
+                own = w.placeholderText()
+            # 明示した accessibleName を最優先にする（索引はこの後の
+            # _apply_accessibility より先に作られるので、名前を効かせたい
+            # コントロールは _build_* の中で付ける必要がある）
+            name = (w.accessibleName() or own or last_label[0] or "").strip()
+            name = name.replace("&", "").rstrip(":：") or name.replace("&", "").strip()
+            if name:
+                self._setting_index.append(
+                    {"name": name, "section": section, "dock": dock, "widget": w,
+                     # 自前の文字を持たない入力欄は、直前のラベルと結び付ける
+                     # （スクリーンリーダーが「編集欄」としか読まないのを防ぐ）
+                     "label": None if own else last_label[1]})
+            return
+        if w.layout() is not None:     # グループボックス等の入れ子
+            self._index_layout(w.layout(), dock, section, last_label)
+
+    def _focus_setting_search(self):
+        """設定検索へフォーカスを移す（コマンドパレット・ショートカットから）。"""
+        if not hasattr(self, "setting_search"):
+            return
+        if getattr(self, "format_dock", None) is not None:
+            self.format_dock.show()
+            self.format_dock.raise_()
+        self.setting_search.setFocus()
+        self.setting_search.selectAll()
+
+    def _find_setting(self, text):
+        """検索語に最もよく合う索引項目を返す（完全一致→前方一致→部分一致）。"""
+        needle = (text or "").strip().lower()
+        if not needle:
+            return None
+        index = getattr(self, "_setting_index", None) or []
+        for pred in (lambda e: e["key"].lower() == needle,
+                     lambda e: e["name"].lower() == needle,
+                     lambda e: e["name"].lower().startswith(needle),
+                     lambda e: needle in e["key"].lower()):
+            for e in index:
+                if pred(e):
+                    return e
+        return None
+
+    def _jump_to_setting(self, text=None):
+        """検索語に対応する設定コントロールを画面に出して選択状態にする。"""
+        if text is None and hasattr(self, "setting_search"):
+            text = self.setting_search.text()
+        entry = self._find_setting(text)
+        if entry is None:
+            self.notify(f"「{text}」に一致する設定は見つかりませんでした。", "warn")
+            return None
+        w = entry["widget"]
+        dock = entry["dock"]
+        # 表示レベルで隠れている項目なら、レベルを上げてから出す。
+        # これが「隠す」と「機能を失う」を分ける仕組みの要。
+        raised = self._raise_level_for(w)
+        if dock is not None:
+            dock.show()
+            dock.raise_()
+            if dock.isFloating():
+                dock.activateWindow()
+        # 折りたたまれたセクションの中なら開く
+        p = w.parentWidget()
+        while p is not None:
+            if isinstance(p, CollapsibleBox):
+                p.set_expanded(True)
+            p = p.parentWidget()
+        # スクロール領域なら見える位置まで送る
+        area = w.parentWidget()
+        while area is not None and not isinstance(area, QtWidgets.QScrollArea):
+            area = area.parentWidget()
+        if isinstance(area, QtWidgets.QScrollArea):
+            area.ensureWidgetVisible(w, 50, 50)
+        w.setFocus(QtCore.Qt.FocusReason.ShortcutFocusReason)
+        self._flash_widget(w)
+        note = f"（表示レベルを「{self.ui_level()}」に上げました）" if raised else ""
+        self._set_status(f"設定: {entry['key']}{note}")
+        return entry
+
+    def _raise_level_for(self, widget):
+        """対象が現在のレベルで隠れているなら、見えるレベルまで上げる。
+
+        「基本」で隠した項目でも Ctrl+F で名前を入れれば必ずたどり着ける、を
+        成立させるための逃がし口。上げた場合 True を返す。"""
+        if self.ui_level() == "全部":
+            return False
+        if widget.isVisibleTo(self):
+            return False
+        for level in self.UI_LEVELS[self.UI_LEVELS.index(self.ui_level()) + 1:]:
+            self._apply_ui_level(level)
+            self._ui_settings().setValue("ui/level", level)
+            if widget.isVisibleTo(self):
+                return True
+        return True     # 「全部」まで上げても隠れている＝折りたたみ側の問題
+
+    def _flash_widget(self, w, ms=1600):
+        """見つけた項目を一時的に縁取りして目立たせる。"""
+        try:
+            before = w.styleSheet()
+            w.setStyleSheet(before + f"\nborder:2px solid {palette_tokens()['accent']};")
+            QtCore.QTimer.singleShot(ms, lambda: w.setStyleSheet(before))
+        except Exception:   # noqa: BLE001  強調は飾りなので失敗しても進む
+            applog.get_logger().debug("設定のハイライトに失敗", exc_info=True)
+
+    # ---- アクセシビリティ（スクリーンリーダー・キーボード操作）----
+    # 主要ボタンの Alt ショートカット。日本語ラベルには自然な頭文字が無いので、
+    # 英字を明示的に割り当てる（重複しないよう1か所で管理する）。
+    _MNEMONICS = {
+        "グラフを描画 (F5)": "D",
+        "自動スケール": "A",
+        "ファイル追加": "O",
+        "フォルダを開く": "F",
+        "解析実行": "R",
+        "一括画像保存...": "B",
+        "画像として保存": "S",
+    }
+
+    def _apply_accessibility(self):
+        """アクセシブル名・buddy・Tab順・ニーモニックをまとめて設定する。
+
+        個々の構築コードに散らかさず、索引（_build_setting_index）を使って
+        画面に並んでいる順序どおりに一括で付ける。新しいコントロールを足しても
+        索引に乗れば自動で対象になる。"""
+        index = getattr(self, "_setting_index", None) or []
+        per_dock = {}
+        for e in index:
+            w, label = e["widget"], e.get("label")
+            if not w.accessibleName():
+                w.setAccessibleName(e["key"])
+            if not w.accessibleDescription() and w.toolTip():
+                w.setAccessibleDescription(w.toolTip().replace("\n", " "))
+            # ラベルと入力欄を結び付ける（読み上げの対応づけ＋Altでのフォーカス移動）
+            if label is not None and isinstance(label, QtWidgets.QLabel) \
+                    and label.buddy() is None:
+                label.setBuddy(w)
+            # 主要ボタンにだけ Alt ショートカットを与える
+            if isinstance(w, QtWidgets.QAbstractButton):
+                key = self._MNEMONICS.get(w.text())
+                if key and "&" not in w.text():
+                    w.setText(f"{w.text()}(&{key})")
+            per_dock.setdefault(id(e["dock"]), []).append(w)
+        # Tab の移動順を画面の並び順に合わせる（生成順のままだと飛び回る）
+        for widgets in per_dock.values():
+            focusable = [w for w in widgets
+                         if w.focusPolicy() != QtCore.Qt.FocusPolicy.NoFocus]
+            for prev, cur in zip(focusable, focusable[1:]):
+                self.setTabOrder(prev, cur)
+        # グラフ本体もキーボードで到達できるようにする（ツールバーのショートカット用）
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            canvas.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+            canvas.setAccessibleName("グラフ")
+            canvas.setAccessibleDescription(
+                "描画したグラフ。ホイールで拡大縮小、ダブルクリックで全体表示。")
+        for name, acc in (("explorer", "ファイルと列のツリー"),
+                          ("preview", "データ編集表"),
+                          ("style_table", "系列スタイル表"),
+                          ("y_list", "Y軸の系列一覧")):
+            w = getattr(self, name, None)
+            if w is not None and not w.accessibleName():
+                w.setAccessibleName(acc)
+        return index
 
     # ---- グラフ書式コントロール（右パネル上段）----
     def _fmt_section(self, title, key, default_open):
@@ -1641,7 +2161,10 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         ar.addWidget(self.aspect_combo)
         ar.addWidget(QtWidgets.QLabel("カスタム W:H"))
         self.aspect_w = QtWidgets.QSpinBox(); self.aspect_w.setRange(1, 100); self.aspect_w.setValue(16)
+        self.aspect_w.setAccessibleName("縦横比 横")
         self.aspect_h = QtWidgets.QSpinBox(); self.aspect_h.setRange(1, 100); self.aspect_h.setValue(9)
+        # 直前のラベルが「:」だけなので、名前を明示しないと索引から漏れる
+        self.aspect_h.setAccessibleName("縦横比 縦")
         ar.addWidget(self.aspect_w); ar.addWidget(QtWidgets.QLabel(":")); ar.addWidget(self.aspect_h)
         ar.addStretch(1)
         sec_ar.set_content_layout(ar)
@@ -1874,10 +2397,13 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         v.addWidget(self._bold("マスク試験 / アイダイアグラム / ジッタ"))
         mk = QtWidgets.QGridLayout()
         mk.addWidget(QtWidgets.QLabel("上限"), 0, 0)
+        # プレースホルダが「なし」なので、名前を明示しないと索引で区別できない
         self.mask_upper = QtWidgets.QLineEdit(); self.mask_upper.setPlaceholderText("なし")
+        self.mask_upper.setAccessibleName("マスク上限")
         mk.addWidget(self.mask_upper, 0, 1)
         mk.addWidget(QtWidgets.QLabel("下限"), 0, 2)
         self.mask_lower = QtWidgets.QLineEdit(); self.mask_lower.setPlaceholderText("なし")
+        self.mask_lower.setAccessibleName("マスク下限")
         mk.addWidget(self.mask_lower, 0, 3)
         b_mask = QtWidgets.QPushButton("マスク判定"); b_mask.clicked.connect(self.run_mask_test)
         mk.addWidget(b_mask, 1, 0, 1, 2)
@@ -2033,6 +2559,7 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         b_draw = QtWidgets.QPushButton("グラフを描画 (F5)")
         b_draw.setStyleSheet("font-weight:bold;")
         b_draw.clicked.connect(self.draw_graph)
+        self.draw_button = b_draw        # 設定検索・アクセシビリティから参照する
         drawbar.addWidget(b_draw)
         self.live_check = QtWidgets.QCheckBox("リアルタイム更新")
         self.live_check.setChecked(True)
@@ -2048,19 +2575,43 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         b_batch2.setToolTip("読み込んだ各ファイルを個別に描画し、ファイル名ごとの画像として一括保存します"
                             "（タイトル・形式・DPI等は次の画面で調整できます）。")
         b_batch2.clicked.connect(self.batch_export)
+        self.batch_button = b_batch2     # 同上
         drawbar.addWidget(b_batch2)
         lay.addLayout(drawbar)
-        # グラフ上部の系列ON/OFFバー（折れ線/散布図の表示切替）
-        self.series_bar = QtWidgets.QScrollArea()
-        self.series_bar.setWidgetResizable(True)
-        self.series_bar.setFixedHeight(34)
-        self.series_bar.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        self.series_bar.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.series_bar.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # グラフ上部の系列ON/OFFバー（折れ線/散布図の表示切替）。
+        # 系列が数百・数千になると横スクロールでは探せないので、絞り込み入力を
+        # 左に固定し、並べる数には上限を設けて超過分は一覧ダイアログから選ぶ。
+        self.series_bar = QtWidgets.QWidget()
+        sb_lay = QtWidgets.QHBoxLayout(self.series_bar)
+        sb_lay.setContentsMargins(6, 2, 6, 2)
+        sb_lay.setSpacing(4)
+        self.series_filter = QtWidgets.QLineEdit()
+        self.series_filter.setPlaceholderText("系列を絞り込み")
+        self.series_filter.setToolTip("入力した文字を含む系列だけをこのバーに表示します。")
+        self.series_filter.setAccessibleName("系列の絞り込み")
+        self.series_filter.setClearButtonEnabled(True)
+        self.series_filter.setFixedWidth(140)
+        self.series_filter.textChanged.connect(lambda _t: self._rebuild_series_bar())
+        sb_lay.addWidget(self.series_filter)
+        self._series_scroll = QtWidgets.QScrollArea()
+        self._series_scroll.setWidgetResizable(True)
+        self._series_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._series_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._series_scroll.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         bar_inner = QtWidgets.QWidget()
         self.series_bar_layout = QtWidgets.QHBoxLayout(bar_inner)
-        self.series_bar_layout.setContentsMargins(6, 2, 6, 2)
-        self.series_bar.setWidget(bar_inner)
+        self.series_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self._series_scroll.setWidget(bar_inner)
+        sb_lay.addWidget(self._series_scroll, 1)
+        self.series_more_btn = QtWidgets.QPushButton("他0件…")
+        self.series_more_btn.setToolTip("バーに収まらない系列を一覧から選びます。")
+        self.series_more_btn.setAccessibleName("残りの系列を一覧から選ぶ")
+        self.series_more_btn.clicked.connect(self.show_series_picker)
+        self.series_more_btn.setVisible(False)
+        sb_lay.addWidget(self.series_more_btn)
+        self.series_bar.setFixedHeight(34)
         self.series_bar.setVisible(False)
         lay.addWidget(self.series_bar)
 
@@ -2128,20 +2679,38 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         if chart_type not in ("折れ線", "散布図"):
             self.series_bar.setVisible(False)
             return
-        items = [(self.y_list.item(i),) for i in range(self.y_list.count())]
+        items = [self.y_list.item(i) for i in range(self.y_list.count())]
         if not items:
             self.series_bar.setVisible(False)
             return
+        # 絞り込み → チェック済みを先に並べる → 上限で打ち切り、の順で選ぶ。
+        # チェック済みを優先するのは、今描いている系列こそ切り替えたいため。
+        needle = ""
+        if hasattr(self, "series_filter"):
+            needle = self.series_filter.text().strip().lower()
+
+        def _label_of(it):
+            st = self.series_styles.get(self._style_key(*it.data(UserRole))) or {}
+            return st.get("label") or it.text()
+
+        matched = [it for it in items if not needle or needle in _label_of(it).lower()]
+        checked_first = ([it for it in matched
+                          if it.checkState() == QtCore.Qt.CheckState.Checked]
+                         + [it for it in matched
+                            if it.checkState() != QtCore.Qt.CheckState.Checked])
+        shown = checked_first[:SERIES_BAR_MAX]
+        hidden = len(checked_first) - len(shown)
+
+        tok = palette_tokens()
         self._series_bar_building = True
-        for (it,) in items:
-            fl, col = it.data(UserRole)
-            st = self.series_styles.get(self._style_key(fl, col)) or {}
+        for it in shown:
+            st = self.series_styles.get(self._style_key(*it.data(UserRole))) or {}
             checked = it.checkState() == QtCore.Qt.CheckState.Checked
-            label = st.get("label") or it.text()
-            color = st.get("color") or ("#333" if checked else "#888")
-            cb = QtWidgets.QCheckBox(label)
+            color = st.get("color") or (tok["fg"] if checked else tok["muted"])
+            cb = QtWidgets.QCheckBox(_label_of(it))
             cb.setChecked(checked)
             cb.setToolTip("右クリック=この系列だけ表示／非表示／すべて表示")
+            cb.setAccessibleName(f"系列 {_label_of(it)} の表示")
             cb.setStyleSheet(f"QCheckBox {{ color:{color}; "
                              f"font-weight:{'bold' if checked else 'normal'}; }}")
             cb.toggled.connect(lambda on, item=it: self._toggle_series_select(item, on))
@@ -2151,7 +2720,49 @@ QToolBar { background:#e4e4e4; spacing:1px; }
             lay.addWidget(cb)
         lay.addStretch(1)
         self._series_bar_building = False
+        if hasattr(self, "series_more_btn"):
+            self.series_more_btn.setText(f"他{hidden}件…")
+            self.series_more_btn.setVisible(hidden > 0)
+        if needle and not matched:
+            self._set_status(f"「{needle}」に一致する系列はありません。")
         self.series_bar.setVisible(True)
+
+    def show_series_picker(self):
+        """全系列をチェックリストで選ぶダイアログ（バーに収まらないとき用）。"""
+        items = [self.y_list.item(i) for i in range(self.y_list.count())]
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("系列の選択")
+        dlg.resize(420, 520)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        edit = QtWidgets.QLineEdit()
+        edit.setPlaceholderText("絞り込み")
+        edit.setAccessibleName("系列の絞り込み")
+        lay.addWidget(edit)
+        lst = QtWidgets.QListWidget()
+        lst.setAccessibleName("系列の一覧")
+        lay.addWidget(lst, 1)
+        rows = []
+        for it in items:
+            st = self.series_styles.get(self._style_key(*it.data(UserRole))) or {}
+            row = QtWidgets.QListWidgetItem(st.get("label") or it.text())
+            row.setFlags(row.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            row.setCheckState(it.checkState())
+            lst.addItem(row)
+            rows.append((row, it))
+        edit.textChanged.connect(lambda t: [
+            r.setHidden(bool(t) and t.strip().lower() not in r.text().lower())
+            for r, _ in rows])
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+        self._series_picker = dlg     # テストから参照できるように保持
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            for row, it in rows:
+                if row.checkState() != it.checkState():
+                    it.setCheckState(row.checkState())
 
     def _toggle_series_select(self, item, on):
         """系列バーのチェックで左Yリストの選択を切り替える（→自動再描画）。"""
@@ -2162,6 +2773,7 @@ QToolBar { background:#e4e4e4; spacing:1px; }
 
     def _build_preview(self):
         box = QtWidgets.QGroupBox("データ編集（選択中ファイル・先頭100行）")
+        self._preview_bar_host = box     # 設定検索の索引がここを走査する
         lay = QtWidgets.QVBoxLayout(box); lay.setContentsMargins(4, 4, 4, 4)
         self._preview_label = None
         self._preview_loading = False
@@ -2196,10 +2808,94 @@ QToolBar { background:#e4e4e4; spacing:1px; }
         self.status = self.statusBar()
         # マウス近傍のデータ値の常時表示（右端。通常のステータス文言とは独立）
         self._hover_label = QtWidgets.QLabel("")
-        self._hover_label.setStyleSheet("color:#0a7a55;")
+        self._hover_label.setStyleSheet(f"color:{palette_tokens()['accent']};")
+        self._hover_label.setAccessibleName("カーソル位置の値")
         self.status.addPermanentWidget(self._hover_label)
+        # 直近メッセージを開くボタン（ステータスの1行は次の表示で消えてしまうため、
+        # 「さっき何か出たが読めなかった」を履歴で追えるようにする）
+        # 表示レベルの切替（メニューを開かずに増減できるように常設）
+        self._level_button = QtWidgets.QToolButton()
+        self._level_button.setText(f"表示: {self.ui_level()} ▾")
+        self._level_button.setToolTip("画面に出す設定の量を切り替えます。"
+                                      "隠れた項目も Ctrl+F で名前を入れれば出てきます。")
+        self._level_button.setAccessibleName("表示レベルの切替")
+        self._level_button.setPopupMode(
+            QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        lv_menu = QtWidgets.QMenu(self._level_button)
+        for lv, act in getattr(self, "_level_actions", {}).items():
+            lv_menu.addAction(act)
+        self._level_button.setMenu(lv_menu)
+        self.status.addPermanentWidget(self._level_button)
+        self._msg_button = QtWidgets.QToolButton()
+        self._msg_button.setText("履歴")
+        self._msg_button.setToolTip("これまでのメッセージ・警告・エラーの一覧を開きます")
+        self._msg_button.setAccessibleName("メッセージ履歴を開く")
+        self._msg_button.clicked.connect(self.show_message_log)
+        self.status.addPermanentWidget(self._msg_button)
         fi = f"日本語: {self.font_name}" if self.font_name else "日本語フォント未検出"
         self.status.addPermanentWidget(QtWidgets.QLabel(fi))
+
+    # ------------------------------------------------------------ 通知と履歴
+    # 方針: 告知はモーダルダイアログではなく画面内の通知バーで出す（操作を止めない）。
+    # ステータスバーの1行は次のメッセージで消えるので、すべて履歴にも残す。
+    def _log_message(self, text, level="info", detail=""):
+        """メッセージを履歴に積む（表示は呼び出し側）。"""
+        log = getattr(self, "_message_log", None)
+        if log is None:
+            log = self._message_log = []
+        stamp = QtCore.QDateTime.currentDateTime().toString("HH:mm:ss")
+        log.append({"time": stamp, "level": level, "text": str(text),
+                    "detail": str(detail or "")})
+        if len(log) > MESSAGE_LOG_MAX:
+            del log[:len(log) - MESSAGE_LOG_MAX]
+        logger = applog.get_logger()
+        {"error": logger.error, "warn": logger.warning}.get(level, logger.info)(
+            "%s%s", text, f" / {detail}" if detail else "")
+
+    def notify(self, text, level="info", detail="", timeout_ms=NOTIFY_MS):
+        """画面内の通知バーにメッセージを出す（非モーダル）。
+
+        level: info / ok / warn / error。error は自動で消えない。"""
+        bar = getattr(self, "notify_bar", None)
+        if bar is not None:
+            bar.show_message(text, level, detail, timeout_ms)
+        if getattr(self, "status", None) is not None:
+            self._set_status(text, level, detail)     # 履歴への記録もここで行う
+        else:                                          # 構築途中（ステータスバー未生成）
+            self._log_message(text, level, detail)
+
+    def show_message_log(self):
+        """メッセージ履歴のウィンドウを開く。"""
+        log = getattr(self, "_message_log", None) or []
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("メッセージ履歴")
+        dlg.resize(760, 420)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        table = QtWidgets.QTableWidget(len(log), 3)
+        table.setHorizontalHeaderLabels(["時刻", "種別", "内容"])
+        table.setAccessibleName("メッセージ履歴")
+        table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        names = {"info": "情報", "ok": "完了", "warn": "警告", "error": "エラー"}
+        for r, m in enumerate(reversed(log)):     # 新しいものを上に
+            body = m["text"] + (f"\n{m['detail']}" if m["detail"] else "")
+            for c, v in enumerate((m["time"], names.get(m["level"], m["level"]), body)):
+                table.setItem(r, c, QtWidgets.QTableWidgetItem(v))
+        table.resizeColumnsToContents()
+        table.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(table)
+        self._wire_table_export(table, "メッセージ履歴")
+        bar = QtWidgets.QHBoxLayout()
+        bar.addStretch(1)
+        b_clear = QtWidgets.QPushButton("履歴を消去(&C)")
+        b_clear.clicked.connect(lambda: (setattr(self, "_message_log", []),
+                                         table.setRowCount(0)))
+        bar.addWidget(b_clear)
+        b_close = QtWidgets.QPushButton("閉じる(&X)")
+        b_close.clicked.connect(dlg.accept)
+        bar.addWidget(b_close)
+        lay.addLayout(bar)
+        self._message_log_dialog = dlg    # テストから参照できるように保持
+        dlg.exec()
 
     # ---- 表の右クリック：コピー / CSV保存（結果表を報告に持ち出せるように）----
     def _wire_table_export(self, table, name):
@@ -2270,7 +2966,16 @@ QToolBar { background:#e4e4e4; spacing:1px; }
 
     @staticmethod
     def _bold(text):
-        l = QtWidgets.QLabel(text); f = l.font(); f.setBold(True); l.setFont(f); return l
+        """パネル内の見出しラベル。
+
+        section_header プロパティを立てておくと、設定検索の索引が
+        「ここから下は別セクション」と解釈して名前に階層を付けられる
+        （CollapsibleBox に作り替えなくてもセクション名が付く）。"""
+        l = QtWidgets.QLabel(text)
+        f = l.font(); f.setBold(True); l.setFont(f)
+        l.setProperty("section_header", True)
+        l.setWordWrap(True)
+        return l
 
     @staticmethod
     def _hline():

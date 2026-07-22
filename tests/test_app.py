@@ -19,7 +19,7 @@ import config_io  # noqa: E402
 config_io.load_last_session = lambda: None  # セッション復元を無効化（テスト独立）
 
 import graph_app  # noqa: E402
-from matplotlib.backends.qt_compat import QtCore, QtWidgets  # noqa: E402
+from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets  # noqa: E402
 
 _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 for _m in ("information", "critical", "warning"):
@@ -714,6 +714,414 @@ def test_undo_redo():
     assert w.title_edit.text() == "B"
     w.redo()
     assert w.title_edit.text() == "C"
+
+
+# ---------------- GUI改修の回帰 ----------------
+def test_notification_bar_and_message_log():
+    """告知が非モーダルの通知バーに出て、履歴に残ること。"""
+    w = _make_app(_wave())
+    w.notify("テスト通知", "info")
+    assert not w.notify_bar.isHidden() and w.notify_bar.current_text() == "テスト通知"
+    w.notify_bar.dismiss()
+    assert w.notify_bar.isHidden()
+    # エラーは自動で消えない（タイマーを動かさない＝残り続ける）
+    w.notify("読めません", "error", "詳細テキスト")
+    assert not w.notify_bar.isHidden()
+    # 履歴に両方が積まれ、種別と詳細も保持される
+    log = w._message_log
+    assert [m["text"] for m in log[-2:]] == ["テスト通知", "読めません"]
+    assert log[-1]["level"] == "error" and log[-1]["detail"] == "詳細テキスト"
+    # ステータスバーの1行にも同じ文言が出る
+    assert w.status.currentMessage() == "読めません"
+    # 「先にファイルを追加」がモーダルでなく通知になった
+    w2 = graph_app.GraphApp()
+    w2.datasets.clear()
+    w2.draw_graph()
+    assert "ファイル" in w2.notify_bar.current_text()
+    # 上限を超えた履歴は古いものから捨てられる
+    for i in range(graph_app.MESSAGE_LOG_MAX + 20):
+        w._log_message(f"m{i}")
+    assert len(w._message_log) == graph_app.MESSAGE_LOG_MAX
+
+
+def _make_app_wide(n, rows=20):
+    """n 列のデータを読み込み、Y を一括チェックしたアプリを返す。
+
+    1件ずつ setCheckState すると選択変更のたびに系列表を作り直すため、
+    列数の2乗に比例して時間がかかる。ここではまとめて設定して1回だけ通知する。
+    """
+    df = pd.DataFrame({"時間": np.arange(float(rows))})
+    for i in range(n):
+        df[f"ch{i:03d}"] = np.arange(float(rows)) + i
+    w = graph_app.GraphApp()
+    w.datasets.clear(); w.file_list.clear(); w.y_list.clear()
+    w.datasets["t.csv"] = df
+    w.meta["t.csv"] = {"path": "t.csv", "enc": "utf-8", "delim": ","}
+    w._add_file_item("t.csv"); w.file_list.setCurrentRow(0); w._refresh_columns()
+    w.x_combo.setCurrentText("時間")
+    w.y_list.blockSignals(True)
+    for r in range(w.y_list.count()):
+        it = w.y_list.item(r)
+        on = it.data(graph_app.UserRole)[1] != "時間"
+        it.setCheckState(QtCore.Qt.CheckState.Checked if on
+                         else QtCore.Qt.CheckState.Unchecked)
+    w.y_list.blockSignals(False)
+    w._on_y_selection_changed()
+    return w
+
+
+def _y_item(w, col):
+    """y_list から列名で項目を探す（並び順に依存しないため）。"""
+    for r in range(w.y_list.count()):
+        it = w.y_list.item(r)
+        if it.data(graph_app.UserRole)[1] == col:
+            return it
+    raise AssertionError(f"{col} が y_list にない")
+
+
+def _bar_checkboxes(w):
+    return [w.series_bar_layout.itemAt(i).widget()
+            for i in range(w.series_bar_layout.count())
+            if isinstance(w.series_bar_layout.itemAt(i).widget(), QtWidgets.QCheckBox)]
+
+
+def test_series_bar_cap_and_filter():
+    """系列バーが上限で打ち切られ、絞り込みが効くこと。"""
+    n = graph_app.SERIES_BAR_MAX + 25
+    w = _make_app_wide(n)
+    w.chart_combo.setCurrentText("折れ線")
+    w._rebuild_series_bar("折れ線")
+    assert len(_bar_checkboxes(w)) == graph_app.SERIES_BAR_MAX   # 無制限に生成しない
+    assert not w.series_more_btn.isHidden()
+    hidden = w.y_list.count() - graph_app.SERIES_BAR_MAX
+    assert w.series_more_btn.text() == f"他{hidden}件…"
+    # 絞り込むと該当だけが並ぶ
+    w.series_filter.setText("ch00")
+    names = [b.text() for b in _bar_checkboxes(w)]
+    assert names and all(nm.startswith("ch00") for nm in names)
+    w.series_filter.setText("")
+    # チェック済みが先に並ぶ（描いている系列をすぐ切り替えられる）
+    w.y_list.blockSignals(True)
+    for r in range(w.y_list.count()):
+        w.y_list.item(r).setCheckState(QtCore.Qt.CheckState.Unchecked)
+    _y_item(w, f"ch{n - 1:03d}").setCheckState(QtCore.Qt.CheckState.Checked)
+    w.y_list.blockSignals(False)
+    w._rebuild_series_bar("折れ線")
+    first = _bar_checkboxes(w)[0]
+    assert first.text() == f"ch{n - 1:03d}" and first.isChecked()
+
+
+def test_heavy_series_confirmation():
+    """系列が多すぎる描画は確認を挟み、拒否すると描かないこと。"""
+    n = graph_app.HEAVY_SERIES + 10
+    w = _make_app_wide(n)
+    orig = QtWidgets.QMessageBox.question
+    QtWidgets.QMessageBox.question = staticmethod(
+        lambda *a, **k: QtWidgets.QMessageBox.StandardButton.No)
+    try:
+        w.draw_graph()
+        assert not w.ax.get_lines()            # 拒否したので描かれない
+        assert "中止" in w.notify_bar.current_text()
+    finally:
+        QtWidgets.QMessageBox.question = orig
+    w.draw_graph()                             # 承諾すると描く（以後は聞かれない）
+    assert len(w.ax.get_lines()) >= n
+    assert w._heavy_draw_ok is True
+
+
+_CTRL = (QtWidgets.QAbstractButton, QtWidgets.QComboBox,
+         QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox)
+
+
+def _control_attrs(w):
+    """アプリが保持しているコントロール属性名の集合。"""
+    return {n for n in dir(w) if isinstance(getattr(w, n, None), _CTRL)}
+
+
+def _visible_controls(w):
+    """そのレベルで画面に出ているコントロールの数（表の中身は除く）。"""
+    vis = w._visible_dock_names()
+    n = 0
+    for d in w._all_docks():
+        if d.objectName() not in vis:
+            continue
+        for c in d.findChildren(QtWidgets.QWidget):
+            if not isinstance(c, _CTRL) or c.isHidden():
+                continue
+            p, skip = c.parentWidget(), False
+            while p is not None and p is not d:
+                if isinstance(p, QtWidgets.QAbstractItemView) or p.isHidden():
+                    skip = True
+                    break
+                p = p.parentWidget()
+            if not skip:
+                n += 1
+    return n
+
+
+def test_ui_level_hides_without_destroying():
+    """表示レベルは setVisible だけで、ウィジェットも設定も失わないこと。"""
+    w = _make_app(_wave())
+    assert w.DEFAULT_UI_LEVEL == "全部"        # 通常版の既定は従来どおり
+    attrs_full = _control_attrs(w)
+    cfg_full = set(w._collect_config().keys())
+    counts = {}
+    for lv in w.UI_LEVELS:
+        w.set_ui_level(lv, announce=False)
+        assert w.ui_level() == lv
+        counts[lv] = _visible_controls(w)
+        # ウィジェットは1つも消えない＝設定の保存・復元・テストの属性参照が生きる
+        assert _control_attrs(w) == attrs_full, f"{lv} でウィジェット属性が変化した"
+        assert set(w._collect_config().keys()) == cfg_full, f"{lv} で設定キーが変化した"
+    # 実際に段階的に減っている
+    assert counts["基本"] < counts["標準"] < counts["全部"]
+    # 「全部」は従来と同じ＝どのドックも隠れていない
+    w.set_ui_level("全部", announce=False)
+    assert w._visible_dock_names() == {d.objectName() for d in w._all_docks()}
+
+
+def test_hidden_settings_are_still_reachable_by_name():
+    """基本レベルで隠れている設定も、名前で検索すれば必ず出てくること。
+
+    これが「隠す」と「機能を落とす」を分ける唯一の担保なので、機械的に確かめる。"""
+    w = _make_app(_wave())
+    w.set_ui_level("基本", announce=False)
+    hidden = [e for e in w._setting_index if not e["widget"].isVisibleTo(w)]
+    assert hidden, "基本レベルなのに隠れている設定が無い＝レベルが効いていない"
+    for entry in hidden[:25]:                  # 代表を確認（全件は時間がかかる）
+        w.set_ui_level("基本", announce=False)
+        got = w._jump_to_setting(entry["key"])
+        assert got is not None, f"{entry['key']} を名前で呼び出せない"
+        assert got["widget"] is entry["widget"]
+        assert entry["widget"].isVisibleTo(w), f"{entry['key']} が呼び出しても出てこない"
+    # 呼び戻しでレベルが自動的に上がっている
+    assert w.ui_level() != "基本"
+
+
+def test_layout_preset_promotes_level():
+    """レイアウトプリセットは表示レベルと競合するので「全部」へ上げること。
+
+    上げないと、プリセットが出したパネルをレベルが隠し返して
+    「選んだのに何も起きない」状態になる。"""
+    w = _make_app(_wave())
+    w.set_ui_level("基本", announce=False)
+    w._apply_layout_preset("analysis")
+    assert w.ui_level() == "全部"
+    assert not w.left_docks[1].isHidden()      # オシロ/解析が実際に出ている
+    w._apply_layout_preset("standard")
+    assert w.ui_level() == "全部"
+
+
+def test_simple_edition_is_same_app_with_fewer_controls():
+    """シンプル版が同じ機能・同じ設定で、表示量だけ絞られていること。"""
+    import graph_app_simple
+    QtCore.QSettings("graph-tool", "GraphApp").clear()
+    s = graph_app_simple.SimpleGraphApp()
+    try:
+        assert isinstance(s, graph_app.GraphApp)       # 別実装ではない
+        assert s.ui_level() == "基本"
+        assert "シンプル" in s.windowTitle()
+        full = _make_app(_wave())
+        full.set_ui_level("全部", announce=False)
+        # 保持するウィジェット・設定キー・解析メソッドは通常版と完全に同一
+        assert _control_attrs(s) == _control_attrs(full)
+        assert set(s._collect_config().keys()) == set(full._collect_config().keys())
+        for m in ("run_analysis", "show_fft", "decode_protocol", "run_pca",
+                  "export_excel_report", "batch_export", "show_waterfall"):
+            assert callable(getattr(s, m, None)), f"{m} がシンプル版に無い"
+        # 画面に出ている量だけが違う
+        assert _visible_controls(s) < _visible_controls(full)
+        # その場で全機能を出せる（再起動不要）
+        s.set_ui_level("全部", announce=False)
+        assert _visible_controls(s) == _visible_controls(full)
+    finally:
+        s.close()
+        QtCore.QSettings("graph-tool", "GraphApp").clear()
+
+
+def test_command_palette_opens_with_all_commands():
+    """コマンドパレットが開き、登録が全部 QAction であること。
+
+    QAction 以外を1件でも登録すると show_command_palette の isEnabled() が
+    AttributeError になり、Ctrl+Shift+P が丸ごと使えなくなる（実際に起きた）。"""
+    w = _make_app(_wave())
+    assert len(w._all_actions) >= 40
+    assert all(isinstance(a, QtGui.QAction) for _k, a in w._all_actions)
+    w.show_command_palette()                     # 例外を投げないこと
+    lst = w._palette_dlg.findChild(QtWidgets.QListWidget)
+    assert lst is not None and lst.count() == len(w._all_actions)
+    # QAction 以外は登録時に弾かれ、候補を汚さない
+    before = len(w._all_actions)
+    w._palette_register("表示", "壊れた登録", lambda: None)
+    assert len(w._all_actions) == before
+
+
+def test_setting_search_jumps_to_control():
+    """設定検索が索引を作り、該当コントロールへ移動できること。"""
+    w = _make_app(_wave())
+    index = w._setting_index
+    assert len(index) > 40                     # 全パネルから拾えている
+    keys = [e["key"] for e in index]
+    assert any("凡例" in k for k in keys) and any("描画バー" in k for k in keys)
+    assert len(set(keys)) == len(keys)          # 候補一覧で選び分けられる
+    # ラベルが「:」だけの入力欄も索引に載る（accessibleName を優先するため）
+    indexed = {id(e["widget"]) for e in index}
+    for attr in ("xmin", "xmax", "ymin", "ymax", "aspect_w", "aspect_h",
+                 "mask_upper", "mask_lower", "bins_spin", "legend_loc"):
+        wdg = getattr(w, attr, None)
+        assert wdg is None or id(wdg) in indexed, f"{attr} が設定検索から漏れている"
+    assert w._find_setting("縦横比 縦") is not None
+    # 折りたたまれたセクションの中の項目でも、開いて選択状態にする
+    box = w._fmt_sections["legend"]
+    box.set_expanded(False)
+    entry = w._jump_to_setting("凡例")
+    assert entry is not None and box.is_expanded()
+    assert w.focusWidget() is entry["widget"] or entry["widget"].hasFocus()
+    # 見つからない語は通知で知らせる（黙って何も起きない、をなくす）
+    assert w._jump_to_setting("存在しない設定名") is None
+    assert "見つかりません" in w.notify_bar.current_text()
+
+
+def test_accessibility_names_and_buddies():
+    """アクセシブル名・buddy・キャンバスのフォーカスが設定されていること。"""
+    w = _make_app(_wave())
+    named = [e for e in w._setting_index if e["widget"].accessibleName()]
+    assert len(named) == len(w._setting_index)          # 全項目に名前が付く
+    buddied = [e for e in w._setting_index
+               if e.get("label") is not None and e["label"].buddy() is not None]
+    assert buddied                                       # ラベルと入力欄が結ばれている
+    assert w.canvas.focusPolicy() == QtCore.Qt.FocusPolicy.StrongFocus
+    assert w.canvas.accessibleName() == "グラフ"
+    assert w.explorer.accessibleName()
+    # 主要ボタンにはAltショートカットが付く
+    draw_btn = next(e["widget"] for e in w._setting_index
+                    if e["name"].startswith("グラフを描画"))
+    assert "&" in draw_btn.text()
+
+
+def test_theme_tokens_follow_palette():
+    """QSSに色が直書きされておらず、ダークパレットでも文字色が反転すること。"""
+    for style in graph_app.GraphApp._UI_STYLES.values():
+        assert "background:white" not in style["qss"]
+        assert "#fcfcfc" not in style["qss"] and "#ececec" not in style["qss"]
+    light = graph_app.palette_tokens(QtGui.QPalette(QtGui.QColor("#ffffff")))
+    dark = graph_app.palette_tokens(QtGui.QPalette(QtGui.QColor("#202020")))
+    assert graph_app.is_dark_theme(QtGui.QPalette(QtGui.QColor("#202020")))
+    assert not graph_app.is_dark_theme(QtGui.QPalette(QtGui.QColor("#ffffff")))
+    assert light["bg"] != dark["bg"] and light["fg"] != dark["fg"]
+    # 展開後のQSSにトークンが残っていない（$bg のまま出力されない）
+    w = _make_app(_wave())
+    w._apply_ui_style("labplot")
+    assert "$" not in w.styleSheet() and "color:" in w.styleSheet()
+    w._apply_ui_style("standard")
+    # パレット変更イベントでスタイルを作り直す（例外を出さない）
+    w._on_palette_changed(QtCore.QEvent.Type.PaletteChange)
+
+
+def test_dark_palette_makes_graph_readable():
+    """ダークパレットで地色・目盛り・凡例枠まで反転し、対比が保たれること。"""
+    before = _app.palette()
+    pal = QtGui.QPalette()
+    for role, col in ((QtGui.QPalette.ColorRole.Window, "#1e1e1e"),
+                      (QtGui.QPalette.ColorRole.Base, "#252526"),
+                      (QtGui.QPalette.ColorRole.Button, "#333333"),
+                      (QtGui.QPalette.ColorRole.WindowText, "#e6e6e6"),
+                      (QtGui.QPalette.ColorRole.Text, "#e6e6e6"),
+                      (QtGui.QPalette.ColorRole.Highlight, "#0a84ff")):
+        pal.setColor(role, QtGui.QColor(col))
+    try:
+        _app.setPalette(pal)
+        w = _make_app(_wave())
+        w.legend_check.setChecked(True)
+        w.draw_graph()
+        face = w.fig.get_facecolor()
+        assert max(face[:3]) < 0.4                    # 地色が暗い
+        assert w.ax.get_xticklabels()[0].get_color() == "#e6e6e6"
+        legend = w.ax.get_legend()
+        assert legend is not None
+        lf = legend.get_frame().get_facecolor()
+        assert max(lf[:3]) < 0.4                      # 凡例の枠も暗い＝白抜けしない
+        assert all(t.get_color() == "#e6e6e6" for t in legend.get_texts())
+        # 背景色を明示指定したときはユーザーの指定が優先される
+        w.bg_color = "#ffffff"
+        w.draw_graph()
+        assert min(w.fig.get_facecolor()[:3]) > 0.9
+        assert w.ax.get_xticklabels()[0].get_color() == "black"
+    finally:
+        _app.setPalette(before)
+
+
+def test_bulk_check_defers_heavy_rebuild():
+    """列を続けてチェックしても、重い作り直しは最後に1回だけになること。"""
+    w = _make_app_wide(20)
+    calls = []
+    orig = w._rebuild_style_table
+    w._rebuild_style_table = lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
+    # 10列を1つずつ外す（＝ツリーでファイル単位に外したときと同じ流れ）
+    targets = [_y_item(w, f"ch{i:03d}") for i in range(10)]
+    for it in targets:
+        it.setCheckState(QtCore.Qt.CheckState.Unchecked)
+    # 見た目（ツリーのチェック）はその場で追従している
+    assert all(nd.checkState(0) == QtCore.Qt.CheckState.Unchecked
+               for nd in [w.explorer.topLevelItem(0).child(i)
+                          for i in range(w.explorer.topLevelItem(0).childCount())
+                          if w.explorer.topLevelItem(0).child(i).text(0).startswith("ch00")])
+    assert not calls                       # 途中では重い作り直しをしていない
+    w._ysel_timer.stop(); w._apply_y_selection_deferred()   # まとめて1回
+    assert len(calls) == 1
+    assert w.style_table.rowCount() == 10
+
+
+def test_async_load_keeps_ui_responsive():
+    """大きめの読み込みがワーカースレッドへ回り、キャンセルできること。"""
+    import tempfile
+    d = os.path.join(tempfile.gettempdir(), "gtest_async")
+    os.makedirs(d, exist_ok=True)
+    big = pd.DataFrame({"時間": np.arange(120000.0),
+                        "値": np.sin(np.arange(120000.0) / 100)})
+    paths = []
+    for i in range(2):
+        p = os.path.join(d, f"big{i}.csv")
+        big.to_csv(p, index=False)
+        paths.append(p)
+    w = graph_app.GraphApp()
+    w.datasets.clear(); w.file_list.clear(); w.y_list.clear()
+    thread = w._load_files_async(paths)
+    assert thread is not None                 # 閾値超えはスレッドで読む
+    assert not w.progress_strip.isHidden()
+    assert w.wait_for_loads(60000)
+    assert len(w.datasets) == 2 and w.progress_strip.isHidden()
+    assert w._load_thread is None
+    # 小さいファイルはスレッドを起こさない（完了タイミングが素直）
+    small = os.path.join(d, "small.csv")
+    pd.DataFrame({"時間": [0, 1], "値": [1.0, 2.0]}).to_csv(small, index=False)
+    w2 = graph_app.GraphApp()
+    w2.datasets.clear(); w2.file_list.clear(); w2.y_list.clear()
+    assert w2._load_files_async([small]) is None
+    assert len(w2.datasets) == 1              # 呼び出し直後に読み終わっている
+    # 終了時にワーカーを止める経路が例外を出さない
+    w._stop_background_tasks()
+
+
+def test_session_restore_skips_huge_selection():
+    """前回選択が多すぎるとき、起動時の自動描画を省いて固まらないこと。"""
+    n = graph_app.HEAVY_SERIES + 5
+    df = pd.DataFrame({"時間": np.arange(10.0)})
+    for i in range(n):
+        df[f"ch{i:03d}"] = np.arange(10.0) + i
+    w = _make_app(df)
+    w._has_drawn = False
+    w.ax.clear()
+    cfg = w._collect_config()
+    orig = config_io.load_last_session
+    config_io.load_last_session = lambda: cfg
+    try:
+        restored = w._try_restore_session()
+    finally:
+        config_io.load_last_session = orig
+    assert restored is True
+    assert not w.ax.get_lines()                       # 自動描画していない
+    assert "自動描画を省略" in w.notify_bar.current_text()
 
 
 # ---------------- スクリプト単体実行用ランナー ----------------
