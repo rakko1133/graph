@@ -38,3 +38,10 @@ tools/noisy_work/
 *.raw
 importlog.txt
 graph.png
+
+# 単一ファイル版はビルド生成物（tools/build_onefile.py / build_simple_onefile.py で
+# いつでも作り直せる）。追跡すると、本体を1行直すたびに1万行超の差分が付いて
+# レビューできなくなるため git では管理しない。
+# 起動bat は無ければ自動でビルドするので、ダブルクリックの使い勝手は変わらない。
+graph_onefile.py
+graph_simple_onefile.py

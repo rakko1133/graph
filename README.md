@@ -96,10 +96,17 @@ C:\.venv\Scripts\pythonw graph_app_simple.py
 
 1ファイルだけで動く版を2種類ビルドできます。配布・持ち出し用です。
 
+**`1ファイル版_起動.bat`** / **`シンプル版_1ファイル_起動.bat`** をダブルクリックすれば、
+無ければ自動でビルドしてから起動します。手動でビルドする場合:
+
 ```bash
 python tools/build_onefile.py          # graph_onefile.py（通常版・全機能）
 python tools/build_simple_onefile.py   # graph_simple_onefile.py（シンプル版）
 ```
+
+> 生成された `graph_onefile.py` / `graph_simple_onefile.py` は **git では管理していません**
+> （本体を1行直すたびに1万行超の差分が付いてレビューできなくなるため）。
+> CI が毎回ビルドして検証し、成果物としてダウンロードできるようにしてあります。
 
 | | 行数 | 見た目テンプレート | 起動時の表示 |
 |---|---:|---|---|
