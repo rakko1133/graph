@@ -53,8 +53,8 @@ SUBS = [
     (UI,
      '    _UI_STYLE_NAMES = {"standard": "標準", "labplot": "LabPlot風", "veusz": "Veusz風",\n'
      '                       "kst": "KST2風", "igor": "Igor Pro風"}\n',
-     '    _UI_STYLE_NAMES = {"standard": "標準"}\n',
-     "_UI_STYLE_NAMES を標準のみに", 1),
+     "",
+     "_UI_STYLE_NAMES を削除（_set_ui_style ごと消すので参照元が無い）", 1),
     (UI,
      '        # 「◯◯風」プリセットは配置だけでなく外観（ボタンの大きさ・密度・配色）も適用する\n'
      "        if name in self._UI_STYLES:\n"

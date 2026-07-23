@@ -254,10 +254,6 @@ def setup_japanese_font(preferred=None):
 
 
 
-# 試行する文字コード（日本語環境でよくある順）。
-# UTF-8 系を先に試し、最後に必ず成功する latin-1 をフォールバックに置く。
-_ENCODINGS = ["utf-8-sig", "utf-8", "cp932", "shift_jis", "euc-jp", "latin-1"]
-
 # 自動判定で候補とする区切り文字
 _DELIMITERS = [",", "\t", ";", "|"]
 
@@ -1531,8 +1527,6 @@ _SCOPE_TYPES = ("折れ線", "散布図")
 # X↔Y 入れ替えが意味を持つ種別（2Dで x,y 両方を持つもの）
 _SWAP_TYPES = ("折れ線", "散布図", "面", "積み上げ面", "ステップ", "ステム",
                "2Dヒストグラム", "hexbin")
-# 3D で描くとき、種別名 → 3D描画の種類（_draw_3d が使う）
-_THREED_KIND = {"散布図": "scatter", "折れ線": "line", "棒": "bar", "曲面": "surface"}
 # 旧バージョンの『3D…』種別名 → 新しい2D種別名（3Dフラグは別途ON）
 _OLD_3D_ALIASES = {"3D散布図": "散布図", "3D折れ線": "折れ線",
                    "3D棒": "棒", "3D曲面": "曲面"}
@@ -1867,7 +1861,6 @@ def plot(ax, df, chart_type, x_col=None, y_cols=None, *, bins=10, title="",
 
 
 _trapz = getattr(np, "trapezoid", None) or np.trapz
-_HAVE_SCIPY = _ilu.find_spec("scipy") is not None
 WINDOWS = ["hann", "hamming", "blackman", "blackmanharris", "flattop",
            "kaiser", "gaussian", "rect"]
 
@@ -3899,41 +3892,6 @@ def render_one(task):
     return task["path"]
 
 
-def render_sequential(tasks):
-    """逐次出力（図を1つ再利用）。並列が使えない/不要なときのフォールバック。
-    戻り値 (saved_paths, skipped_msgs)。"""
-    import os
-    saved, skipped = [], []
-    if not tasks:
-        return saved, skipped
-    fig = Figure(figsize=tasks[0]["figsize"], dpi=tasks[0]["dpi"])
-    FigureCanvasAgg(fig)
-    ax = _make_ax(fig, tasks[0].get("threed", False))   # 同一バッチは同一投影で固定
-    for t in tasks:
-        try:
-            ax.clear()
-            threed = t.get("threed", False)
-            plot_series(
-                ax, t["series"], t["ctype"], categories=t["categories"],
-                title=t["title"], xlabel=t["xlabel"], ylabel=t["ylabel"],
-                xlim=t["xlim"], ylim=t["ylim"],
-                secondary_label=t["sec_label"], max_points=t["max_points"],
-                zlabel=t.get("zlabel", ""), view_init=t.get("view_init"), threed=threed,
-                **t["fmt"])
-            _apply_ratio(ax, t.get("ratio"), threed)
-            tight = t.get("tight", True)
-            if not tight:
-                try:
-                    fig.tight_layout()
-                except Exception:
-                    pass
-            fig.savefig(t["path"], dpi=t["dpi"],
-                        bbox_inches=("tight" if tight else None),
-                        transparent=t["transparent"])
-            saved.append(t["path"])
-        except Exception as e:  # noqa: BLE001
-            skipped.append(f"{os.path.basename(t['path'])}（{e}）")
-    return saved, skipped
 
 # ======================================================================
 # ↑ py
@@ -3946,7 +3904,7 @@ PREVIEW_ROWS = 100
 UserRole = QtCore.Qt.ItemDataRole.UserRole
 DECIMATE_TARGET = 8000   # 折れ線/散布図でこの点数を超えたら間引いて表示
 BUSY_ROWS = 200_000      # この行数を超える読み込みは待機カーソルを出す
-BATCH_PARALLEL_THRESHOLD = 10**9   # 一括出力でこの枚数以上なら別プロセス並列を試みる
+BATCH_PARALLEL_THRESHOLD = 64   # 一括出力でこの枚数以上なら別プロセス並列を試みる
 ASYNC_LOAD_BYTES = 4_000_000   # 合計がこれを超える読み込みはワーカースレッドへ回す
 ASYNC_LOAD_COUNT = 8           # 枚数がこれを超える読み込みもワーカースレッドへ回す
 SERIES_BAR_MAX = 60      # 系列バーに並べるチェックボックスの上限（超過分は一覧から選ぶ）
@@ -12085,7 +12043,7 @@ class PersistenceMixin:
             if table is not None and table.rowCount():
                 extra[name] = self._table_rows(table, False)
         try:
-            import excel_chart
+            excel_chart = _install_package("excel_chart")
             out, eng = excel_chart.export_from_config(
                 self.datasets[src], self._collect_config(), out_path=path,
                 only_file=src, extra_sheets=extra or None)
@@ -12641,3 +12599,1362 @@ if __name__ == "__main__":
 # ======================================================================
 # ↑ graph_app.py
 # ======================================================================
+
+
+_PACKAGE_SRC = {
+    "excel_chart": [
+("excel_chart.mapping", r'''# -*- coding: utf-8 -*-
+"""matplotlib / 日本語スタイル値 → Excel(COM・openpyxl) 値への対応表。
+
+既存アプリ（plotter.LINESTYLES / MARKERS / DEFAULT_STYLE）が使う matplotlib 流の
+値（"-" "--" "o" "s" "#1f77b4" など）を、そのまま Excel ネイティブグラフの
+プロパティへ翻訳する。COM 側は VBA と同じ enum 値（整数）、openpyxl 側は
+OOXML の文字列を返す。GUI には一切依存しない純粋関数群。
+"""
+
+# --- matplotlib linestyle -> (msoLineDashStyle int, openpyxl prstDash) ---
+# msoLineSolid=1, msoLineSquareDot=2, msoLineRoundDot=3, msoLineDash=4,
+# msoLineDashDot=5。「なし」は線を非表示にするので None を返す。
+LINE_DASH = {
+    "-":    (1, "solid"),
+    "--":   (4, "dash"),
+    "-.":   (5, "dashDot"),
+    ":":    (3, "sysDot"),
+    "None": (None, None),
+    "":     (None, None),
+}
+
+# --- matplotlib marker -> (xlMarkerStyle int, openpyxl symbol) ---
+# xlMarkerStyleNone=-4142, Square=1, Diamond=2, Triangle=3, Circle=8, Plus=9,
+# X=-4168, Dot=-4118
+MARKER = {
+    "":  (-4142, "none"),
+    "o": (8, "circle"),
+    "s": (1, "square"),
+    "^": (3, "triangle"),
+    "D": (2, "diamond"),
+    "d": (2, "diamond"),
+    "x": (-4168, "x"),
+    "+": (9, "plus"),
+    ".": (-4118, "dot"),
+    "*": (-4118, "star"),
+    "v": (3, "triangle"),
+}
+
+
+def excel_marker(marker):
+    """matplotlib マーカー -> xlMarkerStyle 整数（不明は丸）。"""
+    return MARKER.get(marker or "", (8, "circle"))[0]
+
+
+def openpyxl_marker(marker):
+    """matplotlib マーカー -> openpyxl symbol 文字列（不明は circle）。"""
+    return MARKER.get(marker or "", (8, "circle"))[1]
+
+
+def excel_dash(linestyle):
+    """matplotlib 線種 -> (msoLineDashStyle int or None)。None は『線なし』。"""
+    return LINE_DASH.get(linestyle, (1, "solid"))[0]
+
+
+def openpyxl_dash(linestyle):
+    """matplotlib 線種 -> (openpyxl prstDash or None)。None は『線なし』。"""
+    return LINE_DASH.get(linestyle, (1, "solid"))[1]
+
+
+# --- 凡例位置 ---------------------------------------------------------------
+def excel_legend_position(loc):
+    """matplotlib legend loc -> xlLegendPosition 整数。
+
+    Excel の凡例位置は上下左右＋右上隅のみ。matplotlib の細かい loc は
+    最寄りの方角へ丸める（best/center/右系はすべて右）。
+    """
+    loc = (loc or "best").lower()
+    if "bottom" in loc or "lower" in loc:
+        return -4107   # xlLegendPositionBottom
+    if "top" in loc or "upper" in loc:
+        return -4160   # xlLegendPositionTop
+    if "left" in loc:
+        return -4131   # xlLegendPositionLeft
+    return -4152       # xlLegendPositionRight
+
+
+def openpyxl_legend_position(loc):
+    """matplotlib legend loc -> openpyxl legend.position ('r'/'l'/'t'/'b')。"""
+    loc = (loc or "best").lower()
+    if "bottom" in loc or "lower" in loc:
+        return "b"
+    if "top" in loc or "upper" in loc:
+        return "t"
+    if "left" in loc:
+        return "l"
+    return "r"
+
+
+# --- 色 --------------------------------------------------------------------
+def _parse_hex(color):
+    """'#RRGGBB' / '#RGB' / 既知の色名 -> (R, G, B) tuple。不正/None は None。"""
+    if not color:
+        return None
+    s = str(color).strip()
+    if s.startswith("#"):
+        s = s[1:]
+    if len(s) == 3:
+        s = "".join(ch * 2 for ch in s)
+    if len(s) != 6:
+        # 色名（'red' 等）は matplotlib があれば解決、無ければ諦める
+        try:
+            from matplotlib.colors import to_hex
+            s = to_hex(color)[1:]
+        except Exception:
+            return None
+    try:
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except ValueError:
+        return None
+
+
+def hex_to_bgr(color):
+    """'#RRGGBB' -> Excel COM の .RGB が要求する整数 0x00BBGGRR(BGR)。
+
+    重要: Excel/VBA の RGB は web の 0xRRGGBB ではなく BGR バイト順。
+    例えば赤 #FF0000 は 0x0000FF を返す。None/不正色は None。
+    """
+    rgb = _parse_hex(color)
+    if rgb is None:
+        return None
+    r, g, b = rgb
+    return r | (g << 8) | (b << 16)
+
+
+def hex_to_rrggbb(color):
+    """'#RRGGBB' -> openpyxl が要求する 'RRGGBB'（# なし大文字）。None は None。"""
+    rgb = _parse_hex(color)
+    if rgb is None:
+        return None
+    return "%02X%02X%02X" % rgb
+
+
+# --- Excel(XlChartType) / openpyxl チャート種別 ------------------------------
+# XlChartType 整数
+XL = {
+    "line":            4,      # xlLine
+    "line_markers":    65,     # xlLineMarkers
+    "xy_lines":        74,     # xlXYScatterLines（数値Xの折れ線に最適）
+    "xy_lines_nomark": 75,     # xlXYScatterLinesNoMarkers
+    "xy_scatter":      -4169,  # xlXYScatter（散布図・マーカーのみ）
+    "column":          51,     # xlColumnClustered
+    "column_stacked":  52,     # xlColumnStacked
+    "bar":             57,     # xlBarClustered（横棒）
+    "bar_stacked":     58,     # xlBarStacked
+    "pie":             5,      # xlPie
+}
+
+# 軸・スケール等の XL 定数
+XL_CATEGORY = 1
+XL_VALUE = 2
+XL_PRIMARY = 1
+XL_SECONDARY = 2
+XL_SCALE_LINEAR = -4132        # xlLinear
+XL_SCALE_LOG = -4133           # xlLogarithmic
+'''),
+("excel_chart.spec", r'''# -*- coding: utf-8 -*-
+"""グラフ書式の中立表現 ChartSpec と、その組み立て。
+
+GUI（PySide6）にも matplotlib にも Excel エンジンにも依存しない純粋なデータ構造。
+ここを境界にして「どんな書式か」を 1 つの dict/データクラスへ正規化し、
+COM / openpyxl いずれのエンジンも同じ ChartSpec を解釈して描く。
+
+書式の供給元は 2 通り:
+  * from_columns(...)  : CLI / コードから列と種別を直接指定
+  * from_app_config(cfg): 既存 GUI が保存した設定 JSON（_collect_config 形式）を流用
+"""
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+
+# 既存アプリの既定スタイル（plotter.DEFAULT_STYLE）と同値。アプリ非導入でも動くよう自前で持つ。
+DEFAULT_STYLE = {
+    "color": None, "linestyle": "-", "linewidth": 1.5,
+    "marker": "", "markersize": 4.0, "alpha": 1.0,
+}
+
+# 既存アプリの日本語ラベル -> matplotlib 値（plotter.LINESTYLES / MARKERS と同じ）。
+LINESTYLES = {"実線": "-", "破線": "--", "一点鎖線": "-.", "点線": ":", "なし": "None"}
+MARKERS = {"なし": "", "丸": "o", "四角": "s", "三角": "^", "菱形": "D",
+           "×": "x", "× ": "x", "＋": "+", "点": "."}
+
+CHART_TYPES = ["折れ線", "棒", "横棒", "積み上げ棒", "散布図", "円", "ヒストグラム"]
+
+
+@dataclass
+class SeriesSpec:
+    """1 系列ぶんの書式。値（y_col）は DataFrame の列名で参照する。"""
+    name: str                      # 凡例に出す系列名
+    y_col: str                     # 値の列名
+    color: Optional[str] = None    # "#RRGGBB" or None(自動)
+    linestyle: str = "-"           # matplotlib 線種（"-","--","-.",":","None"）
+    linewidth: float = 1.5
+    marker: str = ""               # matplotlib マーカー（"","o","s","^","D","x","+","."）
+    markersize: float = 4.0
+    axis: str = "primary"          # "primary" | "secondary"
+    kind: str = ""                 # "" | "line" | "bar" | "area" | "scatter"（複合グラフ用）
+    errcol: Optional[str] = None   # エラーバーに使う列名（任意）
+
+
+@dataclass
+class ChartSpec:
+    """グラフ 1 枚ぶんの完全な書式。"""
+    chart_type: str = "折れ線"
+    x_col: Optional[str] = None
+    series: List[SeriesSpec] = field(default_factory=list)
+    title: str = ""
+    xlabel: str = ""
+    ylabel: str = ""
+    secondary_label: str = ""
+    legend: bool = True
+    legend_loc: str = "best"
+    grid: bool = True
+    xmin: Optional[float] = None
+    xmax: Optional[float] = None
+    ymin: Optional[float] = None
+    ymax: Optional[float] = None
+    xlog: bool = False
+    ylog: bool = False
+    xinvert: bool = False
+    yinvert: bool = False
+    data_labels: bool = False
+    pct: bool = False               # 円グラフでパーセント表示
+    bins: int = 10                  # ヒストグラムのビン数
+    # チャートオブジェクトのサイズ（ポイント）
+    width: float = 480.0
+    height: float = 300.0
+
+    # ---------------------------------------------------------------- 構築
+    @classmethod
+    def from_columns(cls, x_col, y_cols, chart_type="折れ線", *,
+                     styles=None, names=None, **kwargs):
+        """列名から最小限の指定で組み立てる（CLI / コード用）。
+
+        styles: {y_col: style_dict} で系列ごとの見た目を上書き可能。
+        names : {y_col: 表示名}。
+        kwargs: ChartSpec の他フィールド（title, ylabel, ymin ... ）。
+        """
+        styles = styles or {}
+        names = names or {}
+        series = []
+        for col in y_cols:
+            st = dict(DEFAULT_STYLE)
+            st.update(styles.get(col) or {})
+            series.append(SeriesSpec(
+                name=names.get(col, col), y_col=col,
+                color=st.get("color"), linestyle=st.get("linestyle", "-"),
+                linewidth=float(st.get("linewidth", 1.5)),
+                marker=st.get("marker", ""),
+                markersize=float(st.get("markersize", 4.0)),
+                axis=st.get("axis", "primary"), kind=st.get("kind", ""),
+                errcol=st.get("errcol"),
+            ))
+        return cls(chart_type=chart_type, x_col=x_col, series=series, **kwargs)
+
+    @classmethod
+    def from_app_config(cls, cfg, *, only_file=None):
+        """既存 GUI の設定 JSON（_collect_config 形式 / プリセット）から組み立てる。
+
+        単一データファイルでの利用を想定。複数ファイルのときは only_file に
+        対象ファイル名（meta のキー）を渡すとその系列だけ採用する。
+        """
+        styles = cfg.get("styles", {}) or {}
+        # selected_y: [[file, col], ...] ／ 無ければ styles のキーから推定
+        sel = cfg.get("selected_y") or []
+        if not sel:
+            sel = [k.split("\t", 1) for k in styles.keys() if "\t" in k]
+
+        series = []
+        for pair in sel:
+            if not (isinstance(pair, (list, tuple)) and len(pair) == 2):
+                continue
+            fl, col = pair[0], pair[1]
+            if only_file is not None and fl != only_file:
+                continue
+            st = dict(DEFAULT_STYLE)
+            st.update(styles.get(f"{fl}\t{col}") or {})
+            series.append(SeriesSpec(
+                name=st.get("label") or col, y_col=col,
+                color=st.get("color"), linestyle=st.get("linestyle", "-"),
+                linewidth=float(st.get("linewidth", 1.5)),
+                marker=st.get("marker", ""),
+                markersize=float(st.get("markersize", 4.0)),
+                axis=st.get("axis", "primary"), kind=st.get("kind", ""),
+                errcol=st.get("errcol"),
+            ))
+
+        return cls(
+            chart_type=cfg.get("chart_type", "折れ線"),
+            x_col=(None if cfg.get("x_leftmost") else (cfg.get("x_col") or None)),
+            series=series,
+            title=cfg.get("title", ""),
+            xlabel=cfg.get("xlabel", ""), ylabel=cfg.get("ylabel", ""),
+            secondary_label=cfg.get("secondary_label", ""),
+            legend=bool(cfg.get("legend", True)),
+            legend_loc=cfg.get("legend_loc", "best"),
+            grid=bool(cfg.get("grid", True)),
+            xmin=_num(cfg.get("xmin")), xmax=_num(cfg.get("xmax")),
+            ymin=_num(cfg.get("ymin")), ymax=_num(cfg.get("ymax")),
+            xlog=bool(cfg.get("xlog", False)), ylog=bool(cfg.get("ylog", False)),
+            xinvert=bool(cfg.get("xinvert", False)),
+            yinvert=bool(cfg.get("yinvert", False)),
+            data_labels=bool(cfg.get("data_labels", False)),
+            pct=bool(cfg.get("pct", False)),
+            bins=int(cfg.get("bins", 10) or 10),
+        )
+
+    # ---------------------------------------------------------------- 補助
+    def used_columns(self):
+        """このスペックが参照する列名の集合（X・値・誤差）。データ抽出に使う。"""
+        cols = set()
+        if self.x_col:
+            cols.add(self.x_col)
+        for s in self.series:
+            cols.add(s.y_col)
+            if s.errcol:
+                cols.add(s.errcol)
+        return cols
+
+
+def _num(text):
+    """設定 JSON 中の数値テキスト（'1' '1ms' '' None）を float へ。空/不正は None。
+
+    工学接頭辞（1ms 等）は既存アプリの parse_eng があれば使い、無ければ float。
+    """
+    if text is None:
+        return None
+    if isinstance(text, (int, float)):
+        return float(text)
+    s = str(text).strip()
+    if not s:
+        return None
+    try:
+        from plotter_format import parse_eng
+        v = parse_eng(s, default=None)
+        return None if v is None else float(v)
+    except Exception:
+        try:
+            return float(s)
+        except ValueError:
+            return None
+'''),
+("excel_chart.com_engine", r'''# -*- coding: utf-8 -*-
+"""COM エンジン（pywin32）= VBA 完全互換でネイティブ Excel グラフを生成する。
+
+実 Excel を COM で起動し、VBA と同じ Excel.Application オブジェクトモデルを叩く。
+したがって VBA マクロでできる書式設定はすべて可能（線種・色・太さ・マーカー・
+軸範囲/タイトル・対数軸・反転・第2軸・凡例位置・データラベル・エラーバー）。
+
+要件: Windows + Microsoft Excel + pywin32。Linux/ヘッドレス不可。
+このモジュールは Excel が無い環境では import 時には失敗せず、write() 呼び出しで
+明確な RuntimeError を送出する（フォールバックは export 層が担当）。
+"""
+import importlib.util
+import os
+
+import pandas as pd
+
+from . import mapping as M
+
+# msoTrue/msoFalse, msoThemeColor 不使用。RGB は BGR 整数で直接渡す。
+_MSO_FALSE = 0
+
+
+def available():
+    """この環境で COM エンジンが使えそうか（pywin32 が import できるか）。"""
+    return importlib.util.find_spec("win32com") is not None
+
+
+def _col_letter(idx1):
+    """1始まりの列番号 -> 'A','B',...,'AA' のような列記号。"""
+    s = ""
+    n = idx1
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _set_line(fmt, color_bgr, width_pt, dash):
+    """系列/グリッド線の Format.Line を設定。dash=None は線を非表示にする。"""
+    if dash is None:
+        fmt.Line.Visible = _MSO_FALSE
+        return
+    fmt.Line.Visible = -1  # msoTrue
+    if color_bgr is not None:
+        fmt.Line.ForeColor.RGB = color_bgr
+    if width_pt:
+        fmt.Line.Weight = float(width_pt)
+    try:
+        fmt.Line.DashStyle = dash
+    except Exception:
+        pass
+
+
+def write(spec, df, out_path, *, visible=False, macro_enabled=False, extra_sheets=None):
+    """ChartSpec + DataFrame からネイティブ Excel グラフ入りブックを保存する。
+
+    out_path: .xlsx（既定）。macro_enabled=True または拡張子 .xlsm なら .xlsm 保存。
+    戻り値: 保存した絶対パス。
+    """
+    try:
+        import win32com.client as win32
+    except Exception as e:  # pragma: no cover - 環境依存
+        raise RuntimeError(
+            "COM エンジンには pywin32 が必要です（pip install pywin32）。") from e
+
+    out_path = os.path.abspath(out_path)
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    if os.path.exists(out_path):
+        os.remove(out_path)
+
+    ext = os.path.splitext(out_path)[1].lower()
+    as_xlsm = macro_enabled or ext == ".xlsm"
+    file_format = 52 if as_xlsm else 51  # 52=xlsm, 51=xlsx
+
+    try:
+        excel = win32.gencache.EnsureDispatch("Excel.Application")
+    except Exception as e:  # pragma: no cover - gen_py キャッシュ破損など
+        raise RuntimeError(
+            "Excel への COM 接続に失敗しました。Excel がインストールされ、"
+            "起動できる環境か確認してください（gen_py キャッシュ破損時は "
+            "%LOCALAPPDATA%\\Temp\\gen_py を削除）。") from e
+
+    excel.Visible = bool(visible)
+    excel.DisplayAlerts = False
+    try:
+        wb = excel.Workbooks.Add()
+        ws = wb.Worksheets(1)
+        ws.Name = "Data"
+
+        nrow = _write_data(ws, spec, df)        # シートへ列を書き込み、行数を返す
+        chart = _build_chart(ws, spec, df, nrow)
+        _format_axes_and_legend(chart, spec)
+
+        for name, rows in (extra_sheets or {}).items():
+            es = wb.Worksheets.Add(After=wb.Worksheets(wb.Worksheets.Count))
+            es.Name = str(name)[:31]   # Excel のシート名は31文字まで
+            if rows:
+                ncol = max(len(r) for r in rows)
+                block = [list(r) + [None] * (ncol - len(r)) for r in rows]
+                es.Range(es.Cells(1, 1), es.Cells(len(block), ncol)).Value = block
+
+        wb.SaveAs(out_path, FileFormat=file_format)
+        wb.Close(SaveChanges=False)
+        return out_path
+    finally:
+        try:
+            excel.Quit()
+        except Exception:
+            pass
+        del excel  # COM 参照を解放（EXCEL.EXE のリーク防止）
+
+
+# --------------------------------------------------------------------------- 内部
+def _write_data(ws, spec, df):
+    """X 列・各系列の値列・誤差列をシートへ書き込み、データ行数を返す。
+
+    レイアウト: A=X、B 以降=各系列 y、その後に誤差列。列位置は _build_chart と共有。
+    """
+    # 使用する列を順番に決める（X → y1,y2,... → err...）
+    layout = _layout(spec)
+    headers = [name for name, _col in layout]
+    values = [_column_values(df, col, header=name) for name, col in layout]
+    n = max((len(v) for v in values), default=0)
+
+    # ヘッダ行
+    for j, h in enumerate(headers, start=1):
+        ws.Cells(1, j).Value = h
+    # データ本体を 2 次元で一括書き込み（高速）
+    if n:
+        block = []
+        for i in range(n):
+            row = []
+            for v in values:
+                row.append(v[i] if i < len(v) else None)
+            block.append(row)
+        rng = ws.Range(ws.Cells(2, 1), ws.Cells(1 + n, len(headers)))
+        rng.Value = block
+    return n
+
+
+def _layout(spec):
+    """シート列レイアウト [(header, df列名), ...] を返す。X は df列名=None の特例。"""
+    layout = []
+    if _uses_x(spec):
+        layout.append((spec.xlabel or spec.x_col or "X", spec.x_col))
+    for s in spec.series:
+        layout.append((s.name, s.y_col))
+    for s in spec.series:
+        if s.errcol:
+            layout.append((f"{s.name}_err", s.errcol))
+    return layout
+
+
+def _col_index(spec, *, kind, key):
+    """レイアウト上の 1 始まり列番号を引く。kind='x'|'y'|'err', key=系列 or None。"""
+    pos = 1
+    if _uses_x(spec):
+        if kind == "x":
+            return 1
+        pos = 2
+    # y 列
+    for i, s in enumerate(spec.series):
+        if kind == "y" and s is key:
+            return pos + i
+    pos += len(spec.series)
+    # err 列
+    err_series = [s for s in spec.series if s.errcol]
+    for i, s in enumerate(err_series):
+        if kind == "err" and s is key:
+            return pos + i
+    return None
+
+
+def _uses_x(spec):
+    return spec.chart_type not in ("ヒストグラム", "箱ひげ")
+
+
+def _column_values(df, col, header=None):
+    """df[col] を Excel に書ける Python リストへ。X=None の特例は連番。"""
+    if col is None:
+        return None
+    if col not in df.columns:
+        return []
+    s = df[col]
+    # 数値列は float、非数値はそのまま文字列で（カテゴリ軸ラベル等）
+    num = pd.to_numeric(s, errors="coerce")
+    if num.notna().mean() >= 0.8:
+        out = [None if pd.isna(v) else float(v) for v in num.to_numpy()]
+    else:
+        out = [None if pd.isna(v) else str(v) for v in s.to_numpy()]
+    return out
+
+
+def _x_is_numeric(df, spec):
+    if not spec.x_col or spec.x_col not in df.columns:
+        return True   # X 未指定（連番）は数値扱い
+    num = pd.to_numeric(df[spec.x_col], errors="coerce")
+    return bool(num.notna().mean() >= 0.8)
+
+
+def _base_chart_type(spec, df):
+    """ChartSpec.chart_type -> XlChartType 整数。"""
+    ct = spec.chart_type
+    if ct == "散布図":
+        return M.XL["xy_scatter"]
+    if ct == "棒":
+        return M.XL["column"]
+    if ct == "横棒":
+        return M.XL["bar"]
+    if ct == "積み上げ棒":
+        return M.XL["column_stacked"]
+    if ct == "円":
+        return M.XL["pie"]
+    if ct in ("ヒストグラム",):
+        return M.XL["column"]
+    # 折れ線: 数値 X は XY 折れ線が忠実、カテゴリ X は通常の折れ線
+    if _x_is_numeric(df, spec):
+        return M.XL["xy_lines"]
+    return M.XL["line_markers"]
+
+
+def _series_chart_type(spec, s, df):
+    """系列ごとの kind 上書き（複合グラフ）を XlChartType へ。None は基本種別のまま。"""
+    if not s.kind:
+        return None
+    if s.kind == "bar":
+        return M.XL["column"]
+    if s.kind == "area":
+        return 1  # xlArea
+    if s.kind == "scatter":
+        return M.XL["xy_scatter"]
+    if s.kind == "line":
+        return M.XL["xy_lines"] if _x_is_numeric(df, spec) else M.XL["line"]
+    return None
+
+
+def _build_chart(ws, spec, df, nrow):
+    """グラフオブジェクトを作り、系列を 1 本ずつ追加・書式設定する。"""
+    base = _base_chart_type(spec, df)
+    shp = ws.Shapes.AddChart2(-1, base, 10, 10, spec.width, spec.height)
+    chart = shp.Chart
+
+    # AddChart2 が自動生成した系列を一掃し、こちらで明示的に作る（X/Y を完全制御）
+    sc = chart.SeriesCollection()
+    while sc.Count > 0:
+        sc.Item(1).Delete()
+
+    x_idx = _col_index(spec, kind="x", key=None) if _uses_x(spec) else None
+    x_rng = None
+    if x_idx is not None and nrow:
+        x_rng = ws.Range(ws.Cells(2, x_idx), ws.Cells(1 + nrow, x_idx))
+
+    if spec.chart_type == "円":
+        _build_pie(ws, chart, spec, df, nrow, x_rng)
+        return chart
+
+    for s in spec.series:
+        y_idx = _col_index(spec, kind="y", key=s)
+        if y_idx is None or not nrow:
+            continue
+        ser = chart.SeriesCollection().NewSeries()
+        ser.Name = s.name
+        ser.Values = ws.Range(ws.Cells(2, y_idx), ws.Cells(1 + nrow, y_idx))
+        if x_rng is not None:
+            ser.XValues = x_rng
+
+        # 系列ごとの種別（複合グラフ）
+        st = _series_chart_type(spec, s, df)
+        if st is not None:
+            try:
+                ser.ChartType = st
+            except Exception:
+                pass
+
+        # 第2軸
+        if s.axis == "secondary":
+            try:
+                ser.AxisGroup = M.XL_SECONDARY
+            except Exception:
+                pass
+
+        _format_series(ser, s, spec, ws, nrow)
+
+    return chart
+
+
+def _build_pie(ws, chart, spec, df, nrow, x_rng):
+    """円グラフ: 最初の系列のみ使用。ラベルは X 列。"""
+    if not spec.series or not nrow:
+        return
+    s = spec.series[0]
+    y_idx = _col_index(spec, kind="y", key=s)
+    ser = chart.SeriesCollection().NewSeries()
+    ser.Values = ws.Range(ws.Cells(2, y_idx), ws.Cells(1 + nrow, y_idx))
+    if x_rng is not None:
+        ser.XValues = x_rng
+    if spec.data_labels or spec.pct:
+        try:
+            ser.HasDataLabels = True
+            if spec.pct:
+                ser.DataLabels().ShowPercentage = True
+        except Exception:
+            pass
+
+
+def _format_series(ser, s, spec, ws, nrow):
+    """1 系列の線・マーカー・データラベル・エラーバーを設定。"""
+    color_bgr = M.hex_to_bgr(s.color)
+    dash = M.excel_dash(s.linestyle)
+
+    # 散布図（マーカーのみ）は線を消す。複合 area/bar はマーカー無し。
+    is_scatter = (spec.chart_type == "散布図" and not s.kind) or s.kind == "scatter"
+    is_barlike = s.kind in ("bar", "area") or spec.chart_type in (
+        "棒", "横棒", "積み上げ棒", "ヒストグラム")
+
+    if is_barlike:
+        # 塗り色（棒・面）。線色は枠線として控えめに。
+        if color_bgr is not None:
+            try:
+                ser.Format.Fill.Visible = -1
+                ser.Format.Fill.ForeColor.RGB = color_bgr
+            except Exception:
+                pass
+        return
+
+    # 線
+    line_dash = None if is_scatter else dash
+    try:
+        _set_line(ser.Format, color_bgr, s.linewidth, line_dash)
+    except Exception:
+        pass
+
+    # マーカー
+    mk = M.excel_marker(s.marker)
+    if is_scatter and (s.marker in ("", None)):
+        mk = M.excel_marker("o")   # 散布図でマーカー未指定なら丸
+    try:
+        ser.MarkerStyle = mk
+        if mk != -4142:  # not none
+            ser.MarkerSize = int(max(2, min(72, round(s.markersize))))
+            if color_bgr is not None:
+                ser.MarkerForegroundColor = color_bgr
+                ser.MarkerBackgroundColor = color_bgr
+    except Exception:
+        pass
+
+    # データラベル
+    if spec.data_labels:
+        try:
+            ser.HasDataLabels = True
+        except Exception:
+            pass
+
+    # エラーバー（Y・カスタム両側）
+    if s.errcol and nrow:
+        err_idx = _col_index(spec, kind="err", key=s)
+        if err_idx is not None:
+            try:
+                # xlY=1, xlErrorBarIncludeBoth=1, xlErrorBarTypeCustom=-4114
+                amount = ws.Range(ws.Cells(2, err_idx),
+                                  ws.Cells(1 + nrow, err_idx))
+                ser.ErrorBar(Direction=1, Include=1, Type=-4114,
+                             Amount=amount, MinusValues=amount)
+            except Exception:
+                pass
+
+
+def _format_axes_and_legend(chart, spec):
+    """タイトル・軸（タイトル/範囲/対数/反転/グリッド）・第2軸・凡例を設定。"""
+    # タイトル
+    try:
+        chart.HasTitle = bool(spec.title)
+        if spec.title:
+            chart.ChartTitle.Text = spec.title
+    except Exception:
+        pass
+
+    if spec.chart_type == "円":
+        _format_legend(chart, spec)
+        return
+
+    # X 軸（カテゴリ）
+    try:
+        catax = chart.Axes(M.XL_CATEGORY, M.XL_PRIMARY)
+        if spec.xlabel:
+            catax.HasTitle = True
+            catax.AxisTitle.Text = spec.xlabel
+        _apply_scale(catax, spec.xmin, spec.xmax, spec.xlog, spec.xinvert)
+        catax.HasMajorGridlines = bool(spec.grid)
+    except Exception:
+        pass
+
+    # Y 軸（主・値）
+    try:
+        valax = chart.Axes(M.XL_VALUE, M.XL_PRIMARY)
+        if spec.ylabel:
+            valax.HasTitle = True
+            valax.AxisTitle.Text = spec.ylabel
+        _apply_scale(valax, spec.ymin, spec.ymax, spec.ylog, spec.yinvert)
+        valax.HasMajorGridlines = bool(spec.grid)
+    except Exception:
+        pass
+
+    # 第2軸（値）
+    if any(s.axis == "secondary" for s in spec.series):
+        try:
+            sec = chart.Axes(M.XL_VALUE, M.XL_SECONDARY)
+            if spec.secondary_label:
+                sec.HasTitle = True
+                sec.AxisTitle.Text = spec.secondary_label
+        except Exception:
+            pass
+
+    _format_legend(chart, spec)
+
+
+def _apply_scale(axis, vmin, vmax, log, invert):
+    """軸の最小/最大・対数・反転を設定（散布/折れ線の数値軸で有効）。"""
+    try:
+        if vmin is not None:
+            axis.MinimumScale = float(vmin)
+        if vmax is not None:
+            axis.MaximumScale = float(vmax)
+    except Exception:
+        pass
+    try:
+        axis.ScaleType = M.XL_SCALE_LOG if log else M.XL_SCALE_LINEAR
+    except Exception:
+        pass
+    try:
+        axis.ReversePlotOrder = bool(invert)
+    except Exception:
+        pass
+
+
+def _format_legend(chart, spec):
+    try:
+        chart.HasLegend = bool(spec.legend)
+        if spec.legend:
+            chart.Legend.Position = M.excel_legend_position(spec.legend_loc)
+    except Exception:
+        pass
+'''),
+("excel_chart.openpyxl_engine", r'''# -*- coding: utf-8 -*-
+"""openpyxl エンジン = Excel 無しでネイティブ Excel グラフ（OOXML）を生成する。
+
+純 Python。Windows/macOS/Linux・CI/ヘッドレスで動く。生成されるグラフは
+本物の編集可能な Excel グラフだが、書式の再現度には天井がある（COM/VBA が
+できることの一部は OOXML に露出していない）。Excel が使えない提出環境向けの
+フォールバック。COM エンジンと同じ ChartSpec を解釈する。
+
+対応: 折れ線 / 散布図 / 棒 / 横棒 / 積み上げ棒 / 円 / ヒストグラム（事前ビン化）
+制限: 第2軸は combine で対応。複合（系列ごとの種別混在）は近似的に扱う。
+"""
+import importlib.util
+import os
+
+import pandas as pd
+
+from . import mapping as M
+
+_EMU_PER_PT = 12700  # openpyxl の線幅は EMU 指定
+
+
+def available():
+    return importlib.util.find_spec("openpyxl") is not None
+
+
+def write(spec, df, out_path, extra_sheets=None):
+    """ChartSpec + DataFrame からネイティブ Excel グラフ入り .xlsx を保存する。
+
+    extra_sheets: {シート名: 行のリスト（各行はセル値のリスト）} を追加シートとして
+    同じブックに書く（測定値・統計などの表を同梱するレポート用途）。"""
+    try:
+        from openpyxl import Workbook
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("openpyxl が必要です（pip install openpyxl）。") from e
+
+    out_path = os.path.abspath(out_path)
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+
+    layout = _layout(spec)
+    headers = [name for name, _c in layout]
+    cols = [_column_values(df, col) for _name, col in layout]
+    nrow = max((len(c) for c in cols), default=0)
+
+    ws.append(headers)
+    for i in range(nrow):
+        ws.append([(c[i] if i < len(c) else None) for c in cols])
+
+    chart = _build_chart(spec, df, ws, layout, nrow)
+    if chart is not None:
+        ws.add_chart(chart, _anchor(len(headers)))
+
+    for name, rows in (extra_sheets or {}).items():
+        es = wb.create_sheet(str(name)[:31])   # Excel のシート名は31文字まで
+        for row in rows:
+            es.append(list(row))
+
+    wb.save(out_path)
+    return out_path
+
+
+# --------------------------------------------------------------------------- 内部
+def _uses_x(spec):
+    return spec.chart_type not in ("ヒストグラム", "箱ひげ")
+
+
+def _layout(spec):
+    layout = []
+    if _uses_x(spec):
+        layout.append((spec.xlabel or spec.x_col or "X", spec.x_col))
+    for s in spec.series:
+        layout.append((s.name, s.y_col))
+    return layout
+
+
+def _column_values(df, col):
+    if col is None:
+        return []
+    if col not in df.columns:
+        return []
+    s = df[col]
+    num = pd.to_numeric(s, errors="coerce")
+    if num.notna().mean() >= 0.8:
+        return [None if pd.isna(v) else float(v) for v in num.to_numpy()]
+    return [None if pd.isna(v) else str(v) for v in s.to_numpy()]
+
+
+def _anchor(ncols):
+    """データ列の右隣にグラフを置くセルアンカー。"""
+    from openpyxl.utils import get_column_letter
+    return f"{get_column_letter(ncols + 2)}2"
+
+
+def _x_is_numeric(df, spec):
+    if not spec.x_col or spec.x_col not in df.columns:
+        return True
+    return bool(pd.to_numeric(df[spec.x_col], errors="coerce").notna().mean() >= 0.8)
+
+
+def _col_pos(spec):
+    """レイアウト上の 1 始まり列番号: (x_col_idx or None, {series: y_idx})。"""
+    pos = 1
+    x_idx = None
+    if _uses_x(spec):
+        x_idx = 1
+        pos = 2
+    ymap = {}
+    for i, s in enumerate(spec.series):
+        ymap[id(s)] = pos + i
+    return x_idx, ymap
+
+
+def _build_chart(spec, df, ws, layout, nrow):
+    from openpyxl.chart import LineChart, BarChart, PieChart, Reference
+
+    ct = spec.chart_type
+    x_idx, ymap = _col_pos(spec)
+    maxr = 1 + nrow
+
+    if ct == "円":
+        chart = PieChart()
+        s = spec.series[0]
+        data = Reference(ws, min_col=ymap[id(s)], min_row=1, max_row=maxr)
+        cats = Reference(ws, min_col=x_idx, min_row=2, max_row=maxr) if x_idx else None
+        chart.add_data(data, titles_from_data=True)
+        if cats is not None:
+            chart.set_categories(cats)
+        if spec.data_labels or spec.pct:
+            from openpyxl.chart.label import DataLabelList
+            chart.dataLabels = DataLabelList()
+            chart.dataLabels.showVal = not spec.pct
+            chart.dataLabels.showPercent = spec.pct
+        _titles(chart, spec)
+        _legend(chart, spec)
+        return chart
+
+    if ct in ("棒", "横棒", "積み上げ棒"):
+        chart = BarChart()
+        chart.type = "bar" if ct == "横棒" else "col"
+        chart.grouping = "stacked" if ct == "積み上げ棒" else "clustered"
+        if ct == "積み上げ棒":
+            chart.overlap = 100
+        for s in spec.series:
+            data = Reference(ws, min_col=ymap[id(s)], min_row=1, max_row=maxr)
+            chart.add_data(data, titles_from_data=True)
+        if x_idx:
+            cats = Reference(ws, min_col=x_idx, min_row=2, max_row=maxr)
+            chart.set_categories(cats)
+        _style_bar_series(chart, spec)
+        _finish(chart, spec, df)
+        return chart
+
+    if ct == "ヒストグラム":
+        return _build_histogram(spec, df, ws)
+
+    # 折れ線 / 散布図（数値 X は散布図系で X を数値軸として保持）
+    is_scatter = (ct == "散布図") or (ct == "折れ線" and _x_is_numeric(df, spec))
+    if is_scatter:
+        chart = _assemble(spec, df, x_idx=x_idx, ymap=ymap, ws=ws, nrow=nrow)
+        _finish(chart, spec, df)
+        return chart
+
+    # カテゴリ折れ線
+    chart = LineChart()
+    for s in spec.series:
+        data = Reference(ws, min_col=ymap[id(s)], min_row=1, max_row=maxr)
+        chart.add_data(data, titles_from_data=True)
+    if x_idx:
+        cats = Reference(ws, min_col=x_idx, min_row=2, max_row=maxr)
+        chart.set_categories(cats)
+    for ser, s in zip(chart.series, spec.series):
+        _style_xy_series(ser, s, spec, line=True)
+    _finish(chart, spec, df)
+    return chart
+
+
+def _assemble(spec, df, *, x_idx, ymap, ws, nrow):
+    """主軸/第2軸を分けて散布図を組み立て、必要なら combine する。
+
+    ScatterChart は X/Y とも値軸なので、第2軸を出すには第2チャートに
+    「隠しX軸(新 axId, delete=True)＋新Y軸(crosses='max')」を与える必要がある
+    （実機 Excel 検証でこの組み合わせのみ系列が第2軸 group=2 になった）。
+    """
+    from openpyxl.chart import ScatterChart, Reference, Series
+    maxr = 1 + nrow
+
+    xref = Reference(ws, min_col=x_idx, min_row=2, max_row=maxr) if x_idx \
+        else Reference(ws, min_col=ymap[id(spec.series[0])], min_row=2, max_row=maxr)
+
+    prim = ScatterChart()
+    prim.x_axis.delete = False
+    prim.y_axis.delete = False
+    sec = None
+    for s in spec.series:
+        yref = Reference(ws, min_col=ymap[id(s)], min_row=1, max_row=maxr)
+        ser = Series(yref, xref, title_from_data=True)
+        _style_xy_series(ser, s, spec,
+                         line=(spec.chart_type == "折れ線" and s.kind != "scatter"))
+        if s.axis == "secondary":
+            if sec is None:
+                sec = ScatterChart()
+            sec.series.append(ser)
+        else:
+            prim.series.append(ser)
+
+    # 全系列が第2軸指定などで主軸が空なら、主軸へ昇格させて単一チャートに
+    if not prim.series and sec is not None:
+        prim, sec = sec, None
+        prim.x_axis.delete = False
+        prim.y_axis.delete = False
+
+    if sec is not None and sec.series:
+        sec.x_axis.axId = 500       # 第2の（隠し）X軸
+        sec.x_axis.delete = True
+        sec.y_axis.axId = 200       # 第2のY軸
+        sec.y_axis.delete = False
+        sec.y_axis.crosses = "max"  # 右側に表示
+        if spec.secondary_label:
+            sec.y_axis.title = spec.secondary_label
+        prim += sec
+    return prim
+
+
+def _build_histogram(spec, df, ws):
+    """ヒストグラム: 値列をビン化して棒グラフとして出力（事前集計）。"""
+    import numpy as np
+    from openpyxl.chart import BarChart, Reference
+
+    # 別シートにビン集計を書く
+    hs = ws.parent.create_sheet("Hist")
+    bins = int(spec.bins or 10)
+    # 全系列の値域でビン境界を共有
+    allvals = []
+    for s in spec.series:
+        v = pd.to_numeric(df[s.y_col], errors="coerce").dropna().to_numpy()
+        allvals.append(v)
+    flat = np.concatenate(allvals) if allvals else np.array([0.0, 1.0])
+    edges = np.histogram_bin_edges(flat, bins=bins)
+    centers = (edges[:-1] + edges[1:]) / 2
+
+    hs.cell(1, 1, "bin")
+    for i, c in enumerate(centers, start=2):
+        hs.cell(i, 1, float(round(c, 6)))
+    for j, s in enumerate(spec.series, start=2):
+        hs.cell(1, j, s.name)
+        v = pd.to_numeric(df[s.y_col], errors="coerce").dropna().to_numpy()
+        counts, _ = np.histogram(v, bins=edges)
+        for i, cnt in enumerate(counts, start=2):
+            hs.cell(i, j, int(cnt))
+
+    chart = BarChart()
+    chart.type = "col"
+    chart.gapWidth = 20
+    maxr = 1 + len(centers)
+    data = Reference(hs, min_col=2, max_col=1 + len(spec.series), min_row=1, max_row=maxr)
+    cats = Reference(hs, min_col=1, min_row=2, max_row=maxr)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+    _style_bar_series(chart, spec)
+    chart.title = spec.title or None
+    if spec.xlabel:
+        chart.x_axis.title = spec.xlabel
+    chart.y_axis.title = spec.ylabel or "頻度"
+    _legend(chart, spec)
+    return chart
+
+
+# --- 系列スタイル -----------------------------------------------------------
+def _style_xy_series(ser, s, spec, *, line):
+    from openpyxl.chart.marker import Marker
+    from openpyxl.drawing.line import LineProperties
+
+    rgb = M.hex_to_rrggbb(s.color)
+    want_line = line and M.openpyxl_dash(s.linestyle) is not None
+    if want_line:
+        gp = ser.graphicalProperties
+        if rgb:
+            gp.line.solidFill = rgb
+        gp.line.width = int(max(0.25, s.linewidth) * _EMU_PER_PT)
+        dash = M.openpyxl_dash(s.linestyle)
+        if dash and dash != "solid":
+            gp.line.prstDash = dash
+        ser.smooth = False
+    else:
+        # 線なし（散布図・線種なし）
+        ser.graphicalProperties.line = LineProperties(noFill=True)
+
+    # マーカー
+    sym = M.openpyxl_marker(s.marker)
+    if spec.chart_type == "散布図" and (not s.marker):
+        sym = "circle"
+    if sym and sym != "none":
+        ser.marker = Marker(symbol=sym, size=int(max(2, min(72, round(s.markersize)))))
+        if rgb:
+            ser.marker.graphicalProperties.solidFill = rgb
+            ser.marker.graphicalProperties.line.solidFill = rgb
+
+    if spec.data_labels:
+        from openpyxl.chart.label import DataLabelList
+        ser.dLbls = DataLabelList()
+        ser.dLbls.showVal = True
+
+
+def _style_bar_series(chart, spec):
+    from openpyxl.chart.shapes import GraphicalProperties
+
+    for ser, s in zip(chart.series, spec.series):
+        rgb = M.hex_to_rrggbb(s.color)
+        if rgb:
+            ser.graphicalProperties = GraphicalProperties(solidFill=rgb)
+    if spec.data_labels:
+        from openpyxl.chart.label import DataLabelList
+        chart.dataLabels = DataLabelList()
+        chart.dataLabels.showVal = True
+
+
+# --- 体裁（タイトル・軸・凡例）共通 -----------------------------------------
+def _titles(chart, spec):
+    if spec.title:
+        chart.title = spec.title
+
+
+def _legend(chart, spec):
+    if not spec.legend:
+        chart.legend = None
+    elif chart.legend is not None:
+        chart.legend.position = M.openpyxl_legend_position(spec.legend_loc)
+
+
+def _finish(chart, spec, df):
+    """折れ線/散布/棒の軸・タイトル・凡例を仕上げる。"""
+    if spec.title:
+        chart.title = spec.title
+    try:
+        if spec.xlabel:
+            chart.x_axis.title = spec.xlabel
+        if spec.ylabel:
+            chart.y_axis.title = spec.ylabel
+        # 軸の表示を確実化（openpyxl は delete=True だと軸ラベルが出ないことがある）
+        chart.x_axis.delete = False
+        chart.y_axis.delete = False
+        if spec.xmin is not None:
+            chart.x_axis.scaling.min = spec.xmin
+        if spec.xmax is not None:
+            chart.x_axis.scaling.max = spec.xmax
+        if spec.ymin is not None:
+            chart.y_axis.scaling.min = spec.ymin
+        if spec.ymax is not None:
+            chart.y_axis.scaling.max = spec.ymax
+        if spec.xlog:
+            chart.x_axis.scaling.logBase = 10
+        if spec.ylog:
+            chart.y_axis.scaling.logBase = 10
+        if spec.xinvert:
+            chart.x_axis.scaling.orientation = "maxMin"
+        if spec.yinvert:
+            chart.y_axis.scaling.orientation = "maxMin"
+        if spec.grid:
+            from openpyxl.chart.axis import ChartLines
+            chart.y_axis.majorGridlines = ChartLines()
+    except Exception:
+        pass
+    _legend(chart, spec)
+'''),
+("excel_chart.export", r'''# -*- coding: utf-8 -*-
+"""高水準 API: データ読込 → ChartSpec → エンジン選択 → Excel グラフ出力。
+
+データ読み込みは既存システムの data_loader をそのまま流用する（CSV/TSV/Excel・
+文字コード/区切り自動判定）。data_loader が import できない環境（パッケージを
+単体配布した場合）では pandas で素朴に読む簡易フォールバックを使う。
+"""
+import os
+import sys
+
+import pandas as pd
+
+from .spec import ChartSpec
+from . import com_engine, openpyxl_engine
+
+
+def _ensure_repo_on_path():
+    """data_loader / plotter_format を import できるよう、リポジトリ直下を sys.path へ。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+
+
+def load_table(path):
+    """既存 data_loader.load_table を流用。無ければ pandas の簡易読み込み。"""
+    _ensure_repo_on_path()
+    try:
+        import data_loader
+        df, _enc, _delim = data_loader.load_table(path)
+        return df
+    except Exception:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".xlsx", ".xlsm", ".xls"):
+            return pd.read_excel(path)
+        # CSV/TSV: 文字コードを順に試す
+        for enc in ("utf-8-sig", "cp932", "utf-8", "latin-1"):
+            try:
+                sep = "\t" if ext == ".tsv" else None
+                return pd.read_csv(path, sep=sep, engine="python", encoding=enc)
+            except Exception:
+                continue
+        raise
+
+
+def choose_engine(engine, out_path):
+    """'auto'|'com'|'openpyxl' から実際に使うエンジン名を決める。
+
+    auto: Excel(COM) が使えれば com、無理なら openpyxl。
+    .xlsm 出力やマクロ実行は COM のみ。
+    """
+    if engine in ("com", "openpyxl"):
+        return engine
+    # auto
+    if os.path.splitext(out_path)[1].lower() == ".xlsm":
+        return "com"
+    if com_engine.available() and _excel_installed():
+        return "com"
+    return "openpyxl"
+
+
+def _excel_installed():
+    """Excel が COM 起動できそうか軽く判定（Windows のレジストリ CLSID 確認）。"""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "Excel.Application")
+        return True
+    except Exception:
+        return False
+
+
+def export_excel_chart(data, spec=None, out_path="chart.xlsx", *,
+                       engine="auto", visible=False, extra_sheets=None,
+                       x=None, y=None, chart_type="折れ線", **spec_kwargs):
+    """データと書式から Excel グラフを書き出す中心関数。
+
+    data : DataFrame / CSV・TSV・Excel のパス
+    spec : ChartSpec。None のとき x/y/chart_type/**spec_kwargs から組み立てる
+    out_path : 出力 .xlsx（または .xlsm）
+    engine : 'auto'（既定）/'com'（VBA互換・要Excel）/'openpyxl'（Excel不要）
+    visible: COM 実行時に Excel を可視化（デバッグ用）
+    戻り値: (保存パス, 使用エンジン名)
+    """
+    df = data if isinstance(data, pd.DataFrame) else load_table(data)
+
+    if spec is None:
+        ys = y if isinstance(y, (list, tuple)) else ([y] if y else [])
+        if not ys:
+            raise ValueError("y（値の列）を 1 つ以上指定してください。")
+        spec = ChartSpec.from_columns(x, list(ys), chart_type=chart_type, **spec_kwargs)
+
+    _validate(spec, df)
+
+    eng = choose_engine(engine, out_path)
+    if eng == "com":
+        path = com_engine.write(spec, df, out_path, visible=visible,
+                                extra_sheets=extra_sheets)
+    else:
+        path = openpyxl_engine.write(spec, df, out_path, extra_sheets=extra_sheets)
+    return path, eng
+
+
+def export_from_config(data, config, out_path="chart.xlsx", *,
+                       engine="auto", only_file=None, visible=False,
+                       extra_sheets=None):
+    """既存 GUI の設定 JSON（_collect_config 形式 / プリセット）を書式に使う。"""
+    spec = ChartSpec.from_app_config(config, only_file=only_file)
+    return export_excel_chart(data, spec=spec, out_path=out_path,
+                              engine=engine, visible=visible,
+                              extra_sheets=extra_sheets)
+
+
+def _validate(spec, df):
+    """列の存在と種別を検証して分かりやすいエラーにする。"""
+    if spec.chart_type == "箱ひげ":
+        raise ValueError(
+            "箱ひげ図はネイティブ Excel グラフでは未対応です（COM/openpyxl とも）。"
+            "箱ひげは既存 GUI（matplotlib）で画像出力してください。")
+    if not spec.series:
+        raise ValueError("系列（値の列）が空です。")
+    missing = [s.y_col for s in spec.series if s.y_col not in df.columns]
+    if missing:
+        raise ValueError(f"指定の値列がデータにありません: {missing} / "
+                         f"利用可能な列: {list(df.columns)}")
+    if spec.x_col and spec.x_col not in df.columns:
+        raise ValueError(f"X 列 '{spec.x_col}' がデータにありません: "
+                         f"{list(df.columns)}")
+'''),
+("excel_chart", r'''# -*- coding: utf-8 -*-
+"""excel_chart: Python だけで「特定列＋特定書式」のネイティブ Excel グラフを作る。
+
+2 つのエンジンが同じ ChartSpec を解釈する:
+  * com_engine     … pywin32 で実 Excel を COM 操作（VBA 完全互換・要 Excel/Windows）
+  * openpyxl_engine… OOXML を直接生成（Excel 不要・クロスプラットフォーム）
+
+代表的な使い方:
+    from excel_chart import export_excel_chart
+    export_excel_chart("data.csv", x="t", y=["v1", "v2"],
+                       chart_type="折れ線", out_path="out.xlsx")
+
+既存システムからの流用: データ読み込みは data_loader、書式は GUI の設定 JSON
+（ChartSpec.from_app_config / export_from_config）をそのまま使える。
+"""
+from .spec import ChartSpec, SeriesSpec
+from .export import export_excel_chart, export_from_config, load_table
+
+__all__ = [
+    "ChartSpec", "SeriesSpec",
+    "export_excel_chart", "export_from_config", "load_table",
+]
+
+__version__ = "0.1.0"
+'''),
+    ],
+}
+
+
+def _install_package(pkg_name):
+    """同梱したパッケージを、本物のモジュールとして sys.modules に載せる。
+
+    平坦化（同一名前空間への展開）だと同名関数が後勝ちで潰れるので、
+    types.ModuleType で個別の名前空間を作り、依存順に exec する。
+    先に sys.modules へ登録しておくことで `from . import x` / `from .x import Y`
+    のような相対 import がそのまま解決する。
+    """
+    import types as _types
+    if pkg_name in sys.modules:
+        return sys.modules[pkg_name]
+    # パッケージ側の `import data_loader` は、この1ファイルの load_table
+    # （全形式対応）へ橋渡しする。読み込み経路を2重に持たないため。
+    sys.modules.setdefault("data_loader", sys.modules[__name__])
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), pkg_name)
+    pkg = _types.ModuleType(pkg_name)
+    pkg.__file__ = os.path.join(base, "__init__.py")   # __file__ を触る実装がある
+    pkg.__path__ = [base]
+    pkg.__package__ = pkg_name
+    made = {pkg_name: pkg}
+    sys.modules[pkg_name] = pkg
+    entries = _PACKAGE_SRC[pkg_name]
+    for name, _src in entries:
+        if name in made:
+            continue
+        mod = _types.ModuleType(name)
+        mod.__file__ = os.path.join(base, name.split(".")[-1] + ".py")
+        mod.__package__ = pkg_name
+        made[name] = mod
+        sys.modules[name] = mod
+        setattr(pkg, name.split(".")[-1], mod)
+    try:
+        for name, src in entries:
+            mod = made[name]
+            exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+    except Exception:
+        for name, _src in entries:      # 半端な状態を残さない
+            sys.modules.pop(name, None)
+        sys.modules.pop(pkg_name, None)
+        raise
+    return pkg

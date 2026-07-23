@@ -13,10 +13,6 @@ import os
 
 import pandas as pd
 
-# 試行する文字コード（日本語環境でよくある順）。
-# UTF-8 系を先に試し、最後に必ず成功する latin-1 をフォールバックに置く。
-_ENCODINGS = ["utf-8-sig", "utf-8", "cp932", "shift_jis", "euc-jp", "latin-1"]
-
 # 自動判定で候補とする区切り文字
 _DELIMITERS = [",", "\t", ";", "|"]
 
