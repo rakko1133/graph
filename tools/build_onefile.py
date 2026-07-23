@@ -481,13 +481,17 @@ def dedup_top_level_assigns(text):
     return out
 
 
-def build(out_path=None, header=None, transform=None, tail="", compact=False,
+def build(out_path=None, header=None, transform=None, tail="", compact=True,
           join=True, indent_width=1):
     """モジュールを結合して単一ファイルを書き出す。
 
     transform: (相対パス, ソース文字列) -> ソース文字列。結合前に各ファイルを
         書き換えるフック（シンプル版ビルドで見た目テンプレートを削るのに使う）。
     tail: 結合後の末尾に足すコード（エントリポイントの差し替え用）。
+    compact: コメント・docstring・空行を落として小さくする。既定 True。
+        **既定を True にしているのは、テスト（test_onefile）が build() を
+        引数なしで呼んで graph_onefile.py を上書きするため**。ここが False
+        だと、CLI で圧縮ビルドした成果物をテストが非圧縮で書き戻してしまう。
     """
     out_path = out_path or OUT
     header = DEFAULT_HEADER if header is None else header
@@ -580,6 +584,5 @@ def build(out_path=None, header=None, transform=None, tail="", compact=False,
 
 if __name__ == "__main__":
     import sys
-    # 通常版も既定で圧縮する（行数を最優先）。中身を読みたいときは
-    # --keep-comments を付けると、コメント・docstring・空行を残したまま出す。
+    # 中身を読みたいときは --keep-comments で非圧縮ビルドにできる。
     build(compact="--keep-comments" not in sys.argv)
