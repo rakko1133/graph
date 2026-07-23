@@ -52,11 +52,9 @@ PACKAGES = {
 # 開始マーカは**必ず1回だけ**一致すること。落とす範囲にトップレベル定義が
 # 2つ以上入っていたら失敗させる（マーカのずれで巻き添えを出さないため）。
 # モジュール側のファイルは触らないので、テスト・ドキュメントには影響しない。
-CUTS = [
-    ("batch_render.py",
-     "def render_sequential(tasks):", None,
-     "render_sequential（GUI 側は render_one を自前ループで回すので未使用）"),
-]
+# 現状カットするものは無い（render_sequential は元コードから削除済み）。
+# 1ファイル版でだけ死ぬコードが再び出たらここに (相対パス, 開始, 終了, 説明) を足す。
+CUTS = []
 
 
 def _cut(text, start, end, what):

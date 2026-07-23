@@ -33,7 +33,7 @@ _CTRL = (QtWidgets.QAbstractButton, QtWidgets.QComboBox,
 # 通常版に実在する主要な入口。シンプル版でも全部呼べなければならない。
 FEATURES = (
     "run_analysis", "show_fft", "show_spectrogram", "show_waterfall",
-    "decode_protocol", "run_pca", "run_regression", "run_t_test", "run_anova",
+    "decode_protocol", "run_regression", "run_t_test", "run_anova",
     "run_normality", "run_custom_fit", "show_corr_matrix", "show_describe",
     "show_eye_diagram", "run_jitter", "run_mask_test", "show_phase",
     "show_cycle_stats", "show_param_stats", "show_trend", "show_series_picker",

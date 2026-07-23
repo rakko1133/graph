@@ -127,9 +127,6 @@ OS にインストールされている一般的な日本語フォントを優�
 タイトル・軸ラベル・凡例の日本語が文字化け（□□□）しないようにする。
 """
 _CANDIDATES = [ "Yu Gothic", "Meiryo", "BIZ UDGothic", "MS Gothic", "MS PGothic", "Yu Mincho", "Hiragino Sans", "Hiragino Kaku Gothic Pro", "Hiragino Maru Gothic Pro", "Noto Sans CJK JP", "IPAexGothic", "IPAGothic", "TakaoGothic", "VL Gothic", ]
-def available_japanese_fonts():
- installed = {f.name for f in fm.fontManager.ttflist}
- return [name for name in _CANDIDATES if name in installed]
 def setup_japanese_font(preferred=None):
  installed = {f.name for f in fm.fontManager.ttflist}
  order = []
@@ -1026,8 +1023,6 @@ _XY_DEFAULT_KIND = {"折れ線": "line", "散布図": "scatter", "面": "area", 
 _SCOPE_TYPES = ("折れ線", "散布図")
 _SWAP_TYPES = ("折れ線", "散布図", "面", "積み上げ面", "ステップ", "ステム", "2Dヒストグラム", "hexbin")
 _OLD_3D_ALIASES = {"3D散布図": "散布図", "3D折れ線": "折れ線", "3D棒": "棒", "3D曲面": "曲面"}
-def can_be_3d(chart_type):
- return CHART_INFO.get(chart_type, {}).get("dim3") in ("optional", "always")
 def always_3d(chart_type):
  return CHART_INFO.get(chart_type, {}).get("dim3") == "always"
 def migrate_chart_type(name):
@@ -2548,38 +2543,6 @@ def correlation_matrix(named_series, method="pearson"):
  except Exception:
   mat = np.corrcoef(M)
  return names, np.asarray(mat, dtype=float)
-def pca(named_series, n_components=3, standardize=True):
- names = [str(nm) for nm, _ in named_series]
- arrs = [np.asarray(a, dtype=float) for _, a in named_series]
- if len(arrs) < 2:
-  return None
- length = min(a.size for a in arrs)
- if length < 3:
-  return None
- x = np.column_stack([a[:length] for a in arrs])
- x = x[np.all(np.isfinite(x), axis=1)]
- n_samples, n_features = x.shape
- if n_samples < 2 or n_features < 2:
-  return None
- k = int(max(1, min(int(n_components), n_features, n_samples)))
- xc = x - x.mean(axis=0)
- if standardize:
-  std = xc.std(axis=0, ddof=0)
-  std[std == 0] = 1.0
-  xc = xc / std
- backend = "numpy"
- try:
-  from sklearn.decomposition import PCA as _PCA
-  model = _PCA(n_components=k)
-  scores = model.fit_transform(xc)
-  ratio = np.asarray(model.explained_variance_ratio_, dtype=float)
-  backend = "scikit-learn"
- except Exception:
-  _u, s, _vt = np.linalg.svd(xc, full_matrices=False)
-  scores = _u[:, :k] * s[:k]
-  total = float(np.sum(s ** 2))
-  ratio = (s[:k] ** 2 / total) if total else np.zeros(k)
- return { "n_components": k, "n_samples": int(n_samples), "features": names, "backend": backend, "scores": [(f"PC{i + 1}", scores[:, i]) for i in range(k)], "explained_ratio": [float(r) for r in np.asarray(ratio).ravel()[:k]], }
 def normality(y):
  y = _clean(y)
  if y.size < 3:
@@ -4898,25 +4861,6 @@ QToolBar { background:$title_bg; spacing:1px; }
   b_an.clicked.connect(self.run_anova)
   brow2.addWidget(b_cfit); brow2.addWidget(b_tt); brow2.addWidget(b_an)
   v.addLayout(brow2)
-  v.addWidget(self._bold("主成分分析 (PCA)"))
-  pca_hint = QtWidgets.QLabel( "選択中のY系列を特徴量として主成分分析し、PC1〜PCk を新しいデータとして作成します。" "PC1〜3 を作れば『データ』タブで選び 3D 散布図で確認できます。")
-  pca_hint.setWordWrap(True); pca_hint.setStyleSheet("color:#555;")
-  v.addWidget(pca_hint)
-  prow = QtWidgets.QHBoxLayout()
-  prow.addWidget(QtWidgets.QLabel("主成分数"))
-  self.pca_ncomp = QtWidgets.QSpinBox(); self.pca_ncomp.setRange(1, 20)
-  self.pca_ncomp.setValue(3)
-  self.pca_ncomp.setToolTip("取り出す主成分の数。3D散布図で見るなら3を推奨。")
-  prow.addWidget(self.pca_ncomp)
-  self.pca_std = QtWidgets.QCheckBox("標準化")
-  self.pca_std.setChecked(True)
-  self.pca_std.setToolTip("各特徴量を平均0・分散1にそろえてから分析（単位が違う列の混在に有効）。")
-  prow.addWidget(self.pca_std)
-  b_pca = QtWidgets.QPushButton("PCA を実行（選択系列）")
-  b_pca.setToolTip("選択中のY系列を特徴量にPCAを実行し、PC列を新データとして作成します。" "scikit-learn があればそれを使用（無ければ numpy で計算）。")
-  b_pca.clicked.connect(self.run_pca)
-  prow.addWidget(b_pca); prow.addStretch(1)
-  v.addLayout(prow)
   self.ds_title = self._bold("結果")
   v.addWidget(self.ds_title)
   hint = QtWidgets.QLabel("右端の「表示」にチェックした項目は、その値をグラフに注記表示します。")
@@ -5782,7 +5726,7 @@ class DataIOMixin:
   meta = dict(self.meta.get(label) or {})
   path = meta.get("path", "")
   if not path or not os.path.isfile(path):
-   self.notify(f"『{label}』は読み込み元のファイルが無いので再読込できません。", "warn", "貼り付けたデータや、数学チャンネル・カーブフィット・PCA などで" "作ったデータセットが該当します（データはそのまま残しました）。")
+   self.notify(f"『{label}』は読み込み元のファイルが無いので再読込できません。", "warn", "貼り付けたデータや、数学チャンネル・カーブフィットなどで" "作ったデータセットが該当します（データはそのまま残しました）。")
    return
   df = self.datasets.get(label)
   row = self.file_list.row(it)
@@ -8408,34 +8352,6 @@ class DataSciMixin:
   for name, n, mean, std in d["groups"]:
    rows.append((f"{name}", f"n={n}, 平均={mean:.6g}, σ={std:.6g}"))
   self._ds_show(f"一元配置ANOVA（{len(d['groups'])}群）", rows)
- def run_pca(self):
-  items = self._selected_series_items()
-  if len(items) < 2:
-   self.notify("主成分分析には特徴量として2系列以上をデータタブで選択してください。\n" "（例: 複数のセンサ列や測定列。PC1〜3 を作れば3D散布図で確認できます）", "warn")
-   return
-  named = []
-  for fl, col, disp in items:
-   _t, y = self._xy_by_disp(disp)
-   if y is not None:
-    named.append((disp, y))
-  if len(named) < 2:
-   self.notify("有効な数値系列が不足しています。", "warn")
-   return
-  res = pca(named, n_components=self.pca_ncomp.value(), standardize=self.pca_std.isChecked())
-  if not res:
-   self.notify("主成分分析を計算できませんでした（系列数・点数・数値を確認してください）。", "warn")
-   return
-  import pandas as pd
-  df = pd.DataFrame({name: arr for name, arr in res["scores"]})
-  src = items[0][0]
-  label = self.register_dataset( f"PCA: {os.path.splitext(os.path.basename(str(src)))[0]}", df)
-  f = self._fmt
-  rows = [("使用した特徴量", ", ".join(res["features"])), ("サンプル数", res["n_samples"]), ("標準化", self.pca_std.isChecked()), ("計算エンジン", res["backend"])]
-  for j, r in enumerate(res["explained_ratio"]):
-   rows.append((f"PC{j + 1} 寄与率", f"{r * 100:.1f}%"))
-  rows.append(("累積寄与率", f"{sum(res['explained_ratio']) * 100:.1f}%"))
-  self._ds_show(f"主成分分析 (PCA) → 『{label}』を作成", rows)
-  self._set_status( f"主成分分析を作成: {label}（PC1〜{res['n_components']}, {res['backend']}）。" "『データ』タブで選び、3D表示で確認できます。")
 """BatchMixin: GraphApp から分離した BatchMixin 群（挙動は本体と同一）。"""
 class BatchMixin:
  def _save_current_figure(self, target, dpi, transparent, fmt=None):

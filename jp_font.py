@@ -19,12 +19,6 @@ _CANDIDATES = [
 ]
 
 
-def available_japanese_fonts():
-    """利用可能な日本語フォント名の一覧を優先順で返す。"""
-    installed = {f.name for f in fm.fontManager.ttflist}
-    return [name for name in _CANDIDATES if name in installed]
-
-
 def setup_japanese_font(preferred=None):
     """日本語フォントを matplotlib に設定し、採用したフォント名を返す。
 

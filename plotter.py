@@ -101,11 +101,6 @@ _OLD_3D_ALIASES = {"3D散布図": "散布図", "3D折れ線": "折れ線",
                    "3D棒": "棒", "3D曲面": "曲面"}
 
 
-def can_be_3d(chart_type):
-    """『3D表示』チェックが効く種別か（3D描画に対応するか）。"""
-    return CHART_INFO.get(chart_type, {}).get("dim3") in ("optional", "always")
-
-
 def always_3d(chart_type):
     """常に3Dで描く種別か（曲面など。チェックに関わらず3D）。"""
     return CHART_INFO.get(chart_type, {}).get("dim3") == "always"
