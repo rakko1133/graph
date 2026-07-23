@@ -1124,6 +1124,31 @@ def test_theme_tokens_follow_palette():
     w._on_palette_changed(QtCore.QEvent.Type.PaletteChange)
 
 
+def test_ui_style_survives_event_loop():
+    """選んだ外観がイベントループを回しても巻き戻らないこと。
+
+    setStyleSheet はその場で PaletteChange を起こす。テーマ追従が
+    「1つ前のスタイル名」を捕まえて後から再適用すると、選んだ外観が
+    静かに戻ってしまう（実際にそうなっていた）。"""
+    w = _make_app(_wave())
+    app = QtWidgets.QApplication.instance()
+    for name in ("labplot", "veusz", "kst", "igor", "standard"):
+        w._apply_layout_preset(name)
+        app.processEvents()
+        app.processEvents()
+        assert w._ui_style_name == name, f"{name} を選んだのに {w._ui_style_name} に戻った"
+    for name in ("igor", "veusz", "standard"):
+        w._set_ui_style(name)
+        app.processEvents()
+        app.processEvents()
+        assert w._ui_style_name == name
+    # OS のテーマ変更で呼ばれる経路は、今のスタイルを保つ
+    w._on_palette_changed(QtCore.QEvent.Type.PaletteChange)
+    app.processEvents()
+    app.processEvents()
+    assert w._ui_style_name == "standard"
+
+
 def test_dark_palette_makes_graph_readable():
     """ダークパレットで地色・目盛り・凡例枠まで反転し、対比が保たれること。"""
     before = _app.palette()

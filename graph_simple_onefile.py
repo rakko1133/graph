@@ -3555,7 +3555,12 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
         style = self._UI_STYLES.get(name)
         if style is None:
             return
-        self.setStyleSheet(render_qss(style["qss"]))
+        self._ui_style_name = name
+        self._applying_ui_style = True
+        try:
+            self.setStyleSheet(render_qss(style["qss"]))
+        finally:
+            self._applying_ui_style = False
         tb = getattr(self, "main_toolbar", None)
         if tb is not None:
             tb.setIconSize(QtCore.QSize(style["tb_icon"], style["tb_icon"]))
@@ -3566,7 +3571,6 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
         if hasattr(self, "explorer"):
             self.explorer.setIndentation(style["indent"])
         self._ui_settings().setValue("ui/style", name)
-        self._ui_style_name = name
         self._apply_figure_theme()
     UI_LEVELS = ("基本", "標準", "全部")
     DEFAULT_UI_LEVEL = "基本"
@@ -3690,10 +3694,12 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
         if event_type not in (QtCore.QEvent.Type.PaletteChange,
                               QtCore.QEvent.Type.ThemeChange):
             return
-        name = getattr(self, "_ui_style_name", None)
-        if not name:
+        if getattr(self, "_applying_ui_style", False):
             return
-        QtCore.QTimer.singleShot(0, lambda: self._apply_ui_style(name))
+        if not getattr(self, "_ui_style_name", None):
+            return
+        QtCore.QTimer.singleShot(
+            0, lambda: self._apply_ui_style(getattr(self, "_ui_style_name", None)))
     def _build_toolbar(self):
         tb = QtWidgets.QToolBar("メイン")
         tb.setObjectName("main_toolbar")

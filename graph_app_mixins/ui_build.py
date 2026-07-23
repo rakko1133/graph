@@ -280,11 +280,20 @@ QToolBar { background:$title_bg; spacing:1px; }
                          "（配置も合わせるなら 表示→見た目 の上段を選んでください）")
 
     def _apply_ui_style(self, name):
-        """UIスタイル（外観テーマ）を適用する。ウィジェット・機能は変えない。"""
+        """UIスタイル（外観テーマ）を適用する。ウィジェット・機能は変えない。
+
+        注意: setStyleSheet はその場で PaletteChange を発生させ、テーマ追従
+        （_on_palette_changed）が走る。**採用した名前を先に記録**しておかないと、
+        追従側が「1つ前のスタイル」を読んで再適用し、選んだ外観が巻き戻る。"""
         style = self._UI_STYLES.get(name)
         if style is None:
             return
-        self.setStyleSheet(render_qss(style["qss"]))
+        self._ui_style_name = name          # ← setStyleSheet より前に確定させる
+        self._applying_ui_style = True      # 自分が起こす PaletteChange は無視する
+        try:
+            self.setStyleSheet(render_qss(style["qss"]))
+        finally:
+            self._applying_ui_style = False
         tb = getattr(self, "main_toolbar", None)
         if tb is not None:
             tb.setIconSize(QtCore.QSize(style["tb_icon"], style["tb_icon"]))
@@ -295,7 +304,6 @@ QToolBar { background:$title_bg; spacing:1px; }
         if hasattr(self, "explorer"):
             self.explorer.setIndentation(style["indent"])
         self._ui_settings().setValue("ui/style", name)
-        self._ui_style_name = name
         self._apply_figure_theme()
 
     # ---- 表示レベル（画面に出す量の切り替え）----
@@ -474,10 +482,14 @@ QToolBar { background:$title_bg; spacing:1px; }
         if event_type not in (QtCore.QEvent.Type.PaletteChange,
                               QtCore.QEvent.Type.ThemeChange):
             return
-        name = getattr(self, "_ui_style_name", None)
-        if not name:
+        if getattr(self, "_applying_ui_style", False):
+            return          # 自分の setStyleSheet が起こした通知。追従不要
+        if not getattr(self, "_ui_style_name", None):
             return
-        QtCore.QTimer.singleShot(0, lambda: self._apply_ui_style(name))
+        # 名前は**発火時**に読む。ここで捕まえて渡すと、その後ユーザーが別の外観を
+        # 選んでも古い方が後から再適用されて巻き戻る。
+        QtCore.QTimer.singleShot(
+            0, lambda: self._apply_ui_style(getattr(self, "_ui_style_name", None)))
 
     def _build_toolbar(self):
         """よく使う操作をワンクリックで呼べるツールバー（メニューと同じ機能）。"""
