@@ -35,6 +35,64 @@ MESSAGE_LOG_MAX = 500    # メッセージ履歴の保持件数
 NOTIFY_MS = 8000         # 通知バーの自動消灯までの時間（ミリ秒）
 
 
+# --------------------------------------------------------------- タブ・プラグイン
+# 左側の解析タブ（データ / オシロ / 高度解析 / 統計解析）を「差し込み式」にする仕組み。
+# 新しい機能タブを足したいときは、TabPlugin を継承したクラスを1つ書いて
+# register_tab() で登録するだけでよい（メイン側 GraphApp を触らずに増やせる）。
+UI_LEVEL_ORDER = ("基本", "標準", "全部")
+
+
+class TabPlugin:
+    """解析タブ1枚を表すプラグイン。
+
+    サブクラスで build() を実装し、クラス属性でタブの素性を宣言する:
+      key       : 一意な識別子。ドックの objectName は "dock_" + key になる
+      title     : タブ見出し（例 "5. 自作解析"）
+      order     : 小さいほど左（＝上のタブ）に来る
+      min_level : このタブが現れる最小の表示レベル（基本 < 標準 < 全部）
+
+    build(app) はタブの中身ウィジェットを返す。app は GraphApp インスタンスなので、
+    既存の描画・解析メソッド（app.draw_graph / app.analysis_xy_or_warn 等）を
+    そのまま呼べる。独自ロジックはプラグイン側に持ってもよい。
+    """
+    key = ""
+    title = ""
+    order = 100
+    min_level = "全部"
+
+    def build(self, app):
+        raise NotImplementedError(f"{type(self).__name__}.build を実装してください")
+
+
+class _DelegatingTab(TabPlugin):
+    """既存タブ用: GraphApp のビルダーメソッド名に処理を委譲する内蔵プラグイン。
+
+    タブ本体のロジックは従来どおり各 Mixin にあるので、ここは
+    「どのメソッドがこのタブを組み立てるか」を宣言するだけ。挙動は不変。
+    """
+    def __init__(self, key, title, order, min_level, method):
+        self.key, self.title, self.order = key, title, order
+        self.min_level, self._method = min_level, method
+
+    def build(self, app):
+        return getattr(app, self._method)()
+
+
+_TAB_REGISTRY = []
+
+
+def register_tab(plugin):
+    """タブプラグインを登録する（同じ key があれば後勝ちで置き換える）。"""
+    _TAB_REGISTRY[:] = [p for p in _TAB_REGISTRY if p.key != plugin.key]
+    _TAB_REGISTRY.append(plugin)
+    return plugin
+
+
+def registered_tabs():
+    """登録済みタブを order 順（同順なら key 順）で返す。"""
+    return sorted(_TAB_REGISTRY, key=lambda p: (p.order, p.key))
+
+
 def _parse_float(text, default=None):
     text = (text or "").strip()
     if text == "":
@@ -548,4 +606,8 @@ __all__ = [
     "NotificationBar",
     "ProgressStrip",
     "TableLoadThread",
+    "UI_LEVEL_ORDER",
+    "TabPlugin",
+    "register_tab",
+    "registered_tabs",
 ]

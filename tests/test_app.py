@@ -791,6 +791,64 @@ def _visible_controls(w):
     return n
 
 
+def test_builtin_tabs_are_registered_plugins():
+    """内蔵4タブがプラグインとして登録され、順序・レベルが従来どおりであること。"""
+    import graph_app_common as C
+    tabs = C.registered_tabs()
+    assert [t.key for t in tabs] == ["data", "scope", "advanced", "datasci"]
+    assert [t.min_level for t in tabs] == ["基本", "標準", "全部", "全部"]
+    w = _make_app(_wave())
+    assert [d.objectName() for d in w.left_docks] == \
+        ["dock_data", "dock_scope", "dock_advanced", "dock_datasci"]
+    # 表示レベルはプラグインの min_level から導出される（旧ハードコードと一致）
+    w.set_ui_level("基本", announce=False)
+    assert w._visible_dock_names() == {"dock_files", "dock_format", "dock_data"}
+    w.set_ui_level("標準", announce=False)
+    assert w._visible_dock_names() == {
+        "dock_files", "dock_format", "dock_data", "dock_scope"}
+
+
+def test_new_tab_can_be_added_by_plugin():
+    """メインを触らず、プラグインを1つ登録するだけで新しいタブが増えること。"""
+    import graph_app_common as C
+
+    class _ProbeTab(C.TabPlugin):
+        key, title, order, min_level = "probe_xyz", "9. 検証タブ", 90, "全部"
+
+        def build(self, app):
+            w = QtWidgets.QWidget()
+            lay = QtWidgets.QVBoxLayout(w)
+            b = QtWidgets.QPushButton("実行")
+            # app（GraphApp）の既存メソッドをそのまま呼べる
+            b.clicked.connect(lambda: app.notify("検証タブ実行"))
+            self.button = b
+            lay.addWidget(b)
+            return w
+
+    probe = _ProbeTab()
+    C.register_tab(probe)
+    try:
+        w = graph_app.GraphApp()
+        try:
+            # 新タブがドックとして並び、末尾（order=90）に来る
+            names = [d.objectName() for d in w.left_docks]
+            assert "dock_probe_xyz" in names
+            assert names[-1] == "dock_probe_xyz"
+            # min_level=全部 なので基本では隠れ、全部で出る
+            w.set_ui_level("基本", announce=False)
+            assert "dock_probe_xyz" not in w._visible_dock_names()
+            w.set_ui_level("全部", announce=False)
+            assert "dock_probe_xyz" in w._visible_dock_names()
+            # build に渡された app は本物の GraphApp（notify が呼べる）
+            probe.button.click()
+            assert "検証タブ" in w.notify_bar.current_text()
+        finally:
+            w.close()
+    finally:
+        # レジストリを元に戻す（他テストへ影響させない）
+        C._TAB_REGISTRY[:] = [p for p in C._TAB_REGISTRY if p.key != "probe_xyz"]
+
+
 def test_ui_level_hides_without_destroying():
     """表示レベルは setVisible だけで、ウィジェットも設定も失わないこと。"""
     w = _make_app(_wave())

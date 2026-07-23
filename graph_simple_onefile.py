@@ -2667,6 +2667,27 @@ SERIES_BAR_MAX = 60
 HEAVY_SERIES = 60
 MESSAGE_LOG_MAX = 500
 NOTIFY_MS = 8000
+UI_LEVEL_ORDER = ("基本", "標準", "全部")
+class TabPlugin:
+ key = ""
+ title = ""
+ order = 100
+ min_level = "全部"
+ def build(self, app):
+  raise NotImplementedError(f"{type(self).__name__}.build を実装してください")
+class _DelegatingTab(TabPlugin):
+ def __init__(self, key, title, order, min_level, method):
+  self.key, self.title, self.order = key, title, order
+  self.min_level, self._method = min_level, method
+ def build(self, app):
+  return getattr(app, self._method)()
+_TAB_REGISTRY = []
+def register_tab(plugin):
+ _TAB_REGISTRY[:] = [p for p in _TAB_REGISTRY if p.key != plugin.key]
+ _TAB_REGISTRY.append(plugin)
+ return plugin
+def registered_tabs():
+ return sorted(_TAB_REGISTRY, key=lambda p: (p.order, p.key))
 def _parse_float(text, default=None):
  text = (text or "").strip()
  if text == "":
@@ -2972,7 +2993,7 @@ class TableLoadThread(QtCore.QThread):
     self.one_done.emit(i, res, "")
    except Exception as e:
     self.one_done.emit(i, None, str(e))
-__all__ = [ "os", "sys", "QtCore", "QtGui", "QtWidgets", "FigureCanvas", "NavigationToolbar", "Figure", "advanced", "analysis", "applog", "config_io", "data_loader", "datasci", "jp_font", "mathchan", "plotter", "PREVIEW_ROWS", "UserRole", "DECIMATE_TARGET", "BUSY_ROWS", "BATCH_PARALLEL_THRESHOLD", "ASYNC_LOAD_BYTES", "ASYNC_LOAD_COUNT", "SERIES_BAR_MAX", "HEAVY_SERIES", "MESSAGE_LOG_MAX", "NOTIFY_MS", "_parse_float", "CheckListWidget", "LazyColumnCombo", "CollapsibleBox", "ExplorerTree", "SERIES_MIME", "palette_tokens", "is_dark_theme", "render_qss", "NotificationBar", "ProgressStrip", "TableLoadThread", ]
+__all__ = [ "os", "sys", "QtCore", "QtGui", "QtWidgets", "FigureCanvas", "NavigationToolbar", "Figure", "advanced", "analysis", "applog", "config_io", "data_loader", "datasci", "jp_font", "mathchan", "plotter", "PREVIEW_ROWS", "UserRole", "DECIMATE_TARGET", "BUSY_ROWS", "BATCH_PARALLEL_THRESHOLD", "ASYNC_LOAD_BYTES", "ASYNC_LOAD_COUNT", "SERIES_BAR_MAX", "HEAVY_SERIES", "MESSAGE_LOG_MAX", "NOTIFY_MS", "_parse_float", "CheckListWidget", "LazyColumnCombo", "CollapsibleBox", "ExplorerTree", "SERIES_MIME", "palette_tokens", "is_dark_theme", "render_qss", "NotificationBar", "ProgressStrip", "TableLoadThread", "UI_LEVEL_ORDER", "TabPlugin", "register_tab", "registered_tabs", ]
 """UIBuildMixin: GraphApp から分離した UIBuildMixin 群（挙動は本体と同一）。"""
 class UIBuildMixin:
  def _menu_action(self, menu, label, slot, shortcut=None, tip=None):
@@ -3135,8 +3156,8 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
  UI_LEVELS = ("基本", "標準", "全部")
  DEFAULT_UI_LEVEL = "基本"
  UI_LEVEL_KEY = "ui/level_simple"
- _LEVEL_VIEW = { "基本": { "docks": ("dock_files", "dock_data"), "sections": ("axes_sel", "labels", "legend"), }, "標準": { "docks": ("dock_files", "dock_data", "dock_scope", "dock_format"), "sections": ("file_ops", "axes_sel", "labels", "legend", "axis", "trend", "bins", "aspect", "export"), }, }
- _LEVEL_EXTRA_DOCKS = {"基本": ("dock_format",)}
+ _LEVEL_SECTIONS = { "基本": ("axes_sel", "labels", "legend"), "標準": ("file_ops", "axes_sel", "labels", "legend", "axis", "trend", "bins", "aspect", "export"), }
+ _ALWAYS_DOCKS = ("dock_files", "dock_format")
  def ui_level(self):
   return getattr(self, "_ui_level", "全部")
  def set_ui_level(self, level, announce=True):
@@ -3165,16 +3186,26 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
    self._restore_dock_sizes()
   self._sync_level_ui()
   return level
+ def _level_reaches(self, min_level, level):
+  order = UI_LEVEL_ORDER
+  try:
+   return order.index(level) >= order.index(min_level)
+  except ValueError:
+   return True
  def _visible_dock_names(self, level=None):
   level = level or self.ui_level()
-  if level not in self._LEVEL_VIEW:
+  if level == "全部":
    return {d.objectName() for d in self._all_docks()}
-  return (set(self._LEVEL_VIEW[level]["docks"]) | set(self._LEVEL_EXTRA_DOCKS.get(level, ())))
+  names = set(self._ALWAYS_DOCKS)
+  for oname, plugin in getattr(self, "_tab_plugins", {}).items():
+   if self._level_reaches(plugin.min_level, level):
+    names.add(oname)
+  return names
  def _visible_section_keys(self, level=None):
   level = level or self.ui_level()
-  if level not in self._LEVEL_VIEW:
+  if level not in self._LEVEL_SECTIONS:
    return set(getattr(self, "_fmt_sections", {}))
-  return set(self._LEVEL_VIEW[level]["sections"])
+  return set(self._LEVEL_SECTIONS[level])
  def _all_docks(self):
   docks = [getattr(self, "files_dock", None)]
   docks += list(getattr(self, "left_docks", []))
@@ -3283,15 +3314,17 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
   self.addDockWidget(left, files_dock)
   self.files_dock = files_dock
   self.left_docks = []
-  for key, title, builder in ( ("data", "1. データ", self._build_tab_data), ("scope", "2. オシロ/解析", self._build_tab_scope), ("advanced", "3. 高度解析", self._build_tab_advanced), ("datasci", "4. 統計解析", self._build_tab_datasci)):
-   dock = QtWidgets.QDockWidget(title, self)
-   dock.setObjectName("dock_" + key)
-   w = builder()
+  self._tab_plugins = {}
+  for plugin in registered_tabs():
+   dock = QtWidgets.QDockWidget(plugin.title, self)
+   dock.setObjectName("dock_" + plugin.key)
+   w = plugin.build(self)
    if not isinstance(w, QtWidgets.QScrollArea):
     w = self._scrollable(w)
    dock.setWidget(w)
    self.addDockWidget(left, dock)
    self.left_docks.append(dock)
+   self._tab_plugins[dock.objectName()] = plugin
   for d in self.left_docks[1:]:
    self.tabifyDockWidget(self.left_docks[0], d)
   center = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
@@ -8854,6 +8887,19 @@ class PersistenceMixin:
   self._hist_i += 1
   self._apply_snapshot(self._hist[self._hist_i])
   self._set_status("やり直しました。")
+"""内蔵の解析タブを差し込み式で登録するモジュール。
+左側の4タブ（データ / オシロ・解析 / 高度解析 / 統計解析）を TabPlugin として
+登録する。各タブの中身を組み立てるロジックは従来どおり GraphApp の各 Mixin に
+あり、ここは「どのメソッドがどのタブか・どの表示レベルで出すか・並び順」を
+宣言するだけ（挙動は一切変えない）。
+新しい機能タブの足し方は タブ追加ガイド.md を参照。要点だけ:
+TabPlugin を継承したクラスを書いて register_tab() で登録すれば、メイン側
+（GraphApp）を触らずにタブが増える。build(app) の app は GraphApp なので
+既存の描画・解析メソッドをそのまま呼べる。
+"""
+BUILTIN_TABS = [ _DelegatingTab("data", "1. データ", 10, "基本", "_build_tab_data"), _DelegatingTab("scope", "2. オシロ/解析", 20, "標準", "_build_tab_scope"), _DelegatingTab("advanced", "3. 高度解析", 30, "全部", "_build_tab_advanced"), _DelegatingTab("datasci", "4. 統計解析", 40, "全部", "_build_tab_datasci"), ]
+for _tab in BUILTIN_TABS:
+ register_tab(_tab)
 """CSV / TSV / 波形データ グラフ・解析ツール（PySide6 / Qt）。
 使い方:
     python graph_app.py

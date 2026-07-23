@@ -320,21 +320,16 @@ QToolBar { background:$title_bg; spacing:1px; }
     # シンプル版がシンプルでなくなる（実際にそうなっていた）。
     UI_LEVEL_KEY = "ui/level"
 
-    # 各レベルで見せるドック（objectName）と書式セクション（_fmt_sections のキー）。
-    # 「全部」は例外扱いで、この表を参照せず全部見せる。
-    _LEVEL_VIEW = {
-        "基本": {
-            "docks": ("dock_files", "dock_data"),
-            "sections": ("axes_sel", "labels", "legend"),
-        },
-        "標準": {
-            "docks": ("dock_files", "dock_data", "dock_scope", "dock_format"),
-            "sections": ("file_ops", "axes_sel", "labels", "legend", "axis",
-                         "trend", "bins", "aspect", "export"),
-        },
+    # 各レベルで見せる書式セクション（_fmt_sections のキー）。
+    # 「全部」は例外扱いで、この表を参照せず全セクション見せる。
+    # 左タブの表示レベルは各タブのプラグイン（min_level）が決める。
+    _LEVEL_SECTIONS = {
+        "基本": ("axes_sel", "labels", "legend"),
+        "標準": ("file_ops", "axes_sel", "labels", "legend", "axis",
+                 "trend", "bins", "aspect", "export"),
     }
-    # 基本レベルでは書式ドックも出す（種別・ラベル・凡例だけの薄い状態で）
-    _LEVEL_EXTRA_DOCKS = {"基本": ("dock_format",)}
+    # ファイルパネルと書式パネルは全レベルで常設（タブではないので個別扱い）
+    _ALWAYS_DOCKS = ("dock_files", "dock_format")
 
     def ui_level(self):
         return getattr(self, "_ui_level", "全部")
@@ -380,20 +375,34 @@ QToolBar { background:$title_bg; spacing:1px; }
         self._sync_level_ui()
         return level
 
+    def _level_reaches(self, min_level, level):
+        """表示レベル level が、min_level 以上か（基本 < 標準 < 全部）。"""
+        order = UI_LEVEL_ORDER
+        try:
+            return order.index(level) >= order.index(min_level)
+        except ValueError:
+            return True
+
     def _visible_dock_names(self, level=None):
-        """そのレベルで出すドックの objectName 集合。"""
+        """そのレベルで出すドックの objectName 集合。
+
+        タブは各プラグインの min_level で判定する（新しいタブを足しても、
+        そのタブが宣言したレベルに自動で従う）。ファイル・書式パネルは常設。"""
         level = level or self.ui_level()
-        if level not in self._LEVEL_VIEW:
+        if level == "全部":
             return {d.objectName() for d in self._all_docks()}
-        return (set(self._LEVEL_VIEW[level]["docks"])
-                | set(self._LEVEL_EXTRA_DOCKS.get(level, ())))
+        names = set(self._ALWAYS_DOCKS)
+        for oname, plugin in getattr(self, "_tab_plugins", {}).items():
+            if self._level_reaches(plugin.min_level, level):
+                names.add(oname)
+        return names
 
     def _visible_section_keys(self, level=None):
         """そのレベルで出す書式セクションのキー集合。"""
         level = level or self.ui_level()
-        if level not in self._LEVEL_VIEW:
+        if level not in self._LEVEL_SECTIONS:
             return set(getattr(self, "_fmt_sections", {}))
-        return set(self._LEVEL_VIEW[level]["sections"])
+        return set(self._LEVEL_SECTIONS[level])
 
     def _all_docks(self):
         """このウィンドウが持つドックの一覧（順序は左タブ→書式）。"""
@@ -553,15 +562,14 @@ QToolBar { background:$title_bg; spacing:1px; }
         self.files_dock = files_dock
 
         # 左：入力・解析パネル（軸の選択 / オシロ / 高度解析 / 統計解析）
+        # 左タブは差し込み式（graph_app_tabs.py が register_tab で登録）。
+        # 新しい機能タブはプラグインを1つ足すだけで、ここは無改造で並べられる。
         self.left_docks = []
-        for key, title, builder in (
-                ("data", "1. データ", self._build_tab_data),
-                ("scope", "2. オシロ/解析", self._build_tab_scope),
-                ("advanced", "3. 高度解析", self._build_tab_advanced),
-                ("datasci", "4. 統計解析", self._build_tab_datasci)):
-            dock = QtWidgets.QDockWidget(title, self)
-            dock.setObjectName("dock_" + key)   # saveState に必須
-            w = builder()
+        self._tab_plugins = {}     # objectName -> TabPlugin（表示レベルの判定に使う）
+        for plugin in registered_tabs():
+            dock = QtWidgets.QDockWidget(plugin.title, self)
+            dock.setObjectName("dock_" + plugin.key)   # saveState に必須
+            w = plugin.build(self)
             # 中身をスクロール可能にして、ドックを好きな幅まで狭められるようにする
             # （中身の最小サイズがドックの縮小を妨げないように。既にスクロール式ならそのまま）
             if not isinstance(w, QtWidgets.QScrollArea):
@@ -569,6 +577,7 @@ QToolBar { background:$title_bg; spacing:1px; }
             dock.setWidget(w)
             self.addDockWidget(left, dock)
             self.left_docks.append(dock)
+            self._tab_plugins[dock.objectName()] = plugin
         for d in self.left_docks[1:]:           # 既定はタブ化（従来の見た目）
             self.tabifyDockWidget(self.left_docks[0], d)
 

@@ -18,6 +18,7 @@ GUI は matplotlib の qt_compat 経由で実装しており、PySide6 / PyQt6�
 """
 
 from graph_app_common import *  # noqa: F401,F403
+import graph_app_tabs  # noqa: F401  内蔵タブを register_tab で登録（副作用import）
 from graph_app_mixins import (
     UIBuildMixin,
     DataIOMixin,

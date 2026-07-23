@@ -23,6 +23,7 @@ ORDER = [
     "graph_app_mixins/scope_cursor.py", "graph_app_mixins/analysis_peaks.py",
     "graph_app_mixins/advanced_tools.py", "graph_app_mixins/datasci_tools.py",
     "graph_app_mixins/batch.py", "graph_app_mixins/persistence.py",
+    "graph_app_tabs.py",
     "graph_app.py",
 ]
 # 内部モジュール名（これらへの import と修飾参照を消す）
@@ -30,6 +31,7 @@ INTERNAL = {
     "applog", "config_io", "jp_font", "data_loader", "plotter_format", "plotter_draw", "plotter",
     "analysis_common", "analysis_spectrum", "analysis_measure", "analysis",
     "advanced", "mathchan", "datasci", "batch_render", "graph_app_common", "graph_app_mixins",
+    "graph_app_tabs",
 }
 # 平坦化する修飾（長い名前を先に）
 QUALIFIERS = sorted(
