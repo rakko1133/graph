@@ -202,7 +202,24 @@ def compact_source(text):
 
 PACKAGE_TAIL = '''
 
-_PACKAGE_SRC = {name}
+_PACKAGE_NAMES = {names}
+_PACKAGE_BLOB = "{blob}"
+
+
+def _package_entries(pkg_name):
+    """埋め込んだパッケージのソースをほどいて (モジュール名, ソース) の並びにする。
+
+    ソースをそのまま書くと 1,300 行・48 KB のデータがファイルに居座るので、
+    zlib で縮めて base85 の1行にしてある（実測 48 KB → 18 KB）。
+    中身は元のファイルと**1バイトも違わない**（ビルド時に復元して照合済み）。
+    """
+    import base64 as _b64, zlib as _zlib
+    srcs = _zlib.decompress(_b64.b85decode(_PACKAGE_BLOB)).decode("utf-8").split("\\0")
+    entries, at = {}, 0
+    for pkg, names in _PACKAGE_NAMES.items():
+        entries[pkg] = list(zip(names, srcs[at:at + len(names)]))
+        at += len(names)
+    return entries[pkg_name]
 
 
 def _install_package(pkg_name):
@@ -226,7 +243,7 @@ def _install_package(pkg_name):
     pkg.__package__ = pkg_name
     made = {pkg_name: pkg}
     sys.modules[pkg_name] = pkg
-    entries = _PACKAGE_SRC[pkg_name]
+    entries = _package_entries(pkg_name)
     for name, _src in entries:
         if name in made:
             continue
@@ -252,13 +269,19 @@ def _install_package(pkg_name):
 def package_sources(compact=False):
     """PACKAGES のソースを、実行時に exec できる形の Python コードにする。
 
-    ソースは raw 文字列にそのまま入れる。`\'''` を含むと壊れるので、その場で確かめる。
+    ソースは zlib+base85 の1行に畳んで埋め込む。生のまま raw 文字列で置くと
+    1,300 行・48 KB を占めるが、畳むと 2 行・18 KB で済む（実測）。
+    畳んだ側は**その場で復元して元と1バイトずつ照合**するので、取り違えは起きない。
+    base85 の文字集合には引用符もバックスラッシュも無いので、普通の文字列に入れられる。
     """
     if not PACKAGES:
         return ""
-    chunks = []
+    import base64
+    import zlib
+
+    names, srcs = {}, []
     for pkg, mods in PACKAGES.items():
-        items = []
+        got = []
         for m in mods:
             path = os.path.join(ROOT, pkg, m + ".py")
             src = open(path, encoding="utf-8").read()
@@ -266,14 +289,145 @@ def package_sources(compact=False):
                 src = compact_source(src)
             if not src.endswith("\n"):
                 src += "\n"
-            if "'''" in src or src.rstrip("\n").endswith("\\"):
-                raise SystemExit(f"[失敗] 埋め込めないソース（''' か行末\\）: {pkg}/{m}.py")
+            if "\0" in src:                     # 区切りに使う文字が中に居たら困る
+                raise SystemExit(f"[失敗] NUL を含むソース: {pkg}/{m}.py")
             compile(src, path, "exec")          # 埋め込む前に構文を確かめる
-            name = pkg if m == "__init__" else f"{pkg}.{m}"
-            items.append(f"(\"{name}\", r'''{src}'''),")
-        chunks.append('    "%s": [\n%s\n    ],' % (pkg, "\n".join(items)))
-    table = "{\n" + "\n".join(chunks) + "\n}"
-    return PACKAGE_TAIL.replace("{name}", table)
+            got.append(pkg if m == "__init__" else f"{pkg}.{m}")
+            srcs.append(src)
+        names[pkg] = got
+    blob = base64.b85encode(zlib.compress("\0".join(srcs).encode("utf-8"), 9)).decode("ascii")
+    if '"' in blob or "\\" in blob:
+        raise SystemExit("[失敗] base85 に引用符/バックスラッシュが混じった")
+    back = zlib.decompress(base64.b85decode(blob)).decode("utf-8").split("\0")
+    if back != srcs:                            # 復元できることをその場で確かめる
+        raise SystemExit("[失敗] 埋め込んだソースを復元できない")
+    raw = sum(len(s.encode("utf-8")) for s in srcs)
+    print(f"  同梱パッケージを圧縮: {raw / 1024:.0f} KB → {len(blob) / 1024:.0f} KB "
+          f"（{sum(len(v) for v in names.values())} モジュール、復元して照合済み）")
+    return PACKAGE_TAIL.replace("{names}", repr(names)).replace("{blob}", blob)
+
+
+def _same_ast(before, after, what):
+    """変換の前後で構文木が完全に一致することを確かめる（文字列の中身も含む）。
+
+    行の畳み込みやインデント幅の変更は「見た目だけ」の変換なので、構文木が
+    1ビットも変わらないなら意味は変わりようがない。逆に、複数行文字列の中身を
+    うっかり削ったような取り違えはここで必ず落ちる。
+    """
+    import ast
+    a = ast.dump(ast.parse(before), include_attributes=False)
+    b = ast.dump(ast.parse(after), include_attributes=False)
+    if a != b:
+        raise SystemExit(f"[失敗] {what} で構文木が変わった")
+
+
+def join_wrapped_lines(text):
+    """括弧で折り返してある1つの文を、1行に畳む。
+
+    結合ファイルは「読むため」ではなく「配って動かすため」のものなので、
+    80桁の折り返しを保つ意味が無い。折り返し行の**行頭の空白**がそのまま
+    容量になっているので、畳むと行数もバイト数も減る。
+
+    触らないもの（畳むと中身が変わる／壊れるもの）:
+    - 複数行の文字列リテラルを含む文（改行が値の一部）
+    - 行末バックスラッシュで継いだ文（括弧の外なので空白に置き換えられない）
+    - 途中にコメントを挟んでいる文（畳むと後ろが全部コメントになる）
+    """
+    import io as _io
+    import tokenize
+
+    lines = text.splitlines()
+    spans, start, depth, prev_row, skip = [], None, 0, 0, False
+    for tok in tokenize.generate_tokens(_io.StringIO(text).readline):
+        ty = tok.type
+        if ty in (tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER):
+            continue
+        if start is None:
+            if ty in (tokenize.NEWLINE, tokenize.NL, tokenize.COMMENT):
+                continue
+            start, depth, prev_row, skip = tok.start[0], 0, tok.start[0], False
+        pre_depth = depth        # このトークンを処理する前の括弧の深さ
+        if ty == tokenize.COMMENT:
+            skip = True
+        elif tok.end[0] > tok.start[0] and ty != tokenize.NEWLINE:
+            # 1つのトークンが複数行にまたがる＝複数行の文字列（f 文字列を含む）。
+            # 3.12 の f 文字列は STRING ではなく FSTRING_MIDDLE で改行を持つので、
+            # 種類ではなく「またいでいるか」で判定する。
+            skip = True
+        elif ty == tokenize.OP:
+            if tok.string in "([{":
+                depth += 1
+            elif tok.string in ")]}":
+                depth -= 1
+        # 行またぎが「括弧の外」か判定するのは、このトークンを処理する**前**の深さで
+        # 行う。閉じ括弧が単独行にあると depth はこの行で 0 に落ちるため、処理後の
+        # depth で見ると「括弧の外の行継続＝行末 \」と誤判定して畳むのをやめてしまう。
+        if tok.start[0] > prev_row and pre_depth == 0 and ty != tokenize.NEWLINE:
+            skip = True                          # 括弧の外での行またぎ＝行末 \
+        prev_row = max(prev_row, tok.end[0])
+        if ty == tokenize.NEWLINE:
+            if tok.end[0] > start and not skip:
+                spans.append((start, tok.end[0]))
+            start = None
+
+    drop, joined = set(), {}
+    for a, b in spans:
+        parts = [lines[a - 1].rstrip()]
+        for r in range(a + 1, b + 1):
+            piece = lines[r - 1].strip()
+            if piece:
+                parts.append(piece)
+            drop.add(r)
+        joined[a] = " ".join(parts)
+    out = "\n".join(joined.get(i, l) for i, l in enumerate(lines, 1) if i not in drop)
+    out += "\n"
+    _same_ast(text, out, "行の畳み込み")
+    print(f"  折り返しを畳む: {len(spans)} 文 / {len(drop)} 行削除")
+    return out
+
+
+def shrink_indent(text, width=1):
+    """ネスト1段あたりの字下げを width 文字にする（既定は1文字）。
+
+    実測でこのファイルの約2割（100 KB）が行頭の空白。Python は段の深さしか
+    見ないので、1段=4文字を1文字にしても意味は変わらない。
+
+    書き換えるのは**文の先頭行だけ**。複数行文字列の中身や、括弧内の折り返し行は
+    触らない（前者は値そのもの、後者はどう字下げしても解釈が変わらない）。
+    """
+    import io as _io
+    import tokenize
+
+    level, at_start, want = 0, True, {}
+    for tok in tokenize.generate_tokens(_io.StringIO(text).readline):
+        ty = tok.type
+        if ty == tokenize.INDENT:
+            level += 1
+            continue
+        if ty == tokenize.DEDENT:
+            level -= 1
+            continue
+        if ty in (tokenize.NEWLINE, tokenize.NL):
+            at_start = True
+            continue
+        if ty == tokenize.ENDMARKER:
+            continue
+        if at_start:
+            want[tok.start[0]] = level
+            at_start = False
+
+    lines = text.splitlines()
+    out, saved = [], 0
+    for i, line in enumerate(lines, 1):
+        if i in want:
+            body = line.lstrip(" \t")
+            saved += len(line) - len(body) - width * want[i]
+            line = " " * (width * want[i]) + body
+        out.append(line)
+    result = "\n".join(out) + "\n"
+    _same_ast(text, result, "字下げの詰め")
+    print(f"  字下げを1段={width}文字に: {saved / 1024:.0f} KB 削減")
+    return result
 
 
 def dedup_top_level_assigns(text):
@@ -327,7 +481,8 @@ def dedup_top_level_assigns(text):
     return out
 
 
-def build(out_path=None, header=None, transform=None, tail="", compact=False):
+def build(out_path=None, header=None, transform=None, tail="", compact=False,
+          join=True, indent_width=1):
     """モジュールを結合して単一ファイルを書き出す。
 
     transform: (相対パス, ソース文字列) -> ソース文字列。結合前に各ファイルを
@@ -407,6 +562,11 @@ def build(out_path=None, header=None, transform=None, tail="", compact=False):
         after = len(body.encode("utf-8"))
         print(f"  圧縮: {before / 1024:.0f} KB → {after / 1024:.0f} KB "
               f"（-{100 * (before - after) / before:.0f}%。コメント・docstring・空行を除去）")
+    # 以下は「見た目だけ」の変換。構文木が変わらないことを毎回その場で確かめる。
+    if join:
+        body = join_wrapped_lines(body)
+    if indent_width:
+        body = shrink_indent(body, indent_width)
     out = header + body
     open(out_path, "w", encoding="utf-8").write(out)
     # サイズは**バイト**で出す（len(str) は文字数なので、日本語コメントが多いこの
@@ -419,4 +579,7 @@ def build(out_path=None, header=None, transform=None, tail="", compact=False):
 
 
 if __name__ == "__main__":
-    build()
+    import sys
+    # 通常版も既定で圧縮する（行数を最優先）。中身を読みたいときは
+    # --keep-comments を付けると、コメント・docstring・空行を残したまま出す。
+    build(compact="--keep-comments" not in sys.argv)

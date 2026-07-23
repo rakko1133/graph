@@ -80,10 +80,17 @@ def test_simple_onefile_is_compact():
     # 説明文が残っていない
     assert "    # " not in body, "行コメントが残っている"
     assert not [l for l in body.splitlines() if not l.strip()], "空行が残っている"
-    # 通常版より確実に小さい
+    # 通常版より小さい。両版とも圧縮するようになってからは差が「見た目
+    # テンプレート5種＋外観切替」の分だけなので、固定のバイト比ではなく
+    # 「確実に小さい」ことだけを見る（0.9倍などの閾値は両圧縮で破綻する）。
     full = os.path.join(ROOT, "graph_onefile.py")
     if os.path.isfile(full):
-        assert os.path.getsize(path) < os.path.getsize(full) * 0.9
+        assert os.path.getsize(path) < os.path.getsize(full), \
+            "シンプル版が通常版より小さくない"
+        # 見た目テンプレートを削った分、行数でも確実に少ない
+        n_simple = sum(1 for _ in open(path, encoding="utf-8"))
+        n_full = sum(1 for _ in open(full, encoding="utf-8"))
+        assert n_simple < n_full, f"行数: simple {n_simple} >= full {n_full}"
     # それでも構文は完全（compile が通る）
     compile(src, path, "exec")
 
