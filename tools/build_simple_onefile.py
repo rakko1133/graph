@@ -150,11 +150,18 @@ def transform(rel, src):
     return src
 
 
-def build():
+def build(compact=True):
+    """シンプル版の単一ファイルを作る。
+
+    compact=True（既定）ではコメント・docstring・空行も落とす。
+    この版は「読むため」ではなく「配って動かすため」のファイルなので、
+    説明は元のモジュール側にあれば十分（実測でファイルの約2割が説明文）。
+    中身を読みながら追いたいときは compact=False でビルドする。
+    """
     print("シンプル版・単一ファイルを構築します（見た目テンプレートを除去）")
-    path = build_onefile.build(out_path=OUT, header=HEADER, transform=transform)
-    return path
+    return build_onefile.build(out_path=OUT, header=HEADER, transform=transform,
+                               compact=compact)
 
 
 if __name__ == "__main__":
-    build()
+    build(compact="--keep-comments" not in sys.argv)

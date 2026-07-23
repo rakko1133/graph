@@ -67,6 +67,27 @@ def test_simple_onefile_builds_and_runs():
         QtCore.QSettings("graph-tool", "GraphApp").clear()
 
 
+def test_simple_onefile_is_compact():
+    """配布用に圧縮されていること（コメント・docstring・空行を落とす）。
+
+    「読むコード」は元のモジュール側にあるので、動かすための1ファイルからは
+    説明文を落としてよい。落としても動作は1ビットも変わらない。"""
+    S = sys.modules.get("graph_simple_onefile") or _build_and_import()
+    path = os.path.join(ROOT, "graph_simple_onefile.py")
+    src = open(path, encoding="utf-8").read()
+    assert S.__doc__, "先頭の説明（これは何のファイルか）は残す"
+    body = src.split('"""', 2)[-1].lstrip("\n")   # 先頭の改行は分割の副産物
+    # 説明文が残っていない
+    assert "    # " not in body, "行コメントが残っている"
+    assert not [l for l in body.splitlines() if not l.strip()], "空行が残っている"
+    # 通常版より確実に小さい
+    full = os.path.join(ROOT, "graph_onefile.py")
+    if os.path.isfile(full):
+        assert os.path.getsize(path) < os.path.getsize(full) * 0.9
+    # それでも構文は完全（compile が通る）
+    compile(src, path, "exec")
+
+
 def test_simple_onefile_has_no_look_templates():
     """見た目テンプレートがコードから消えていること。"""
     S = sys.modules.get("graph_simple_onefile") or _build_and_import()

@@ -60,7 +60,66 @@ DEFAULT_HEADER = (
 )
 
 
-def build(out_path=None, header=None, transform=None, tail=""):
+def compact_source(text):
+    """コメント・docstring・空行を落として、動作はそのままに小さくする。
+
+    配布して**動かす**ためのファイル向け。読むためのコードは元のモジュール側に
+    あるので、結合済みファイルの説明文は落としてよい（実測で全体の約2割）。
+
+    安全のための決まり:
+    - コメントの除去は tokenize で行う（文字列リテラル中の # を壊さない）
+    - docstring は ast が「本体の先頭にある文字列」と判定したものだけを消す。
+      QSS やメッセージの複数行文字列は対象外。
+    - 本体が docstring だけの関数は、消すと構文エラーになるので pass を残す
+    - モジュール先頭の docstring は「これは何のファイルか」の説明なので残す
+    """
+    import ast
+    import io as _io
+    import tokenize
+
+    tree = ast.parse(text)
+    drop = set()          # 消す行番号（1始まり）
+    need_pass = {}        # 行番号 -> インデント（pass を置く必要がある場所）
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue        # Module の docstring は残す
+        if ast.get_docstring(node, clean=False) is None or not node.body:
+            continue
+        first = node.body[0]
+        start, end = first.lineno, (first.end_lineno or first.lineno)
+        for ln in range(start, end + 1):
+            drop.add(ln)
+        if len(node.body) == 1:     # 中身が docstring だけ → pass に置き換える
+            line = text.splitlines()[start - 1]
+            need_pass[start] = line[:len(line) - len(line.lstrip())]
+
+    # 行コメント・行末コメントを tokenize で特定する
+    comment_spans = {}    # 行番号 -> その行で切り捨てる開始桁
+    for tok in tokenize.generate_tokens(_io.StringIO(text).readline):
+        if tok.type == tokenize.COMMENT:
+            row, col = tok.start
+            comment_spans.setdefault(row, col)
+
+    out = []
+    for i, line in enumerate(text.splitlines(), start=1):
+        if i in need_pass:
+            out.append(need_pass[i] + "pass")
+            continue
+        if i in drop:
+            continue
+        if i in comment_spans:
+            line = line[:comment_spans[i]].rstrip()
+            if not line:
+                continue          # 行まるごとコメントだった
+        if not line.strip():
+            continue              # 空行
+        out.append(line.rstrip())
+    result = "\n".join(out) + "\n"
+    compile(result, "<compact>", "exec")   # 壊していないことをその場で確かめる
+    return result
+
+
+def build(out_path=None, header=None, transform=None, tail="", compact=False):
     """モジュールを結合して単一ファイルを書き出す。
 
     transform: (相対パス, ソース文字列) -> ソース文字列。結合前に各ファイルを
@@ -121,10 +180,21 @@ def build(out_path=None, header=None, transform=None, tail=""):
     # 一括出力の並列(プロセスプール)は単一ファイルでは spawn が再帰起動するため無効化
     text = re.sub(r"BATCH_PARALLEL_THRESHOLD\s*=\s*\d+", "BATCH_PARALLEL_THRESHOLD = 10**9", text)
 
-    out = header + "\n".join(external) + "\n\n" + text + "\n" + tail
+    body = "\n".join(external) + "\n\n" + text + "\n" + tail
+    if compact:
+        before = len(body.encode("utf-8"))
+        body = compact_source(body)
+        after = len(body.encode("utf-8"))
+        print(f"  圧縮: {before / 1024:.0f} KB → {after / 1024:.0f} KB "
+              f"（-{100 * (before - after) / before:.0f}%。コメント・docstring・空行を除去）")
+    out = header + body
     open(out_path, "w", encoding="utf-8").write(out)
+    # サイズは**バイト**で出す（len(str) は文字数なので、日本語コメントが多いこの
+    # ファイルでは実ファイルサイズと2〜3割ずれる）
+    size_kb = len(out.encode("utf-8")) / 1024
     print(f"出力: {out_path}")
-    print(f"結合: {len(ORDER)} モジュール / {out.count(chr(10)) + 1} 行 / {len(out) / 1024:.0f} KB / 外部import {len(external)} 種")
+    print(f"結合: {len(ORDER)} モジュール / {out.count(chr(10)) + 1} 行 / "
+          f"{size_kb:.0f} KB / 外部import {len(external)} 種")
     return out_path
 
 

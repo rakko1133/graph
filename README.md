@@ -104,14 +104,24 @@ python tools/build_onefile.py          # graph_onefile.py（通常版・全機�
 python tools/build_simple_onefile.py   # graph_simple_onefile.py（シンプル版）
 ```
 
-> 生成された `graph_onefile.py` / `graph_simple_onefile.py` は **git では管理していません**
-> （本体を1行直すたびに1万行超の差分が付いてレビューできなくなるため）。
-> CI が毎回ビルドして検証し、成果物としてダウンロードできるようにしてあります。
+> CI でも毎回ビルドして、結合が壊れていないことを検証しています。
+>
+> **注意**: `excel_chart` パッケージは単一ファイルに同梱していません。
+> 単一ファイルだけを別の場所へ持ち出すと「Excelレポート出力」が使えません
+> （フォルダごと持っていけば動きます）。
 
-| | 行数 | 見た目テンプレート | 起動時の表示 |
-|---|---:|---|---|
-| `graph_onefile.py` | 12,557 | LabPlot風/Veusz風/KST2風/Igor Pro風＋外観のみ切替 | 全部 |
-| `graph_simple_onefile.py` | 12,401 | **無し**（標準の見た目のみ） | 基本 |
+| | 行数 | サイズ | 見た目テンプレート | 起動時の表示 |
+|---|---:|---:|---|---|
+| `graph_onefile.py` | 12,643 | 618 KB | LabPlot風/Veusz風/KST2風/Igor Pro風＋外観のみ切替 | 全部 |
+| `graph_simple_onefile.py` | **10,214** | **482 KB** | **無し**（標準の見た目のみ） | 基本 |
+
+シンプル版は**配って動かすためのファイル**なので、コメント・docstring・空行を
+落として作ります（動作は1ビットも変わりません。説明は元のモジュール側にあります）。
+中身を読みながら追いたいときは:
+
+```bash
+python tools/build_simple_onefile.py --keep-comments
+```
 
 シンプル単一ファイル版は **`シンプル版_1ファイル_起動.bat`** で起動できます。
 削っているのは**見た目の着せ替えだけ**で、解析・測定・出力の機能は通常版と同じです
