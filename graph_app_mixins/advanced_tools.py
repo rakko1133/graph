@@ -5,15 +5,6 @@ from graph_app_common import *  # noqa: F401,F403
 
 class AdvancedMixin:
     # ------------------------------------------------------------ 高度解析
-    def _xy_by_disp(self, disp):
-        """選択中系列の表示名から (t, y) を取得（時間軸は数値化）。
-
-        取り出しは series_xy と共通。ここは区間で絞らない（生成データや
-        相関の対象を切り詰めないため）。"""
-        for fl, col, d in self._selected_series_items():
-            if d == disp:
-                return self.series_xy(fl, col, gated=False)
-        return None, None
 
     def _on_math_op_change(self, op):
         binary = op in mathchan.BINARY_OPS

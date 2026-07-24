@@ -2994,6 +2994,70 @@ class TableLoadThread(QtCore.QThread):
    except Exception as e:
     self.one_done.emit(i, None, str(e))
 __all__ = [ "os", "sys", "QtCore", "QtGui", "QtWidgets", "FigureCanvas", "NavigationToolbar", "Figure", "advanced", "analysis", "applog", "config_io", "data_loader", "datasci", "jp_font", "mathchan", "plotter", "PREVIEW_ROWS", "UserRole", "DECIMATE_TARGET", "BUSY_ROWS", "BATCH_PARALLEL_THRESHOLD", "ASYNC_LOAD_BYTES", "ASYNC_LOAD_COUNT", "SERIES_BAR_MAX", "HEAVY_SERIES", "MESSAGE_LOG_MAX", "NOTIFY_MS", "_parse_float", "CheckListWidget", "LazyColumnCombo", "CollapsibleBox", "ExplorerTree", "SERIES_MIME", "palette_tokens", "is_dark_theme", "render_qss", "NotificationBar", "ProgressStrip", "TableLoadThread", "UI_LEVEL_ORDER", "TabPlugin", "register_tab", "registered_tabs", ]
+"""HostMixin: タブが共通で使う「土台サービス」。
+解析対象の系列取り出し（series_xy / analysis_xy_or_warn / _analysis_xy /
+_xy_by_disp / _apply_measure_window）と、特殊表示の軸準備（prepare_view_axes）を
+ここに集約する。以前は scope タブ（analysis_peaks）と advanced タブ
+（advanced_tools）にあり、他タブが直接呼んでいた＝タブ同士が依存していた。
+ここへ剥がすことで各タブは HostMixin だけに依存し、タブ同士は独立になる
+（1タブのファイルを消しても他タブは壊れない）。挙動は完全に不変。
+"""
+class HostMixin:
+ def _tab_hook(self, name, *args, default=None):
+  fn = getattr(self, name, None)
+  return fn(*args) if callable(fn) else default
+ def series_xy(self, fl, col, gated=False):
+  import numpy as np
+  import pandas as pd
+  df = self.datasets[fl]
+  xname = self.x_combo.currentText()
+  raw = df[xname].to_numpy() if xname in df.columns else df.iloc[:, 0].to_numpy()
+  t = pd.to_numeric(pd.Series(raw), errors="coerce").to_numpy(dtype=float)
+  if np.isnan(t).mean() > 0.5:
+   t = np.arange(len(t), dtype=float)
+  y = pd.to_numeric(pd.Series(df[col].to_numpy()), errors="coerce").to_numpy(dtype=float)
+  if gated:
+   t, y = self._apply_measure_window(t, y)
+  return t, y
+ def _xy_for(self, fl, col):
+  return self.series_xy(fl, col, gated=True)
+ def analysis_xy_or_warn(self, msg="解析対象の系列を選択してください。"):
+  t, y, label = self._analysis_xy()
+  if t is None:
+   self.notify(msg, "warn")
+   return None
+  return t, y, label
+ def prepare_view_axes(self, three_d=False, white_bg=True):
+  self._ensure_axes_projection(three_d)
+  self._reset_figure_axes()
+  self.ax.clear()
+  if white_bg:
+   self.ax.set_facecolor("white")
+   self.ax.tick_params(colors="black")
+  return self.ax
+ def _apply_measure_window(self, t, y):
+  import numpy as np
+  if self.window_meas_check.isChecked() and self._has_drawn:
+   x0, x1 = self.ax.get_xlim()
+   if x1 < x0:
+    x0, x1 = x1, x0
+   t_disp = axis_scale(t, self.xscale_edit.text())
+   mask = (t_disp >= x0) & (t_disp <= x1)
+   if int(mask.sum()) >= 3:
+    t, y = t[mask], y[mask]
+  return t, y
+ def _analysis_xy(self):
+  disp = self.analysis_target.currentText()
+  for fl, col, d in self._selected_series_items():
+   if d == disp:
+    t, y = self._xy_for(fl, col)
+    return t, y, d
+  return None, None, None
+ def _xy_by_disp(self, disp):
+  for fl, col, d in self._selected_series_items():
+   if d == disp:
+    return self.series_xy(fl, col, gated=False)
+  return None, None
 """UIBuildMixin: GraphApp から分離した UIBuildMixin 群（挙動は本体と同一）。"""
 class UIBuildMixin:
  def _menu_action(self, menu, label, slot, shortcut=None, tip=None):
@@ -6290,14 +6354,14 @@ class PlotMixin:
     QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
     self._set_status(f"描画中…（{total:,} 点）"); QtWidgets.QApplication.processEvents()
    try:
-    markers = self._peak_markers() if self.show_peaks_check.isChecked() else None
+    markers = self._tab_hook("_peak_markers") if self.show_peaks_check.isChecked() else None
     sec_label = " / ".join(s["label"] for s in series if s.get("axis") == "secondary")
     plot_series( self.ax, series, ctype, categories=categories, title=self.title_edit.text(), xlabel=self.xlabel_edit.text() or self._effective_x_label(), ylabel=self.ylabel_edit.text() or self._effective_y_label(), xlim=xlim, ylim=ylim, scope=scope, markers=markers, max_points=max_points, secondary_label=sec_label, zlabel=(self.z_combo.currentText() if self._want_3d() else ""), view_init=(self._view_angles() if self._want_3d() else None), threed=self._want_3d(), **self._plot_format_kwargs(), )
     self._apply_aspect()
     self._apply_tick_spacing(ctype, scope)
     self._apply_fill_between(ctype, series)
-    self._draw_ds_annotations()
-    self._draw_proto_overlay(ctype)
+    self._tab_hook("_draw_ds_annotations")
+    self._tab_hook("_draw_proto_overlay", ctype)
     self._apply_figure_theme(redraw=False)
     try:
      self.fig.tight_layout()
@@ -6313,7 +6377,7 @@ class PlotMixin:
    self._plotted_artists = [ (ln.get_label(), ln) for ln in self.ax.get_lines() if "近似" not in str(ln.get_label())]
    self._style_artists = self._build_style_artist_map(series, ctype, bool(max_points))
    self._wire_legend_picking()
-   self._regate()
+   self._tab_hook("_regate")
    self._has_drawn = True
    self._snapshot()
    msg = f"「{ctype}」を描画しました（系列 {len(series)}）。"
@@ -6396,7 +6460,7 @@ class PlotMixin:
    plot_series( ax, [s2], ctype, title=(self.title_edit.text() if i == 0 else ""), xlabel=(xlabel if i == n - 1 else ""), ylabel=str(st.get("label") or s.get("label") or ""), xlim=xlim, ylim=ylim, scope=None, markers=None, max_points=max_points, secondary_label="", threed=False, **kw)
    ax._twin_secondary = None
   self.ax = axes[-1]
-  self._draw_ds_annotations()
+  self._tab_hook("_draw_ds_annotations")
   self._apply_figure_theme(redraw=False)
   try:
    self.fig.tight_layout()
@@ -6406,7 +6470,7 @@ class PlotMixin:
   self._plotted_artists = [(ln.get_label(), ln) for a in axes for ln in a.get_lines() if "近似" not in str(ln.get_label())]
   self._style_artists = {}
   self._legend_pick_map = {}
-  self._regate()
+  self._tab_hook("_regate")
   self._stacked = True
  def _draw_proto_overlay(self, ctype):
   info = getattr(self, "_proto_annotations", None)
@@ -6469,7 +6533,7 @@ class PlotMixin:
   skey = getattr(self, "_line_pick_map", {}).get(event.artist)
   if skey is None:
    return
-  if (self._scope_active() or getattr(self.toolbar, "mode", "") or self._cursor_cid is not None or (getattr(self, "gate_btn", None) and self.gate_btn.isChecked())):
+  if (self._tab_hook("_scope_active", default=False) or getattr(self.toolbar, "mode", "") or self._cursor_cid is not None or (getattr(self, "gate_btn", None) and self.gate_btn.isChecked())):
    return
   ind = getattr(event, "ind", None)
   if ind is None or not len(ind):
@@ -7220,53 +7284,6 @@ class ScopeCursorMixin:
   return w
 """AnalysisMixin: GraphApp から分離した AnalysisMixin 群（挙動は本体と同一）。"""
 class AnalysisMixin:
- def series_xy(self, fl, col, gated=False):
-  import numpy as np
-  import pandas as pd
-  df = self.datasets[fl]
-  xname = self.x_combo.currentText()
-  raw = df[xname].to_numpy() if xname in df.columns else df.iloc[:, 0].to_numpy()
-  t = pd.to_numeric(pd.Series(raw), errors="coerce").to_numpy(dtype=float)
-  if np.isnan(t).mean() > 0.5:
-   t = np.arange(len(t), dtype=float)
-  y = pd.to_numeric(pd.Series(df[col].to_numpy()), errors="coerce").to_numpy(dtype=float)
-  if gated:
-   t, y = self._apply_measure_window(t, y)
-  return t, y
- def _xy_for(self, fl, col):
-  return self.series_xy(fl, col, gated=True)
- def analysis_xy_or_warn(self, msg="解析対象の系列を選択してください。"):
-  t, y, label = self._analysis_xy()
-  if t is None:
-   self.notify(msg, "warn")
-   return None
-  return t, y, label
- def prepare_view_axes(self, three_d=False, white_bg=True):
-  self._ensure_axes_projection(three_d)
-  self._reset_figure_axes()
-  self.ax.clear()
-  if white_bg:
-   self.ax.set_facecolor("white")
-   self.ax.tick_params(colors="black")
-  return self.ax
- def _apply_measure_window(self, t, y):
-  import numpy as np
-  if self.window_meas_check.isChecked() and self._has_drawn:
-   x0, x1 = self.ax.get_xlim()
-   if x1 < x0:
-    x0, x1 = x1, x0
-   t_disp = axis_scale(t, self.xscale_edit.text())
-   mask = (t_disp >= x0) & (t_disp <= x1)
-   if int(mask.sum()) >= 3:
-    t, y = t[mask], y[mask]
-  return t, y
- def _analysis_xy(self):
-  disp = self.analysis_target.currentText()
-  for fl, col, d in self._selected_series_items():
-   if d == disp:
-    t, y = self._xy_for(fl, col)
-    return t, y, d
-  return None, None, None
  def _peak_markers(self):
   if self.chart_combo.currentText() not in ("折れ線", "散布図"):
    return None
@@ -7463,11 +7480,6 @@ class AnalysisMixin:
    QtWidgets.QMessageBox.critical(self, "保存エラー", str(e))
 """AdvancedMixin: GraphApp から分離した AdvancedMixin 群（挙動は本体と同一）。"""
 class AdvancedMixin:
- def _xy_by_disp(self, disp):
-  for fl, col, d in self._selected_series_items():
-   if d == disp:
-    return self.series_xy(fl, col, gated=False)
-  return None, None
  def _on_math_op_change(self, op):
   binary = op in BINARY_OPS
   self.math_b.setEnabled(binary); self.math_b_label.setEnabled(binary)
@@ -8915,7 +8927,7 @@ for _tab in BUILTIN_TABS:
     - 設定の保存／読み込み（終了時自動保存・起動時復元）
 GUI は matplotlib の qt_compat 経由で実装しており、PySide6 / PyQt6（Qt6系）で動作する。
 """
-class GraphApp(UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin, ScopeCursorMixin, AnalysisMixin, AdvancedMixin, DataSciMixin, BatchMixin, PersistenceMixin, QtWidgets.QMainWindow):
+class GraphApp(HostMixin, UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin, ScopeCursorMixin, AnalysisMixin, AdvancedMixin, DataSciMixin, BatchMixin, PersistenceMixin, QtWidgets.QMainWindow):
  def __init__(self):
   super().__init__()
   self.datasets = {}

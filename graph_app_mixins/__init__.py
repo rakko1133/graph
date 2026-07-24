@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """GraphApp を構成する概念別 Mixin 群。"""
+from .host import HostMixin
 from .ui_build import UIBuildMixin
 from .data_io import DataIOMixin
 from .style_table import StyleTableMixin
@@ -12,6 +13,7 @@ from .batch import BatchMixin
 from .persistence import PersistenceMixin
 
 __all__ = [
+    "HostMixin",
     "UIBuildMixin",
     "DataIOMixin",
     "StyleTableMixin",

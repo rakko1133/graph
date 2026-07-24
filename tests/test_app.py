@@ -791,6 +791,41 @@ def _visible_controls(w):
     return n
 
 
+def test_tabs_do_not_depend_on_each_other():
+    """タブ間の相互依存が無く、共通サービスは HostMixin に集約されていること。"""
+    import graph_app_mixins.host as host
+    hm = host.HostMixin
+    # タブ横断で使う土台サービスは HostMixin が持つ
+    for name in ("series_xy", "analysis_xy_or_warn", "_analysis_xy",
+                 "_xy_by_disp", "prepare_view_axes", "_tab_hook"):
+        assert name in hm.__dict__, f"{name} が HostMixin に無い"
+    # HostMixin 由来であることを実機で確認
+    w = _make_app(_wave())
+    for name in ("analysis_xy_or_warn", "_xy_by_disp"):
+        owner = next(c.__name__ for c in type(w).__mro__ if name in c.__dict__)
+        assert owner == "HostMixin", f"{name} の所有者が {owner}"
+
+
+def test_draw_path_survives_missing_tab_hook():
+    """タブ由来の描画フックが欠けても描画が落ちないこと（タブを外せる担保）。
+
+    plotting はタブのメソッド名を直接呼ばず _tab_hook 経由にしたので、
+    該当タブ（メソッド）が無い構成でも draw が例外を出さない。"""
+    w = _make_app(_wave())
+    # 欠けているフック名は default を返す（呼び出しは起きない）
+    assert w._tab_hook("_no_such_overlay_xyz") is None
+    assert w._tab_hook("_no_such_overlay_xyz", default=False) is False
+    # 実在フックは通常どおり値を返す
+    assert callable(getattr(w, "_draw_ds_annotations", None))
+    # インスタンス側でフックを None に潰しても（＝タブ非搭載相当）draw は通る
+    w._draw_ds_annotations = None
+    w._draw_proto_overlay = None
+    w._peak_markers = None
+    w.chart_combo.setCurrentText("折れ線")
+    w.draw_graph()
+    assert len(w.ax.get_lines()) >= 1
+
+
 def test_builtin_tabs_are_registered_plugins():
     """内蔵4タブがプラグインとして登録され、順序・レベルが従来どおりであること。"""
     import graph_app_common as C

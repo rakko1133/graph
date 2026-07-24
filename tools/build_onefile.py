@@ -18,6 +18,7 @@ ORDER = [
     "analysis_common.py", "analysis_spectrum.py", "analysis_measure.py",
     "advanced.py", "mathchan.py", "datasci.py", "batch_render.py",
     "graph_app_common.py",
+    "graph_app_mixins/host.py",
     "graph_app_mixins/ui_build.py", "graph_app_mixins/data_io.py",
     "graph_app_mixins/style_table.py", "graph_app_mixins/plotting.py",
     "graph_app_mixins/scope_cursor.py", "graph_app_mixins/analysis_peaks.py",

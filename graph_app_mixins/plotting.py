@@ -392,7 +392,7 @@ class PlotMixin:
                 QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
                 self._set_status(f"描画中…（{total:,} 点）"); QtWidgets.QApplication.processEvents()
             try:
-                markers = self._peak_markers() if self.show_peaks_check.isChecked() else None
+                markers = self._tab_hook("_peak_markers") if self.show_peaks_check.isChecked() else None
                 sec_label = " / ".join(s["label"] for s in series
                                        if s.get("axis") == "secondary")
                 plotter.plot_series(
@@ -411,8 +411,8 @@ class PlotMixin:
                 self._apply_aspect()   # 縦横比の固定（自動なら解除）
                 self._apply_tick_spacing(ctype, scope)   # 目盛り間隔（指定時）
                 self._apply_fill_between(ctype, series)   # 系列間の塗りつぶし（選択時）
-                self._draw_ds_annotations()              # データサイエンス注記（選択時）
-                self._draw_proto_overlay(ctype)          # プロトコル解読の波形上注記
+                self._tab_hook("_draw_ds_annotations")   # データサイエンス注記（該当タブがあれば）
+                self._tab_hook("_draw_proto_overlay", ctype)  # プロトコル解読の波形上注記
                 # 地色が暗いときは目盛り・軸ラベル・凡例の文字色も明るくする
                 # （plot_series は地色しか塗らないので、ここで対比を確保する）
                 self._apply_figure_theme(redraw=False)
@@ -436,7 +436,7 @@ class PlotMixin:
             # スタイルのみ変更を即時反映するための skey->Line2D マップ（安全な場合のみ）
             self._style_artists = self._build_style_artist_map(series, ctype, bool(max_points))
             self._wire_legend_picking()   # 凡例クリックで系列ON/OFF
-            self._regate()                # 区間測定ON中は選択機構を作り直す
+            self._tab_hook("_regate")     # 区間測定ON中は選択機構を作り直す
             self._has_drawn = True
             self._snapshot()   # Undo/Redo 用に設定の履歴を記録
             msg = f"「{ctype}」を描画しました（系列 {len(series)}）。"
@@ -556,7 +556,7 @@ class PlotMixin:
                 secondary_label="", threed=False, **kw)
             ax._twin_secondary = None
         self.ax = axes[-1]   # 以降の操作（区間測定・注記等）は最下段を基準にする
-        self._draw_ds_annotations()
+        self._tab_hook("_draw_ds_annotations")
         self._apply_figure_theme(redraw=False)   # 段分けでも全段の文字色を地色に合わせる
         try:
             self.fig.tight_layout()
@@ -567,7 +567,7 @@ class PlotMixin:
                                  if "近似" not in str(ln.get_label())]
         self._style_artists = {}      # スタイル即時反映は無効（全再描画へフォールバック）
         self._legend_pick_map = {}
-        self._regate()
+        self._tab_hook("_regate")
         self._stacked = True
 
     def _draw_proto_overlay(self, ctype):
@@ -655,7 +655,7 @@ class PlotMixin:
         skey = getattr(self, "_line_pick_map", {}).get(event.artist)
         if skey is None:
             return
-        if (self._scope_active() or getattr(self.toolbar, "mode", "")
+        if (self._tab_hook("_scope_active", default=False) or getattr(self.toolbar, "mode", "")
                 or self._cursor_cid is not None
                 or (getattr(self, "gate_btn", None) and self.gate_btn.isChecked())):
             return   # ドラッグ操作系のモード中は誤選択を避ける
