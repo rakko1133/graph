@@ -2985,13 +2985,2332 @@ class TableLoadThread(QtCore.QThread):
    except Exception as e:
     self.one_done.emit(i, None, str(e))
 __all__ = [ "os", "sys", "QtCore", "QtGui", "QtWidgets", "FigureCanvas", "NavigationToolbar", "Figure", "advanced", "analysis", "applog", "config_io", "data_loader", "datasci", "jp_font", "mathchan", "plotter", "PREVIEW_ROWS", "UserRole", "DECIMATE_TARGET", "BUSY_ROWS", "BATCH_PARALLEL_THRESHOLD", "ASYNC_LOAD_BYTES", "ASYNC_LOAD_COUNT", "SERIES_BAR_MAX", "HEAVY_SERIES", "MESSAGE_LOG_MAX", "NOTIFY_MS", "_parse_float", "CheckListWidget", "LazyColumnCombo", "CollapsibleBox", "ExplorerTree", "SERIES_MIME", "palette_tokens", "is_dark_theme", "render_qss", "NotificationBar", "ProgressStrip", "TableLoadThread", "UI_LEVEL_ORDER", "TabPlugin", "register_tab", "registered_tabs", ]
-"""HostMixin: タブが共通で使う「土台サービス」。
-解析対象の系列取り出し（series_xy / analysis_xy_or_warn / _analysis_xy /
-_xy_by_disp / _apply_measure_window）と、特殊表示の軸準備（prepare_view_axes）を
-ここに集約する。以前は scope タブ（analysis_peaks）と advanced タブ
-（advanced_tools）にあり、他タブが直接呼んでいた＝タブ同士が依存していた。
-ここへ剥がすことで各タブは HostMixin だけに依存し、タブ同士は独立になる
-（1タブのファイルを消しても他タブは壊れない）。挙動は完全に不変。
+"""DataIOMixin: GraphApp から分離した DataIOMixin 群（挙動は本体と同一）。"""
+class DataIOMixin:
+ def dragEnterEvent(self, event):
+  if event.mimeData().hasUrls():
+   event.acceptProposedAction()
+ _ACCEPT_EXTS = ACCEPT_EXTS
+ def dropEvent(self, event):
+  paths = []
+  for url in event.mimeData().urls():
+   p = url.toLocalFile()
+   if p and os.path.splitext(p)[1].lower() in self._ACCEPT_EXTS:
+    paths.append(p)
+  if not paths:
+   return
+  self.last_dir = os.path.dirname(paths[-1])
+  self._load_files_async(paths)
+ def add_file(self):
+  paths, _ = QtWidgets.QFileDialog.getOpenFileNames( self, "ファイルを追加（複数選択可）", self.last_dir, file_dialog_filter())
+  if paths:
+   self.last_dir = os.path.dirname(paths[-1])
+   self._load_files_async(paths)
+ def paste_from_clipboard(self):
+  import io
+  import pandas as pd
+  text = QtWidgets.QApplication.clipboard().text()
+  if not text or not text.strip():
+   self.notify("クリップボードに表データがありません。", "info")
+   return
+  first = text.splitlines()[0]
+  sep = "\t" if first.count("\t") >= first.count(",") else ","
+  try:
+   df = pd.read_csv(io.StringIO(text), sep=sep, engine="python", skip_blank_lines=True)
+   df = _normalize_columns(df)
+  except Exception as e:
+   self.notify(f"表として読み取れませんでした:\n{e}", "warn")
+   return
+  if df.shape[1] == 0 or len(df) == 0:
+   self.notify("表として読み取れませんでした。", "warn")
+   return
+  label, i = "貼り付け", 2
+  while label in self.datasets:
+   label = f"貼り付け ({i})"; i += 1
+  self.datasets[label] = df
+  self.meta[label] = {"path": "(clipboard)", "enc": "clipboard", "delim": sep}
+  self._add_file_item(label)
+  self.file_list.setCurrentRow(self.file_list.count() - 1)
+  self._refresh_columns()
+  self._set_status(f"クリップボードから {len(df)}行 × {len(df.columns)}列 を貼り付けました。")
+ def _load_job(self, path):
+  enc = self.enc_combo.currentText()
+  enc = None if enc.startswith("自動") else enc
+  delim = None
+  dt = self.delim_combo.currentText()
+  if not dt.startswith("自動"):
+   for ch, lbl in DELIMITER_LABELS.items():
+    if lbl == dt:
+     delim = ch
+     break
+  sheet = None
+  if os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm", ".xls"):
+   try:
+    sheets = excel_sheet_names(path)
+   except Exception as e:
+    self.notify(f"{os.path.basename(path)} のシートを読めませんでした。", "error", str(e))
+    return None
+   if len(sheets) > 1:
+    sheet, ok = QtWidgets.QInputDialog.getItem( self, "シートの選択", f"{os.path.basename(path)} のシート:", sheets, 0, False)
+    if not ok:
+     return None
+  return {"path": path, "enc": enc, "delim": delim, "sheet": sheet}
+ def _register_loaded(self, job, result):
+  path, sheet = job["path"], job.get("sheet")
+  df, used_enc, used_delim = result
+  label = os.path.basename(path)
+  if sheet:
+   label = f"{label}[{sheet}]"
+  base, i = label, 2
+  while label in self.datasets and self.meta.get(label, {}).get("path") != path:
+   label = f"{base} ({i})"; i += 1
+  self.datasets[label] = df
+  self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim, "sheet": sheet}
+  if not self._find_file_item(label):
+   self._add_file_item(label)
+  self._push_recent(path)
+  self._set_status(f"{label} を読み込み（{len(df)}行 × {len(df.columns)}列, {used_enc}）")
+  return label
+ def _load_file(self, path):
+  if os.path.splitext(path)[1].lower() in RUNNABLE_EXTS:
+   self.run_ltspice_asc(path)
+   return
+  job = self._load_job(path)
+  if job is None:
+   return
+  size = os.path.getsize(path) if os.path.isfile(path) else 0
+  busy = size > 5_000_000
+  if busy:
+   QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+   self._set_status(f"読み込み中… {os.path.basename(path)}")
+   QtWidgets.QApplication.processEvents()
+  try:
+   result = load_table( path, encoding=job["enc"], delimiter=job["delim"], sheet=job["sheet"])
+  except Exception as e:
+   self.notify(f"{os.path.basename(path)} を読み込めませんでした。", "error", str(e))
+   return
+  finally:
+   if busy:
+    QtWidgets.QApplication.restoreOverrideCursor()
+  self._register_loaded(job, result)
+ def _load_files_async(self, paths, on_finished=None):
+  paths = list(paths)
+  for p in [p for p in paths if os.path.splitext(p)[1].lower() in RUNNABLE_EXTS]:
+   self.run_ltspice_asc(p)
+  targets = [p for p in paths if os.path.splitext(p)[1].lower() not in RUNNABLE_EXTS]
+  jobs = []
+  for p in targets:
+   job = self._load_job(p)
+   if job is not None:
+    jobs.append(job)
+  if not jobs:
+   if on_finished:
+    on_finished([])
+   return None
+  if getattr(self, "_load_thread", None) is not None:
+   self.notify("前の読み込みが実行中です。終わるまでお待ちください。", "warn")
+   return None
+  loaded, errors = [], []
+  total_bytes = 0
+  for job in jobs:
+   try:
+    total_bytes += os.path.getsize(job["path"])
+   except OSError:
+    get_logger().debug("_load_files_async: 無視した例外", exc_info=True)
+  if len(jobs) <= ASYNC_LOAD_COUNT and total_bytes <= ASYNC_LOAD_BYTES:
+   for job in jobs:
+    name = os.path.basename(job["path"])
+    try:
+     res = load_table( job["path"], encoding=job["enc"], delimiter=job["delim"], sheet=job["sheet"])
+     loaded.append(self._register_loaded(job, res))
+    except Exception as e:
+     errors.append(f"{name}: {e}")
+   self._refresh_columns()
+   if loaded and self._has_drawn:
+    self.draw_graph()
+   if errors:
+    self.notify(f"{len(errors)} 件のファイルを読み込めませんでした。", "error", "\n".join(errors))
+   if on_finished:
+    on_finished(loaded)
+   return None
+  def _on_one(index, result, err):
+   job = jobs[index]
+   name = os.path.basename(job["path"])
+   if result is None:
+    errors.append(f"{name}: {err}")
+   else:
+    try:
+     loaded.append(self._register_loaded(job, result))
+    except Exception as e:
+     errors.append(f"{name}: {e}")
+   self.progress_strip.update(index + 1)
+  def _on_progress(done, name):
+   self.progress_strip.update(done, f"読み込み中… {name}（{done + 1}/{len(jobs)}）")
+  def _on_finished():
+   thread = getattr(self, "_load_thread", None)
+   canceled = bool(thread is not None and thread.is_canceled())
+   self._load_thread = None
+   self.progress_strip.finish()
+   self._refresh_columns()
+   if loaded and self._has_drawn:
+    self.draw_graph()
+   if errors:
+    self.notify(f"{len(errors)} 件のファイルを読み込めませんでした。", "error", "\n".join(errors))
+   elif canceled:
+    self.notify(f"読み込みを中止しました（{len(loaded)} 件は読み込み済み）。", "warn")
+   elif loaded:
+    self.notify(f"{len(loaded)} 件のファイルを読み込みました。", "ok")
+   if on_finished:
+    on_finished(loaded)
+  thread = TableLoadThread(jobs, self)
+  self._load_thread = thread
+  thread.one_done.connect(_on_one)
+  thread.progressed.connect(_on_progress)
+  thread.finished.connect(_on_finished)
+  self.progress_strip.start(f"読み込み中…（0/{len(jobs)}）", len(jobs))
+  thread.start()
+  return thread
+ def _cancel_background(self):
+  thread = getattr(self, "_load_thread", None)
+  if thread is not None:
+   thread.cancel()
+   self._set_status("読み込みの中止を要求しました（実行中の1件が終わり次第停止）。")
+ def _stop_background_tasks(self):
+  thread = getattr(self, "_load_thread", None)
+  if thread is not None:
+   thread.cancel()
+   thread.wait(5000)
+   self._load_thread = None
+ def wait_for_loads(self, timeout_ms=30000):
+  app = QtWidgets.QApplication.instance()
+  deadline = QtCore.QElapsedTimer()
+  deadline.start()
+  while getattr(self, "_load_thread", None) is not None:
+   if deadline.hasExpired(timeout_ms):
+    return False
+   if app is not None:
+    app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 20)
+  if app is not None:
+   app.processEvents()
+  return True
+ def add_folder(self):
+  d = QtWidgets.QFileDialog.getExistingDirectory(self, "フォルダを開く", self.last_dir)
+  if d:
+   self._load_folder(d)
+ def _load_folder(self, d):
+  exts = set(TABLE_EXTS)
+  try:
+   names = sorted(os.listdir(d))
+  except OSError as e:
+   QtWidgets.QMessageBox.critical(self, "フォルダを開く", str(e))
+   return
+  files = [os.path.join(d, f) for f in names if os.path.splitext(f)[1].lower() in exts and os.path.isfile(os.path.join(d, f))]
+  if not files:
+   self.notify("このフォルダに読み込めるデータファイルがありません。", "warn")
+   return
+  if len(files) > 40:
+   ret = QtWidgets.QMessageBox.question( self, "フォルダを開く", f"{len(files)} 個のファイルが見つかりました。すべて読み込みますか？")
+   if ret != QtWidgets.QMessageBox.StandardButton.Yes:
+    return
+  self.last_dir = d
+  self._load_files_async( files, on_finished=lambda labels: self.notify( f"フォルダを読み込みました: {os.path.basename(d)}" f"（{len(labels)}/{len(files)} ファイル）", "ok"))
+ _LTSPICE_CANDIDATES = ( r"C:\Program Files\ADI\LTspice\LTspice.exe", r"C:\Program Files\LTC\LTspiceXVII\XVIIx64.exe", r"C:\Program Files (x86)\LTC\LTspiceIV\scad3.exe", )
+ def _ltspice_exe(self):
+  p = self._ui_settings().value("ltspice/exe")
+  if p and os.path.isfile(str(p)):
+   return str(p)
+  cands = list(self._LTSPICE_CANDIDATES) + [ os.path.expanduser(r"~\AppData\Local\Programs\ADI\LTspice\LTspice.exe")]
+  for c in cands:
+   if os.path.isfile(c):
+    return c
+  try:
+   from spicelib.simulators.ltspice_simulator import LTspice
+   for c in LTspice.spice_exe:
+    if os.path.isfile(str(c)):
+     return str(c)
+  except Exception:
+   get_logger().debug("_ltspice_exe: 無視した例外", exc_info=True)
+  import shutil
+  return shutil.which("LTspice") or shutil.which("XVIIx64")
+ def set_ltspice_path(self):
+  path, _ = QtWidgets.QFileDialog.getOpenFileName( self, "LTspice実行ファイルの場所", r"C:\Program Files", "LTspice (*.exe)")
+  if path:
+   self._ui_settings().setValue("ltspice/exe", path)
+   self._set_status(f"LTspiceの場所を設定しました: {path}")
+ def run_ltspice_asc(self, path=None):
+  if getattr(self, "_lt_proc", None) is not None \
+                and self._lt_proc.state() != QtCore.QProcess.ProcessState.NotRunning:
+   self._set_status("LTspiceシミュレーションを実行中です。完了までお待ちください。")
+   return
+  if not path:
+   path, _ = QtWidgets.QFileDialog.getOpenFileName( self, "LTspice回路を実行", self.last_dir, "LTspice回路/ネットリスト (*.asc *.net)")
+   if not path:
+    return
+  exe = self._ltspice_exe()
+  if not exe:
+   ret = QtWidgets.QMessageBox.question( self, "LTspiceが見つかりません", "LTspice の実行ファイルが見つかりませんでした。\n場所を指定しますか？")
+   if ret == QtWidgets.QMessageBox.StandardButton.Yes:
+    self.set_ltspice_path()
+    exe = self._ltspice_exe()
+   if not exe:
+    return
+  self.last_dir = os.path.dirname(path)
+  raw = os.path.splitext(path)[0] + ".raw"
+  proc = QtCore.QProcess(self)
+  self._lt_proc = proc
+  proc.finished.connect( lambda code, _st, p=path, r=raw: self._on_ltspice_finished(code, p, r))
+  proc.start(exe, ["-b", path])
+  if not proc.waitForStarted(5000):
+   self._lt_proc = None
+   QtWidgets.QMessageBox.critical(self, "LTspice", f"起動できませんでした: {exe}")
+   return
+  self._set_status(f"LTspiceシミュレーション実行中… {os.path.basename(path)}" "（完了すると自動で波形を読み込みます）")
+ def _on_ltspice_finished(self, code, asc_path, raw_path):
+  self._lt_proc = None
+  if not os.path.isfile(raw_path):
+   self.notify(f"シミュレーションは終了しましたが .raw が見つかりません（終了コード {code}）。\n" f"回路にエラーがないか LTspice で確認してください:\n{asc_path}", "warn")
+   return
+  self._load_file(raw_path)
+  self._refresh_columns()
+  if self._has_drawn:
+   self.draw_graph()
+  note = ("（ファイル監視ONなので、LTspice側で再実行すると自動更新されます）" if self._watch_enabled() else "（メニュー『ファイル→ファイルの変更を監視』をONにすると、" "LTspice側の再実行で自動更新されます）")
+  self._set_status(f"LTspice完了: {os.path.basename(raw_path)} を読み込みました {note}")
+ def _watch_enabled(self):
+  return bool(getattr(self, "_watch_action", None) and self._watch_action.isChecked())
+ def toggle_file_watch(self, on):
+  self._ui_settings().setValue("ui/watch_files", "1" if on else "0")
+  if on:
+   self._ensure_watcher()
+   self._rebuild_watch_paths()
+   self._set_status("ファイル監視: ON（監視中のファイルが更新されると自動で再読込・再描画します）")
+  else:
+   w = getattr(self, "_fs_watcher", None)
+   if w is not None and w.files():
+    w.removePaths(w.files())
+   self._set_status("ファイル監視: OFF")
+ def _ensure_watcher(self):
+  if getattr(self, "_fs_watcher", None) is None:
+   self._fs_watcher = QtCore.QFileSystemWatcher(self)
+   self._fs_watcher.fileChanged.connect(self._on_watched_file_changed)
+   self._watch_pending = set()
+   self._watch_timer = QtCore.QTimer(self)
+   self._watch_timer.setSingleShot(True)
+   self._watch_timer.setInterval(600)
+   self._watch_timer.timeout.connect(self._reload_watched)
+ def _rebuild_watch_paths(self):
+  if not self._watch_enabled():
+   return
+  self._ensure_watcher()
+  w = self._fs_watcher
+  if w.files():
+   w.removePaths(w.files())
+  paths = sorted({m.get("path") for m in self.meta.values() if m.get("path") and os.path.isfile(m.get("path"))})
+  if paths:
+   w.addPaths(paths)
+ def _on_watched_file_changed(self, path):
+  self._watch_pending.add(path)
+  self._watch_timer.start()
+ def _reload_watched(self):
+  pending, self._watch_pending = set(self._watch_pending), set()
+  labels = [l for l, m in self.meta.items() if m.get("path") in pending]
+  reloaded = []
+  for label in labels:
+   if self._reload_label_inplace(label):
+    reloaded.append(label)
+  self._rebuild_watch_paths()
+  if reloaded:
+   self._refresh_columns()
+   if self._has_drawn:
+    self.draw_graph()
+   self._set_status("自動再読込: " + ", ".join(reloaded))
+ def _reload_all_files(self):
+  reloaded = [l for l in list(self.datasets) if self._reload_label_inplace(l)]
+  if reloaded:
+   self._refresh_columns()
+   if self._has_drawn:
+    self.draw_graph()
+   self._set_status(f"再読込しました: {len(reloaded)}ファイル")
+  else:
+   self._set_status("再読込できるファイルがありません（貼り付け・生成データのみ）。")
+ def _reload_label_inplace(self, label):
+  meta = self.meta.get(label) or {}
+  path = meta.get("path")
+  if not path or not os.path.isfile(path):
+   return False
+  enc = meta.get("enc")
+  enc = None if (not enc or str(enc).startswith(("自動", "clipboard"))) else enc
+  try:
+   df, used_enc, used_delim = load_table( path, encoding=enc, delimiter=meta.get("delim"), sheet=meta.get("sheet"))
+  except Exception:
+   return False
+  self.datasets[label] = df
+  self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim, "sheet": meta.get("sheet")}
+  if getattr(self, "_preview_label", None) == label:
+   self._populate_preview(df, label=label)
+  return True
+ def _find_file_item(self, label):
+  for i in range(self.file_list.count()):
+   if self.file_list.item(i).text() == label:
+    return self.file_list.item(i)
+  return None
+ def _add_file_item(self, label):
+  it = QtWidgets.QListWidgetItem(label)
+  it.setToolTip(label)
+  self.file_list.addItem(it)
+ def _push_recent(self, path):
+  if path in self.recent_files:
+   self.recent_files.remove(path)
+  self.recent_files.insert(0, path)
+  del self.recent_files[12:]
+  self._rebuild_recent_menu()
+ def _rebuild_recent_menu(self):
+  self.recent_menu.clear()
+  if not self.recent_files:
+   act = self.recent_menu.addAction("（履歴なし）"); act.setEnabled(False)
+   return
+  for p in self.recent_files:
+   self.recent_menu.addAction(os.path.basename(p), lambda checked=False, q=p: self._open_recent(q))
+ def _open_recent(self, path):
+  if not os.path.isfile(path):
+   self.notify(f"ファイルが見つかりません:\n{path}", "warn")
+   self.recent_files = [q for q in self.recent_files if q != path]
+   self._rebuild_recent_menu()
+   return
+  self._load_file(path)
+  self._refresh_columns()
+  if self._has_drawn:
+   self.draw_graph()
+ def remove_file(self):
+  items = self.file_list.selectedItems()
+  if not items and self.file_list.currentItem():
+   items = [self.file_list.currentItem()]
+  labels = [it.text() for it in items]
+  if not labels:
+   self.notify("削除するファイルを選択してください。", "warn")
+   return
+  if len(labels) > 1:
+   ret = QtWidgets.QMessageBox.question( self, "一括削除", f"{len(labels)} 個のファイルを一覧から削除しますか？")
+   if ret != QtWidgets.QMessageBox.StandardButton.Yes:
+    return
+  self._remove_labels(labels)
+  self._set_status(f"{len(labels)} 個のファイルを削除しました。")
+ def clear_all_files(self):
+  if not self.datasets:
+   self.notify("読み込み済みファイルがありません。", "warn")
+   return
+  ret = QtWidgets.QMessageBox.question( self, "全削除", f"読み込み済みの {len(self.datasets)} 個すべてを一覧から削除しますか？")
+  if ret != QtWidgets.QMessageBox.StandardButton.Yes:
+   return
+  n = len(self.datasets)
+  self._remove_labels(list(self.datasets.keys()))
+  self._set_status(f"すべて（{n} 個）のファイルを削除しました。")
+ def _remove_labels(self, labels):
+  labelset = set(labels)
+  self._clear_dynamic_resample()
+  for label in labels:
+   self.datasets.pop(label, None)
+   self.meta.pop(label, None)
+  for key in [k for k in self.series_styles if k.split("\t", 1)[0] in labelset]:
+   self.series_styles.pop(key, None)
+  self._meas_annotations = []
+  self._ds_annotations = []
+  self._proto_annotations = None
+  if hasattr(self, "meas_table"):
+   self.meas_table.setRowCount(0)
+  if hasattr(self, "ds_table"):
+   self.ds_table.setRowCount(0)
+  self.file_list.blockSignals(True)
+  for i in range(self.file_list.count() - 1, -1, -1):
+   if self.file_list.item(i).text() in labelset:
+    self.file_list.takeItem(i)
+  self.file_list.blockSignals(False)
+  self._refresh_columns()
+  if self.datasets:
+   self.file_list.setCurrentRow(0)
+  else:
+   self._preview_label = None
+   self.table.clearContents()
+   self.table.setRowCount(0)
+   self.table.setColumnCount(0)
+   self._draw_placeholder()
+ def reload_current(self):
+  it = self.file_list.currentItem()
+  if not it:
+   self.notify("ファイルを選択してください。", "warn")
+   return
+  label = it.text()
+  meta = dict(self.meta.get(label) or {})
+  path = meta.get("path", "")
+  if not path or not os.path.isfile(path):
+   self.notify(f"『{label}』は読み込み元のファイルが無いので再読込できません。", "warn", "貼り付けたデータや、数学チャンネル・カーブフィットなどで" "作ったデータセットが該当します（データはそのまま残しました）。")
+   return
+  df = self.datasets.get(label)
+  row = self.file_list.row(it)
+  self.datasets.pop(label, None)
+  self.meta.pop(label, None)
+  self.file_list.takeItem(row)
+  self._load_file(path)
+  if label not in self.datasets and df is not None:
+   self.datasets[label] = df
+   self.meta[label] = meta
+   if not self._find_file_item(label):
+    self._add_file_item(label)
+   self.notify(f"『{label}』を読み直せなかったので、元の内容を残しました。", "warn")
+  self._refresh_columns()
+ def _on_file_selected(self, _row):
+  it = self.file_list.currentItem()
+  if it and it.text() in self.datasets:
+   self._populate_preview(self.datasets[it.text()], label=it.text())
+   meta = self.meta[it.text()]
+   self.enc_combo.setCurrentText(meta["enc"]) if self.enc_combo.findText(meta["enc"]) >= 0 else None
+ def _refresh_columns(self):
+  seen, xcols = set(), []
+  for df in self.datasets.values():
+   for c in df.columns:
+    if c not in seen:
+     seen.add(c); xcols.append(c)
+  cur_x = self.x_combo.currentText()
+  self.x_combo.blockSignals(True)
+  self.x_combo.clear(); self.x_combo.addItems(xcols)
+  if cur_x in xcols:
+   self.x_combo.setCurrentText(cur_x)
+  self.x_combo.blockSignals(False)
+  if hasattr(self, "z_combo"):
+   cur_z = self.z_combo.currentText()
+   self.z_combo.blockSignals(True)
+   self.z_combo.clear(); self.z_combo.addItems(xcols)
+   if cur_z in xcols:
+    self.z_combo.setCurrentText(cur_z)
+   elif xcols:
+    self.z_combo.setCurrentText(xcols[-1])
+   self.z_combo.blockSignals(False)
+  checked = QtCore.Qt.CheckState.Checked
+  unchecked = QtCore.Qt.CheckState.Unchecked
+  if hasattr(self, "x_list"):
+   prev_x = {self.x_list.item(i).data(UserRole) for i in range(self.x_list.count()) if self.x_list.item(i).checkState() == checked}
+   self.x_list.blockSignals(True)
+   self.x_list.clear()
+   for c in xcols:
+    it = QtWidgets.QListWidgetItem(str(c))
+    it.setData(UserRole, c)
+    it.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+    it.setCheckState(checked if c in prev_x else unchecked)
+    self.x_list.addItem(it)
+   self.x_list.blockSignals(False)
+  prev = {self.y_list.item(i).data(UserRole) for i in range(self.y_list.count()) if self.y_list.item(i).checkState() == checked}
+  self.y_list.blockSignals(True)
+  self.y_list.clear()
+  multi = len(self.datasets) > 1
+  use_left = self._use_leftmost_x()
+  for label, df in self.datasets.items():
+   for ci, c in enumerate(df.columns):
+    if use_left and ci == 0:
+     continue
+    disp = f"{label} | {c}" if multi else c
+    item = QtWidgets.QListWidgetItem(disp)
+    item.setData(UserRole, (label, c))
+    item.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+    item.setCheckState(checked if (label, c) in prev else unchecked)
+    self.y_list.addItem(item)
+  self.y_list.blockSignals(False)
+  if hasattr(self, "explorer"):
+   self._rebuild_explorer()
+  self._rebuild_watch_paths()
+  self._on_y_selection_changed()
+ def _selected_series_items(self):
+  out = []
+  for i in range(self.y_list.count()):
+   it = self.y_list.item(i)
+   if it.checkState() == QtCore.Qt.CheckState.Checked:
+    fl, col = it.data(UserRole)
+    out.append((fl, col, it.text()))
+  return out
+ def _populate_preview(self, df, label=None):
+  import pandas as pd
+  self._preview_loading = True
+  try:
+   head = df.head(PREVIEW_ROWS)
+   cols = list(df.columns)
+   self.table.clear()
+   self.table.setColumnCount(len(cols))
+   self.table.setRowCount(len(head))
+   self.table.setHorizontalHeaderLabels([str(c) for c in cols])
+   nan_bg = QtGui.QBrush(QtGui.QColor("#ffe4e1"))
+   for r in range(len(head)):
+    for c in range(len(cols)):
+     v = head.iat[r, c]
+     missing = pd.isna(v)
+     it = QtWidgets.QTableWidgetItem("" if missing else str(v))
+     if missing:
+      it.setBackground(nan_bg)
+      it.setToolTip("欠損値（NaN）")
+     self.table.setItem(r, c, it)
+   for c, col in enumerate(cols):
+    s = df[col]
+    n_nan = int(s.isna().sum())
+    tip = [f"列: {col}", f"型: {s.dtype}", f"全 {len(s):,} 行"]
+    if n_nan:
+     tip.append(f"⚠ 欠損: {n_nan:,} 行（{n_nan / max(len(s), 1):.1%}）")
+    if pd.api.types.is_numeric_dtype(s):
+     v = s.dropna()
+     if len(v):
+      tip.append(f"範囲: {v.min():.6g} 〜 {v.max():.6g}")
+    hi = QtWidgets.QTableWidgetItem(("⚠ " if n_nan else "") + str(col))
+    hi.setToolTip("\n".join(tip))
+    self.table.setHorizontalHeaderItem(c, hi)
+   self.table.resizeColumnsToContents()
+   if label is not None:
+    self._preview_label = label
+  finally:
+   self._preview_loading = False
+ def _on_edit_toggle(self, on):
+  ET = QtWidgets.QAbstractItemView.EditTrigger
+  self.table.setEditTriggers( (ET.DoubleClicked | ET.EditKeyPressed | ET.AnyKeyPressed) if on else ET.NoEditTriggers)
+ def _on_cell_edited(self, item):
+  if self._preview_loading or not getattr(self, "_preview_label", None):
+   return
+  import pandas as pd
+  df = self.datasets.get(self._preview_label)
+  if df is None:
+   return
+  r, c = item.row(), item.column()
+  if r >= len(df) or c >= df.shape[1]:
+   return
+  col = df.columns[c]
+  text = item.text()
+  if pd.api.types.is_numeric_dtype(df[col]):
+   val = pd.to_numeric(text, errors="coerce")
+  else:
+   val = text
+  old = df.iat[r, c]
+  df.iat[r, c] = val
+  self._data_record({"kind": "cell", "label": self._preview_label, "row": r, "col": c, "old": old, "new": val})
+  self._set_status(f"編集: {self._preview_label} 行{r}「{col}」= {text}")
+  self._request_redraw()
+ def _edit_target(self):
+  lbl = getattr(self, "_preview_label", None)
+  if not lbl or lbl not in self.datasets:
+   self.notify("左の一覧でファイルを選択してください。", "warn")
+   return None
+  return lbl
+ def _row_add(self):
+  import numpy as np
+  lbl = self._edit_target()
+  if not lbl:
+   return
+  df = self.datasets[lbl]
+  df.loc[len(df)] = [np.nan] * df.shape[1]
+  df.reset_index(drop=True, inplace=True)
+  self._data_record({"kind": "row_add", "label": lbl})
+  self._populate_preview(df, label=lbl)
+  if len(df) > PREVIEW_ROWS:
+   self._set_status(f"行を追加（全{len(df)}行。表示は先頭{PREVIEW_ROWS}行）")
+  self._request_redraw()
+ def _row_del(self):
+  lbl = self._edit_target()
+  if not lbl:
+   return
+  rows = sorted({i.row() for i in self.table.selectedIndexes()})
+  if not rows:
+   self._set_status("削除する行を選択してください。")
+   return
+  df = self.datasets[lbl]
+  self._data_record({"kind": "row_del", "label": lbl, "rows": rows, "data": df.iloc[rows].copy()})
+  df.drop(df.index[rows], inplace=True)
+  df.reset_index(drop=True, inplace=True)
+  self._populate_preview(df, label=lbl)
+  self._request_redraw()
+ def _col_add(self):
+  lbl = self._edit_target()
+  if not lbl:
+   return
+  name, ok = QtWidgets.QInputDialog.getText(self, "列追加", "新しい列名:")
+  name = (name or "").strip()
+  if not ok or not name:
+   return
+  df = self.datasets[lbl]
+  if name in df.columns:
+   self.notify("同名の列が既にあります。", "warn")
+   return
+  df[name] = 0.0
+  self._data_record({"kind": "col_add", "label": lbl, "name": name})
+  self._populate_preview(df, label=lbl)
+  self._refresh_columns()
+  self._set_status(f"列「{name}」を追加（値0.0で初期化）")
+ def _data_record(self, op):
+  if not hasattr(self, "_data_hist"):
+   self._data_hist, self._data_hist_i = [], -1
+  del self._data_hist[self._data_hist_i + 1:]
+  self._data_hist.append(op)
+  if len(self._data_hist) > 100:
+   self._data_hist.pop(0)
+  self._data_hist_i = len(self._data_hist) - 1
+ def _data_undo(self):
+  hist = getattr(self, "_data_hist", None)
+  if not hist or self._data_hist_i < 0:
+   self._set_status("戻せるデータ編集はありません。")
+   return
+  op = hist[self._data_hist_i]
+  if self._data_apply(op, forward=False):
+   self._data_hist_i -= 1
+   self._set_status(f"データ編集を戻しました（{self._data_op_name(op)}）。")
+ def _data_redo(self):
+  hist = getattr(self, "_data_hist", None)
+  if not hist or self._data_hist_i >= len(hist) - 1:
+   self._set_status("やり直せるデータ編集はありません。")
+   return
+  op = hist[self._data_hist_i + 1]
+  if self._data_apply(op, forward=True):
+   self._data_hist_i += 1
+   self._set_status(f"データ編集をやり直しました（{self._data_op_name(op)}）。")
+ @staticmethod
+ def _data_op_name(op):
+  return {"cell": "セル編集", "row_add": "行追加", "row_del": "行削除", "col_add": "列追加"}.get(op["kind"], op["kind"])
+ def _data_apply(self, op, forward):
+  import pandas as pd
+  label = op["label"]
+  df = self.datasets.get(label)
+  if df is None:
+   self._set_status(f"対象ファイル「{label}」は読み込まれていません。")
+   return False
+  kind = op["kind"]
+  if kind == "cell":
+   r, c = op["row"], op["col"]
+   if r >= len(df) or c >= df.shape[1]:
+    return False
+   df.iat[r, c] = op["new"] if forward else op["old"]
+  elif kind == "row_add":
+   if forward:
+    import numpy as np
+    df.loc[len(df)] = [np.nan] * df.shape[1]
+    df.reset_index(drop=True, inplace=True)
+   else:
+    if not len(df):
+     return False
+    df.drop(df.index[-1], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+  elif kind == "row_del":
+   if forward:
+    df.drop(df.index[op["rows"]], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+   else:
+    parts, prev = [], 0
+    for j, r in enumerate(op["rows"]):
+     cut = r - j
+     parts.append(df.iloc[prev:cut])
+     parts.append(op["data"].iloc[[j]])
+     prev = cut
+    parts.append(df.iloc[prev:])
+    self.datasets[label] = pd.concat(parts, ignore_index=True)
+  elif kind == "col_add":
+   if forward:
+    self.datasets[label][op["name"]] = 0.0
+   else:
+    self.datasets[label].drop(columns=[op["name"]], inplace=True, errors="ignore")
+  df2 = self.datasets[label]
+  if getattr(self, "_preview_label", None) == label:
+   self._populate_preview(df2, label=label)
+  if kind == "col_add":
+   self._refresh_columns()
+  self._request_redraw()
+  return True
+ def _save_csv(self):
+  lbl = self._edit_target()
+  if not lbl:
+   return
+  default = lbl if lbl.lower().endswith((".csv", ".tsv")) else lbl + ".csv"
+  path, _ = QtWidgets.QFileDialog.getSaveFileName( self, "CSV/TSVとして保存", default, "CSV (*.csv);;TSV (*.tsv);;全てのファイル (*.*)")
+  if not path:
+   return
+  try:
+   sep = "\t" if path.lower().endswith(".tsv") else ","
+   self.datasets[lbl].to_csv(path, index=False, sep=sep, encoding="utf-8-sig")
+   self._set_status(f"保存しました: {path}（全{len(self.datasets[lbl])}行）")
+  except Exception as e:
+   QtWidgets.QMessageBox.critical(self, "保存エラー", str(e))
+ def _build_tab_data(self):
+  w = QtWidgets.QWidget()
+  v = QtWidgets.QVBoxLayout(w)
+  v.setContentsMargins(2, 2, 2, 2)
+  note = QtWidgets.QLabel("Y系列の選択は「読み込み済みファイル」ウィンドウで行います" "（表示メニューから再表示できます）。")
+  note.setWordWrap(True); note.setStyleSheet("color:#666;")
+  v.addWidget(note)
+  sec_axes = self._fmt_section("軸の選択（X・Z・3D）", "axes_sel", True)
+  v.addWidget(sec_axes)
+  av = QtWidgets.QVBoxLayout()
+  av.addWidget(QtWidgets.QLabel("X軸（横軸 / ラベル）"))
+  self.xleft_check = QtWidgets.QCheckBox("一番左の列をX軸にする（位置で固定）")
+  self.xleft_check.setToolTip( "ONにすると各ファイルの『一番左の列』をX軸に使います（列名が違っても適用）。\n" "複数ファイル／バッチ出力でX軸を固定したいときに便利。\n" "OFFなら下のコンボで列名を指定します。")
+  self.xleft_check.toggled.connect(self._on_xleft_toggled)
+  av.addWidget(self.xleft_check)
+  self.x_combo = QtWidgets.QComboBox()
+  self.x_combo.setToolTip("横軸に使う列（列名で指定）。波形なら時間列を選びます。")
+  self.x_combo.currentTextChanged.connect(self._on_x_changed)
+  av.addWidget(self.x_combo)
+  xrow = QtWidgets.QHBoxLayout()
+  self.swap_xy_check = QtWidgets.QCheckBox("X↔Y 入れ替え")
+  self.swap_xy_check.setToolTip("XとYを入れ替えて描く（軸の“向き反転”0→1↔1→0 とは別）。" "散布図・折れ線などの2D種別で有効。")
+  self.swap_xy_check.toggled.connect(self._request_redraw)
+  xrow.addWidget(self.swap_xy_check)
+  self.multix_check = QtWidgets.QCheckBox("X軸を複数選択")
+  self.multix_check.setToolTip("ONにすると下のリストでチェックした複数の列をXにし、" "各X×各Yの組み合わせを系列として描きます。")
+  self.multix_check.setEnabled(False)
+  self.multix_check.toggled.connect(self._on_multix_toggled)
+  xrow.addWidget(self.multix_check); xrow.addStretch(1)
+  av.addLayout(xrow)
+  self.x_list = CheckListWidget()
+  self.x_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+  self.x_list.setToolTip("『X軸を複数選択』ON時に、Xに使う列をチェックします。")
+  self.x_list.setStyleSheet("QListWidget::indicator { width:16px; height:16px; }")
+  self.x_list.setMaximumHeight(90)
+  self.x_list.itemChanged.connect(self._request_redraw)
+  self.x_list.setEnabled(False)
+  av.addWidget(self.x_list)
+  self.z_label = QtWidgets.QLabel("Z軸（3Dの奥行き）")
+  av.addWidget(self.z_label)
+  self.z_combo = QtWidgets.QComboBox()
+  self.z_combo.setToolTip("3Dグラフの奥行き（Z軸）に使う列。3D種別のときだけ有効になります。")
+  self.z_combo.currentTextChanged.connect(self._on_x_changed)
+  self.z_combo.setEnabled(False)
+  av.addWidget(self.z_combo)
+  self.threed_check = QtWidgets.QCheckBox("3D表示（Z軸を使う・ドラッグで回転）")
+  self.threed_check.setToolTip( "散布図・折れ線・棒でONにするとZ軸を使った3D描画になります。\n" "曲面は常に3Dです。3D対応でない種別では選べません（種別は書式パネルで選択）。")
+  self.threed_check.setEnabled(False)
+  self.threed_check.toggled.connect(self._on_3d_toggled)
+  av.addWidget(self.threed_check)
+  view = QtWidgets.QHBoxLayout()
+  view.addWidget(QtWidgets.QLabel("3D視点 仰角"))
+  self.elev_spin = QtWidgets.QSpinBox(); self.elev_spin.setRange(-90, 90)
+  self.elev_spin.setValue(30)
+  self.elev_spin.setToolTip("3Dグラフの仰角（上下の見おろし角）。ドラッグでも回転できます。")
+  self.elev_spin.valueChanged.connect(self._on_view_angle_changed)
+  view.addWidget(self.elev_spin)
+  view.addWidget(QtWidgets.QLabel("方位"))
+  self.azim_spin = QtWidgets.QSpinBox(); self.azim_spin.setRange(-180, 180)
+  self.azim_spin.setValue(-60)
+  self.azim_spin.setToolTip("3Dグラフの方位（左右の回転角）。ドラッグでも回転できます。")
+  self.azim_spin.valueChanged.connect(self._on_view_angle_changed)
+  view.addWidget(self.azim_spin)
+  view.addStretch(1)
+  self.elev_spin.setEnabled(False); self.azim_spin.setEnabled(False)
+  av.addLayout(view)
+  sec_axes.set_content_layout(av)
+  self.y_list = CheckListWidget()
+  self.y_list.setVisible(False)
+  self.y_list.itemChanged.connect(self._on_y_check_changed)
+  self.y_list.itemDoubleClicked.connect(self._on_y_double_clicked)
+  v.addStretch(1)
+  return w
+"""ScopeTabMixin: 「オシロ/解析」タブ（1タブ=1ファイル）。
+旧 scope_cursor.py（オシロ表示・カーソル・区間測定・パン/ズーム）と
+旧 analysis_peaks.py（ピーク検出・自動測定・FFT表示・全系列一括解析）を統合。
+共通の系列取り出し等は HostMixin（host.py）にあり、このタブはそれに依存する。
+"""
+class ScopeTabMixin:
+ def toggle_cursors(self, on):
+  if on and getattr(self, "gate_btn", None) and self.gate_btn.isChecked():
+   self.gate_btn.setChecked(False)
+  if on:
+   self._cursors = []
+   self._cursor_drag = None
+   self._cursor_text = None
+   self._clear_cursor_artists()
+   self._cursor_cid = ( self.canvas.mpl_connect("button_press_event", self._on_cursor_press), self.canvas.mpl_connect("motion_notify_event", self._on_cursor_motion), self.canvas.mpl_connect("button_release_event", self._on_cursor_release), )
+   self._set_status("カーソル: クリックで2本設置 → 線をドラッグで微調整（波形に追従）")
+  else:
+   if self._cursor_cid:
+    for c in self._cursor_cid:
+     self.canvas.mpl_disconnect(c)
+    self._cursor_cid = None
+   self._clear_cursor_artists()
+   self.canvas.draw_idle()
+ def _clear_cursor_artists(self):
+  for a in self._cursor_artists:
+   try:
+    a.remove()
+   except Exception:
+    get_logger().debug("_clear_cursor_artists: 無視した例外", exc_info=True)
+  self._cursor_artists = []
+  self._cursors = []
+  self._cursor_text = None
+ def _cursor_track_y(self, x):
+  if not self._plotted_artists:
+   return 0.0
+  try:
+   import numpy as np
+   line = self._plotted_artists[0][1]
+   xd = np.asarray(line.get_xdata(), float)
+   yd = np.asarray(line.get_ydata(), float)
+   order = np.argsort(xd)
+   return float(np.interp(x, xd[order], yd[order]))
+  except Exception:
+   return 0.0
+ def _add_cursor(self, x):
+  y = self._cursor_track_y(x)
+  vl = self.ax.axvline(x, color="#e6194b", lw=0.9, ls="--")
+  mk, = self.ax.plot([x], [y], "o", color="#e6194b", ms=6)
+  self._cursors.append({"x": x, "vline": vl, "marker": mk})
+  self._cursor_artists += [vl, mk]
+ def _cursor_near(self, event):
+  for i, c in enumerate(self._cursors):
+   try:
+    cx_px = self.ax.transData.transform((c["x"], 0))[0]
+    if abs(event.x - cx_px) < 8:
+     return i
+   except Exception:
+    get_logger().debug("_cursor_near: 無視した例外", exc_info=True)
+  return None
+ def _on_cursor_press(self, event):
+  if event.inaxes is not self.ax or event.xdata is None:
+   return
+  if getattr(self.ax, "name", None) == "3d":
+   return
+  near = self._cursor_near(event)
+  if near is not None:
+   self._cursor_drag = near
+   return
+  if len(self._cursors) >= 2:
+   self._clear_cursor_artists()
+  self._add_cursor(event.xdata)
+  self._update_cursor_readout()
+  self.canvas.draw_idle()
+ def _on_cursor_motion(self, event):
+  if self._cursor_drag is None or event.inaxes is not self.ax or event.xdata is None:
+   return
+  c = self._cursors[self._cursor_drag]
+  c["x"] = event.xdata
+  c["vline"].set_xdata([event.xdata, event.xdata])
+  c["marker"].set_data([event.xdata], [self._cursor_track_y(event.xdata)])
+  self._update_cursor_readout()
+  self.canvas.draw_idle()
+ def _on_cursor_release(self, event):
+  self._cursor_drag = None
+ def _update_cursor_readout(self):
+  if self._cursor_text is not None:
+   try:
+    self._cursor_text.remove()
+   except Exception:
+    get_logger().debug("_update_cursor_readout: 無視した例外", exc_info=True)
+   self._cursor_text = None
+  if len(self._cursors) == 2:
+   x1, x2 = self._cursors[0]["x"], self._cursors[1]["x"]
+   y1, y2 = self._cursor_track_y(x1), self._cursor_track_y(x2)
+   dt, dv = x2 - x1, y2 - y1
+   freq = (1.0 / dt) if dt else float("inf")
+   txt = (f"Δt={format_eng(abs(dt))}  ΔV={format_eng(abs(dv))}" f"  1/Δt={format_eng(abs(freq))}Hz")
+   self._cursor_text = self.ax.text( 0.5, 0.98, txt, transform=self.ax.transAxes, ha="center", va="top", color="#e6194b", fontsize=9, bbox=dict(facecolor="white", alpha=0.75, edgecolor="#e6194b"))
+   self._cursor_artists.append(self._cursor_text)
+   self._set_status("カーソル  " + txt)
+ def _scope_active(self):
+  return (self.scope_check.isChecked() and self.chart_combo.currentText() in ("折れ線", "散布図") and self._has_drawn and self._cursor_cid is None and not getattr(self.toolbar, "mode", ""))
+ def _scope_overlay(self, text):
+  self._remove_scope_overlay()
+  self._scope_ov = self.ax.text( 0.99, 0.02, text, transform=self.ax.transAxes, ha="right", va="bottom", color="#7CFC00", fontsize=11, bbox=dict(facecolor="black", alpha=0.65, edgecolor="#7CFC00"))
+ def _remove_scope_overlay(self):
+  if self._scope_ov is not None:
+   try:
+    self._scope_ov.remove()
+   except Exception:
+    get_logger().debug("_remove_scope_overlay: 無視した例外", exc_info=True)
+   self._scope_ov = None
+ def _shift_held(self, event=None):
+  try:
+   mods = QtWidgets.QApplication.keyboardModifiers()
+   if bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier):
+    return True
+  except Exception:
+   get_logger().debug("_shift_held: 無視した例外", exc_info=True)
+  return bool(event is not None and event.key and "shift" in str(event.key))
+ def _scope_on_press(self, event):
+  if (event.dblclick and event.button == 1 and event.inaxes is not None and event.inaxes in self.fig.axes and self._cursor_cid is None and not getattr(self.toolbar, "mode", "") and getattr(event.inaxes, "name", None) != "3d" and event.inaxes.get_label() != "<colorbar>" and getattr(self, "_has_drawn", False)):
+   self._autoscale_view()
+   return
+  if (not self._scope_active() or event.inaxes is not self.ax or event.button not in (1, 3) or event.x is None):
+   return
+  bbox = self.ax.get_window_extent()
+  self._scope_drag = { "button": event.button, "shift": self._shift_held(event), "px": (event.x, event.y), "xlim": self.ax.get_xlim(), "ylim": self.ax.get_ylim(), "tdiv": parse_eng(self.tdiv.currentText(), 1e-3) or 1e-3, "vdiv": parse_eng(self.vdiv.currentText(), 1.0) or 1.0, "w": max(bbox.width, 1.0), "h": max(bbox.height, 1.0), }
+ def _scope_on_motion(self, event):
+  d = self._scope_drag
+  if not d or event.x is None:
+   return
+  dxpx = event.x - d["px"][0]
+  dypx = event.y - d["px"][1]
+  xd, yd = self.xdivs.value(), self.ydivs.value()
+  if d["button"] == 1 and not d["shift"]:
+   x0, x1 = d["xlim"]; y0, y1 = d["ylim"]
+   dpx = (x1 - x0) / d["w"]; dpy = (y1 - y0) / d["h"]
+   nx0, nx1 = x0 - dxpx * dpx, x1 - dxpx * dpx
+   ny0, ny1 = y0 - dypx * dpy, y1 - dypx * dpy
+   self.ax.set_xlim(nx0, nx1); self.ax.set_ylim(ny0, ny1)
+   self._scope_overlay(f"位置  X中心={format_eng((nx0+nx1)/2)}  " f"Y中心={format_eng((ny0+ny1)/2)}")
+  else:
+   xc = (d["xlim"][0] + d["xlim"][1]) / 2
+   yc = (d["ylim"][0] + d["ylim"][1]) / 2
+   ntdiv = d["tdiv"] * (2 ** (dxpx / 150.0))
+   nvdiv = d["vdiv"] * (2 ** (-dypx / 150.0))
+   self.ax.set_xlim(xc - xd / 2 * ntdiv, xc + xd / 2 * ntdiv)
+   self.ax.set_ylim(yc - yd / 2 * nvdiv, yc + yd / 2 * nvdiv)
+   self._scope_overlay(f"{format_eng(ntdiv)}s/div   " f"{format_eng(nvdiv)}/div")
+  self.canvas.draw_idle()
+ def _scope_on_release(self, event):
+  if not self._scope_drag:
+   return
+  self._scope_drag = None
+  self._remove_scope_overlay()
+  x0, x1 = self.ax.get_xlim(); y0, y1 = self.ax.get_ylim()
+  xd, yd = self.xdivs.value(), self.ydivs.value()
+  self._suspend_redraw = True
+  self.xpos.setText(f"{(x0+x1)/2:.6g}"); self.ypos.setText(f"{(y0+y1)/2:.6g}")
+  self.tdiv.setCurrentText(format_eng((x1 - x0) / xd) + "s")
+  self.vdiv.setCurrentText(format_eng((y1 - y0) / yd))
+  self._suspend_redraw = False
+  self.draw_graph()
+ def _scope_on_scroll(self, event):
+  if event.inaxes is not self.ax:
+   return
+  if self._scope_active():
+   step = 0.8 if event.button == "up" else 1.25
+   self._suspend_redraw = True
+   if self._shift_held(event):
+    cur = parse_eng(self.vdiv.currentText(), 1.0) or 1.0
+    self.vdiv.setCurrentText(format_eng(cur * step))
+   else:
+    cur = parse_eng(self.tdiv.currentText(), 1e-3) or 1e-3
+    self.tdiv.setCurrentText(format_eng(cur * step) + "s")
+   self._suspend_redraw = False
+   self.draw_graph()
+   return
+  self._wheel_zoom(event)
+ def _wheel_zoom(self, event):
+  ax = event.inaxes if event.inaxes in self.fig.axes else self.ax
+  if (self._cursor_cid is not None or getattr(self.toolbar, "mode", "") or not getattr(self, "_has_drawn", False) or self.chart_combo.currentText() == "円" or getattr(ax, "name", None) == "3d" or ax.get_label() == "<colorbar>"):
+   return
+  factor = 0.8 if event.button == "up" else 1.25
+  x0, x1 = ax.get_xlim()
+  y0, y1 = ax.get_ylim()
+  xc = event.xdata if event.xdata is not None else (x0 + x1) / 2.0
+  yc = event.ydata if event.ydata is not None else (y0 + y1) / 2.0
+  xlog = ax.get_xscale() == "log"
+  ylog = ax.get_yscale() == "log"
+  ax.set_xlim(*self._zoom_pair(x0, x1, xc, factor, xlog))
+  if not self._shift_held(event):
+   ax.set_ylim(*self._zoom_pair(y0, y1, yc, factor, ylog))
+  self.canvas.draw_idle()
+ def toggle_gate(self, on):
+  if on:
+   if getattr(self.ax, "name", None) == "3d":
+    self._set_status("区間測定は2Dグラフで使えます（3D表示では無効）。")
+    self.gate_btn.setChecked(False)
+    return
+   if self.cursor_btn.isChecked():
+    self.cursor_btn.setChecked(False)
+   from matplotlib.widgets import SpanSelector
+   self._gate_span = SpanSelector( self.ax, self._on_gate_select, "horizontal", useblit=True, props=dict(alpha=0.2, facecolor="#2b6cb0"), interactive=True)
+   self._set_status("区間測定: グラフ上を横にドラッグしてX範囲を選ぶと、" "その区間だけの測定値を下の表に表示します。")
+  else:
+   sp = getattr(self, "_gate_span", None)
+   if sp is not None:
+    try:
+     sp.set_visible(False)
+     sp.disconnect_events()
+    except Exception:
+     get_logger().debug("toggle_gate: 無視した例外", exc_info=True)
+   self._gate_span = None
+   self.canvas.draw_idle()
+ def _regate(self):
+  if getattr(self, "gate_btn", None) and self.gate_btn.isChecked():
+   self.toggle_gate(False)
+   if getattr(self.ax, "name", None) == "3d":
+    self.gate_btn.setChecked(False)
+   else:
+    self.toggle_gate(True)
+ def _on_gate_select(self, x0, x1):
+  if x1 < x0:
+   x0, x1 = x1, x0
+  if x0 == x1:
+   return
+  self._run_gated_analysis(float(x0), float(x1))
+ def _autoscale_view(self):
+  if (self.scope_check.isChecked() and self.chart_combo.currentText() in ("折れ線", "散布図")):
+   self.auto_scale_scope()
+   return
+  self._suspend_redraw = True
+  for le in (self.xmin, self.xmax, self.ymin, self.ymax):
+   le.clear()
+  self._suspend_redraw = False
+  self.draw_graph()
+  self._set_status("全体表示に戻しました（ダブルクリックでいつでも戻れます）。")
+ def _hover_lines(self, ax):
+  axs = [ax]
+  twin = getattr(ax, "_twin_secondary", None)
+  if twin is not None:
+   axs.append(twin)
+  if ax is getattr(self.ax, "_twin_secondary", None):
+   axs.append(self.ax)
+  return [(str(ln.get_label()), ln) for a in axs for ln in a.get_lines() if not str(ln.get_label()).startswith("_") and "近似" not in str(ln.get_label())]
+ def _hover_values(self, ax, x_disp):
+  import numpy as np
+  out = []
+  for label, ln in self._hover_lines(ax):
+   try:
+    xd = np.asarray(ln.get_xdata(), float)
+    yd = np.asarray(ln.get_ydata(), float)
+   except (TypeError, ValueError):
+    continue
+   if xd.size == 0 or xd.size != yd.size:
+    continue
+   m = np.isfinite(xd) & np.isfinite(yd)
+   if not m.any():
+    continue
+   xs, ys = xd[m], yd[m]
+   i = int(np.argmin(np.abs(xs - x_disp)))
+   out.append((label, ln.get_color(), float(xs[i]), float(ys[i])))
+  return out
+ def _hover_readout(self, event):
+  lbl = getattr(self, "_hover_label", None)
+  if lbl is None:
+   return
+  ax = event.inaxes
+  if (ax is None or ax not in self.fig.axes or event.x is None or event.xdata is None or not getattr(self, "_has_drawn", False) or getattr(ax, "name", None) == "3d" or ax.get_label() == "<colorbar>" or self._scope_drag or self._cursor_drag is not None):
+   if lbl.text():
+    lbl.setText("")
+   self._hide_hover_ui()
+   return
+  import time
+  now = time.monotonic()
+  if now - getattr(self, "_hover_t", 0.0) < 0.05:
+   return
+  self._hover_t = now
+  import numpy as np
+  vals = self._hover_values(ax, float(event.xdata))
+  best = None
+  for label, _c, x, y in vals:
+   pt = ax.transData.transform([[x, y]])[0]
+   d2 = (pt[0] - event.x) ** 2 + (pt[1] - event.y) ** 2
+   if best is None or d2 < best[0]:
+    best = (d2, label, x, y)
+  if best is not None and best[0] <= 20.0 ** 2:
+   _, label, x, y = best
+   lbl.setText(f"{label}:  X={format_eng(x)}  Y={format_eng(y)}  ")
+  elif lbl.text():
+   lbl.setText("")
+  if vals:
+   rows = [f"<b>X = {format_eng(float(event.xdata))}</b>"]
+   for label, color, _x, y in vals[:12]:
+    rows.append(f"<span style='color:{color}'>■</span> " f"{label}: <b>{format_eng(y)}</b>")
+   if len(vals) > 12:
+    rows.append(f"…他 {len(vals) - 12} 系列")
+   QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "<br>".join(rows), self.canvas)
+  else:
+   QtWidgets.QToolTip.hideText()
+  self._draw_crosshair(ax, event.xdata, event.ydata)
+ def _hide_hover_ui(self):
+  QtWidgets.QToolTip.hideText()
+  if getattr(self, "_xhair_bg", None) is None:
+   return
+  size = (int(self.fig.bbox.width), int(self.fig.bbox.height), self.canvas.width(), self.canvas.height())
+  if getattr(self, "_xhair_size", None) != size or getattr(self, "_drawing", False):
+   self._xhair_bg = None
+   return
+  try:
+   self.canvas.restore_region(self._xhair_bg)
+   self.canvas.blit(self.fig.bbox)
+  except Exception:
+   get_logger().debug("_hide_hover_ui: 無視した例外", exc_info=True)
+  self._xhair_bg = None
+ def _invalidate_crosshair(self, *_):
+  self._xhair_bg = None
+ def _draw_crosshair(self, ax, x, y):
+  if (x is None or y is None or (getattr(self, "gate_btn", None) and self.gate_btn.isChecked()) or self._cursor_cid is not None or getattr(self.toolbar, "mode", "")):
+   return
+  xh = getattr(self, "_xhair", None)
+  if not xh or xh[0].axes is not ax:
+   if xh:
+    for a in xh:
+     try:
+      a.remove()
+     except Exception:
+      get_logger().debug("_draw_crosshair: 無視した例外", exc_info=True)
+   v = ax.axvline(x, color="#888", lw=0.7, ls="--", animated=True, zorder=30)
+   h = ax.axhline(y, color="#888", lw=0.7, ls="--", animated=True, zorder=30)
+   self._xhair = (v, h)
+   self._xhair_bg = None
+  size = (int(self.fig.bbox.width), int(self.fig.bbox.height), self.canvas.width(), self.canvas.height())
+  if getattr(self, "_xhair_size", None) != size:
+   self._xhair_bg = None
+  if getattr(self, "_drawing", False):
+   return
+  try:
+   if getattr(self, "_xhair_bg", None) is None:
+    self._xhair_bg = self.canvas.copy_from_bbox(self.fig.bbox)
+    self._xhair_size = size
+   self.canvas.restore_region(self._xhair_bg)
+   self._xhair[0].set_xdata([x, x])
+   self._xhair[1].set_ydata([y, y])
+   ax.draw_artist(self._xhair[0])
+   ax.draw_artist(self._xhair[1])
+   self.canvas.blit(self.fig.bbox)
+  except Exception:
+   self._xhair_bg = None
+ @staticmethod
+ def _zoom_pair(lo, hi, center, factor, log=False):
+  import numpy as np
+  if log and lo > 0 and hi > 0 and center > 0:
+   l0, l1, lc = np.log10(lo), np.log10(hi), np.log10(center)
+   return 10.0 ** (lc - (lc - l0) * factor), 10.0 ** (lc + (l1 - lc) * factor)
+  return center - (center - lo) * factor, center + (hi - center) * factor
+ def auto_scale_scope(self):
+  import numpy as np
+  import pandas as pd
+  items = self._selected_series_items()
+  if not items:
+   self.notify("データタブでY系列を選択してください。", "warn")
+   return
+  xname = self.x_combo.currentText()
+  xspec = self.xscale_edit.text()
+  yspec = self.yscale_edit.text()
+  tmins, tmaxs, ymins, ymaxs = [], [], [], []
+  for fl, col, _ in items:
+   df = self.datasets[fl]
+   raw = df[xname].to_numpy() if xname in df.columns else df.iloc[:, 0].to_numpy()
+   tt = pd.to_numeric(pd.Series(raw), errors="coerce").to_numpy(dtype=float)
+   if np.isnan(tt).mean() > 0.5:
+    tt = np.arange(len(tt), dtype=float)
+   yy = pd.to_numeric(pd.Series(df[col].to_numpy()), errors="coerce").to_numpy(dtype=float)
+   tt = axis_scale(tt, xspec)
+   yy = axis_scale(yy, yspec)
+   tt, yy = tt[np.isfinite(tt)], yy[np.isfinite(yy)]
+   if tt.size:
+    tmins.append(tt.min()); tmaxs.append(tt.max())
+   if yy.size:
+    ymins.append(yy.min()); ymaxs.append(yy.max())
+  if not tmins or not ymins:
+   self.notify("数値データがありません。", "warn")
+   return
+  tmin, tmax = min(tmins), max(tmaxs)
+  ymin, ymax = min(ymins), max(ymaxs)
+  xd, yd = self.xdivs.value(), self.ydivs.value()
+  tpd = (tmax - tmin) / xd if tmax > tmin else 1e-3
+  vpd = (ymax - ymin) / (yd - 1) if ymax > ymin else 1.0
+  self._suspend_redraw = True
+  self.tdiv.setCurrentText(format_eng(tpd) + "s")
+  self.vdiv.setCurrentText(format_eng(vpd))
+  self.xpos.setText(f"{(tmin+tmax)/2:.4g}"); self.ypos.setText(f"{(ymin+ymax)/2:.4g}")
+  self.scope_check.setChecked(True)
+  self._suspend_redraw = False
+  self.draw_graph()
+ def _build_tab_scope(self):
+  w = QtWidgets.QWidget()
+  v = QtWidgets.QVBoxLayout(w)
+  self.scope_check = QtWidgets.QCheckBox("オシロスコープ表示（折れ線/散布図）")
+  v.addWidget(self.scope_check)
+  g = QtWidgets.QGridLayout()
+  g.addWidget(QtWidgets.QLabel("time/div [s]"), 0, 0)
+  self.tdiv = QtWidgets.QComboBox(); self.tdiv.setEditable(True)
+  self.tdiv.addItems(eng_125_sequence(1e-9, 1.0, "s"))
+  self.tdiv.setCurrentText("1ms")
+  g.addWidget(self.tdiv, 0, 1)
+  g.addWidget(QtWidgets.QLabel("V/div"), 0, 2)
+  self.vdiv = QtWidgets.QComboBox(); self.vdiv.setEditable(True)
+  self.vdiv.addItems(eng_125_sequence(1e-3, 100.0, ""))
+  self.vdiv.setCurrentText("500m")
+  g.addWidget(self.vdiv, 0, 3)
+  g.addWidget(QtWidgets.QLabel("X位置(中心)"), 1, 0)
+  self.xpos = QtWidgets.QLineEdit("0"); g.addWidget(self.xpos, 1, 1)
+  g.addWidget(QtWidgets.QLabel("Y位置(中心)"), 1, 2)
+  self.ypos = QtWidgets.QLineEdit("0"); g.addWidget(self.ypos, 1, 3)
+  g.addWidget(QtWidgets.QLabel("X div数"), 2, 0)
+  self.xdivs = QtWidgets.QSpinBox(); self.xdivs.setRange(2, 20); self.xdivs.setValue(10)
+  g.addWidget(self.xdivs, 2, 1)
+  g.addWidget(QtWidgets.QLabel("Y div数"), 2, 2)
+  self.ydivs = QtWidgets.QSpinBox(); self.ydivs.setRange(2, 20); self.ydivs.setValue(8)
+  g.addWidget(self.ydivs, 2, 3)
+  v.addLayout(g)
+  b_auto = QtWidgets.QPushButton("自動スケール（解析対象に合わせる）")
+  b_auto.clicked.connect(self.auto_scale_scope)
+  v.addWidget(b_auto)
+  scope_hint = QtWidgets.QLabel( "💡 オシロ表示中はグラフを直接操作可：左ドラッグ=位置移動／右ドラッグ=time/V/div／" "ホイール=time/div・Shift+ホイール=V/div（ドラッグ中は数値を表示）")
+  scope_hint.setWordWrap(True); scope_hint.setStyleSheet("color:#0a7a55; font-size:11px;")
+  v.addWidget(scope_hint)
+  v.addWidget(self._hline())
+  row = QtWidgets.QHBoxLayout()
+  row.addWidget(QtWidgets.QLabel("解析対象:"))
+  self.analysis_target = QtWidgets.QComboBox()
+  row.addWidget(self.analysis_target, 1)
+  v.addLayout(row)
+  row2 = QtWidgets.QHBoxLayout()
+  row2.addWidget(QtWidgets.QLabel("ピーク数 N:"))
+  self.npeaks = QtWidgets.QSpinBox(); self.npeaks.setRange(1, 50); self.npeaks.setValue(5)
+  row2.addWidget(self.npeaks)
+  row2.addWidget(QtWidgets.QLabel("平滑化(点):"))
+  self.smooth_spin = QtWidgets.QSpinBox(); self.smooth_spin.setRange(0, 501)
+  self.smooth_spin.setSingleStep(2); self.smooth_spin.setValue(0)
+  self.smooth_spin.setToolTip("ノイズの多い実測データで偽ピークを抑える。0=平滑化なし。窓の点数（奇数推奨）。")
+  row2.addWidget(self.smooth_spin); row2.addStretch(1)
+  v.addLayout(row2)
+  self.show_peaks_check = QtWidgets.QCheckBox("ピークをグラフに表示"); self.show_peaks_check.setChecked(False)
+  v.addWidget(self.show_peaks_check)
+  self.window_meas_check = QtWidgets.QCheckBox("表示範囲のみ測定（ズーム/オシロ窓に追従）")
+  self.window_meas_check.setToolTip("オンにすると、画面に見えているX範囲だけを対象に解析します。")
+  v.addWidget(self.window_meas_check)
+  b_an = QtWidgets.QPushButton("解析実行"); b_an.clicked.connect(self.run_analysis)
+  b_an.setToolTip("解析対象コンボで選んだ1系列のピーク・測定を下の表に表示")
+  b_all = QtWidgets.QPushButton("全系列を解析…")
+  b_all.setToolTip("選択中の全系列のピーク・測定を別ウィンドウに一覧表示（CSV保存可）")
+  b_all.clicked.connect(self.analyze_all_series)
+  b_fft = QtWidgets.QPushButton("FFT表示"); b_fft.clicked.connect(self.show_fft)
+  b_fft.setToolTip("FFTスペクトル表示：選択中の全系列のFFTを1枚に重ね描き（系列ごとに色分け）")
+  b_cur = QtWidgets.QPushButton("カーソル測定"); b_cur.setCheckable(True)
+  b_cur.setToolTip("グラフを2回クリックして Δt・ΔV・1/Δt を測ります")
+  b_cur.toggled.connect(self.toggle_cursors)
+  self.cursor_btn = b_cur
+  brow = QtWidgets.QHBoxLayout()
+  brow.addWidget(b_an); brow.addWidget(b_all); brow.addWidget(b_fft)
+  v.addLayout(brow)
+  b_gate = QtWidgets.QPushButton("区間測定")
+  b_gate.setCheckable(True)
+  b_gate.setToolTip("ONにしてグラフ上を横にドラッグすると、選んだX区間だけの\n" "測定値（平均/RMS/周期など）を下の表に表示します。")
+  b_gate.toggled.connect(self.toggle_gate)
+  self.gate_btn = b_gate
+  brow2 = QtWidgets.QHBoxLayout()
+  brow2.addWidget(b_cur); brow2.addWidget(b_gate)
+  v.addLayout(brow2)
+  v.addWidget(self._bold("ピーク（第1=最大）"))
+  self.peak_table = QtWidgets.QTableWidget(0, 3)
+  self.peak_table.setHorizontalHeaderLabels(["順位", "時間/周波数", "値"])
+  self.peak_table.horizontalHeader().setStretchLastSection(True)
+  self.peak_table.setMaximumHeight(160)
+  self._wire_table_export(self.peak_table, "ピーク")
+  v.addWidget(self.peak_table)
+  v.addWidget(self._bold("測定値（右端「表示」でグラフに注記）"))
+  self.meas_table = QtWidgets.QTableWidget(0, 3)
+  self.meas_table.setHorizontalHeaderLabels(["項目", "値", "表示"])
+  mh = self.meas_table.horizontalHeader()
+  mh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+  mh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+  mh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+  self.meas_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+  self._wire_table_export(self.meas_table, "測定値")
+  v.addWidget(self.meas_table, 1)
+  srow = QtWidgets.QHBoxLayout()
+  b_stat = QtWidgets.QPushButton("サイクル統計"); b_stat.clicked.connect(self.show_cycle_stats)
+  b_trend = QtWidgets.QPushButton("トレンド表示"); b_trend.clicked.connect(self.show_trend)
+  b_pstat = QtWidgets.QPushButton("パラメータ統計…")
+  b_pstat.setToolTip("サイクルごとの統計（平均/最大/最小/σ）とパラメータ間演算を別ウィンドウで表示")
+  b_pstat.clicked.connect(self.show_param_stats)
+  srow.addWidget(b_stat); srow.addWidget(b_trend); srow.addWidget(b_pstat)
+  v.addLayout(srow)
+  prow = QtWidgets.QHBoxLayout()
+  prow.addWidget(QtWidgets.QLabel("位相差 対象2:"))
+  self.phase_target2 = QtWidgets.QComboBox(); prow.addWidget(self.phase_target2, 1)
+  b_phase = QtWidgets.QPushButton("位相差/遅延"); b_phase.clicked.connect(self.show_phase)
+  prow.addWidget(b_phase)
+  v.addLayout(prow)
+  return w
+ def _peak_markers(self):
+  if self.chart_combo.currentText() not in ("折れ線", "散布図"):
+   return None
+  t, y, _ = self._analysis_xy()
+  if t is None:
+   return None
+  try:
+   peaks = find_signal_peaks(y, t=t, n=self.npeaks.value(), smooth=self.smooth_spin.value())
+  except Exception:
+   return None
+  xspec, yspec = self.xscale_edit.text(), self.yscale_edit.text()
+  out = []
+  for p in peaks:
+   if p["time"] is None:
+    continue
+   out.append({"x": float(axis_scale([p["time"]], xspec)[0]), "y": float(axis_scale([p["value"]], yspec)[0]), "text": f"第{p['rank']}", "color": "#ff3030"})
+  return out
+ def run_analysis(self):
+  got = self.analysis_xy_or_warn()
+  if got is None:
+   return
+  t, y, label = got
+  import numpy as np
+  y = np.asarray(y, float)
+  res = analyze(t, y, n_peaks=self.npeaks.value(), smooth=self.smooth_spin.value())
+  self._show_analysis_result(res, f"解析しました: {label}")
+ def _run_gated_analysis(self, x0, x1):
+  import numpy as np
+  t, y, label = self._analysis_xy()
+  if t is None:
+   self._set_status("区間測定: 『オシロ/解析』の解析対象で系列を選択してください。")
+   return
+  t = np.asarray(t, float)
+  t_disp = axis_scale(t, self.xscale_edit.text())
+  mask = (t_disp >= x0) & (t_disp <= x1)
+  if int(mask.sum()) < 3:
+   self._set_status("区間測定: 選択した区間のデータ点が少なすぎます（3点以上必要）。")
+   return
+  res = analyze(t[mask], np.asarray(y, float)[mask], n_peaks=self.npeaks.value(), smooth=self.smooth_spin.value())
+  self._show_analysis_result( res, f"区間測定 [{format_eng(x0)} 〜 {format_eng(x1)}]: " f"{label}（{int(mask.sum()):,}点）", redraw_ok=False)
+ def _show_analysis_result(self, res, status, redraw_ok=True):
+  self.peak_table.setRowCount(len(res["peaks"]))
+  for r, p in enumerate(res["peaks"]):
+   self.peak_table.setItem(r, 0, QtWidgets.QTableWidgetItem(f"第{p['rank']}"))
+   tv = "-" if p["time"] is None else f"{p['time']*1e3:.4g} ms"
+   self.peak_table.setItem(r, 1, QtWidgets.QTableWidgetItem(tv))
+   self.peak_table.setItem(r, 2, QtWidgets.QTableWidgetItem(f"{p['value']:.4g}"))
+  rows = res["measurements"]
+  had_ann = bool(getattr(self, "_meas_annotations", None))
+  self._meas_annotations = []
+  self.meas_table.setRowCount(len(rows))
+  for r, m in enumerate(rows):
+   val = m["value"]
+   txt = "-" if val is None else f"{val:.6g} {m['unit']}"
+   self.meas_table.setItem(r, 0, QtWidgets.QTableWidgetItem(m["name"]))
+   self.meas_table.setItem(r, 1, QtWidgets.QTableWidgetItem(txt))
+   cb = QtWidgets.QCheckBox()
+   cb.setToolTip("チェックすると、この測定値をグラフ上に注記表示します。")
+   cb.toggled.connect(self._refresh_meas_annotations)
+   self.meas_table.setCellWidget(r, 2, cb)
+  if redraw_ok and (self.show_peaks_check.isChecked() or had_ann):
+   self.draw_graph()
+  self._set_status(status)
+ def _refresh_meas_annotations(self, *_):
+  anns = []
+  for r in range(self.meas_table.rowCount()):
+   cb = self.meas_table.cellWidget(r, 2)
+   if cb is not None and cb.isChecked():
+    k = self.meas_table.item(r, 0)
+    val = self.meas_table.item(r, 1)
+    if k is not None and val is not None:
+     anns.append(f"{k.text()} = {val.text()}")
+  self._meas_annotations = anns
+  if self.datasets:
+   self.draw_graph()
+ def show_fft(self):
+  items = self._selected_series_items()
+  if not items:
+   self.notify("解析する系列を選択してください。", "warn")
+   return
+  import numpy as np
+  win = self.fft_window.currentText() if hasattr(self, "fft_window") else "hann"
+  use_db = hasattr(self, "fft_db") and self.fft_db.isChecked()
+  ylab = "振幅 [dBV]" if use_db else "振幅"
+  series, markers, drawn = [], [], 0
+  for idx, (fl, col, disp) in enumerate(items):
+   t, y = self._xy_for(fl, col)
+   if t is None or len(np.asarray(y)) < 4:
+    continue
+   freqs, amp = fft_spectrum(t, np.asarray(y, float), window=win)
+   if freqs is None:
+    continue
+   color = (self.series_styles.get(self._style_key(fl, col)) or {}).get("color") \
+                or f"C{idx % 10}"
+   disp_amp = to_db(amp) if use_db else amp
+   series.append({"label": f"FFT: {disp}", "x": freqs, "y": disp_amp, "style": {"color": color, "linewidth": 1.0}})
+   for p in find_spectral_peaks(t, np.asarray(y, float), n=self.npeaks.value()):
+    yv = to_db(np.array([p["amplitude"]]))[0] if use_db else p["amplitude"]
+    markers.append({"x": p["frequency"], "y": yv, "text": f"{p['frequency']:.0f}Hz", "color": color})
+   drawn += 1
+  if drawn == 0:
+   self.notify("FFT を計算できませんでした。", "warn")
+   return
+  self._ensure_axes_projection(False)
+  self._reset_figure_axes()
+  plot_series( self.ax, series, "折れ線", title=f"FFTスペクトル（{win}窓・{drawn}系列）", xlabel="周波数 [Hz]", ylabel=ylab, grid=True, legend=(drawn > 1), markers=markers, fonts=self._fonts())
+  self._apply_aspect()
+  try:
+   self.fig.tight_layout()
+  except Exception:
+   get_logger().debug("show_fft: 無視した例外", exc_info=True)
+  self.canvas.draw()
+  self._set_status(f"FFT表示: {drawn}系列を重ね描き")
+ def analyze_all_series(self):
+  items = self._selected_series_items()
+  if not items:
+   self.notify("解析する系列を選択してください。", "warn")
+   return
+  import numpy as np
+  peak_rows, meas_rows = [], []
+  for fl, col, disp in items:
+   t, y = self._xy_for(fl, col)
+   if t is None or len(np.asarray(y)) < 2:
+    continue
+   r = analyze(t, np.asarray(y, float), n_peaks=self.npeaks.value(), smooth=self.smooth_spin.value())
+   for p in r["peaks"]:
+    tv = None if p["time"] is None else p["time"] * 1e3
+    peak_rows.append((disp, f"第{p['rank']}", tv, p["value"]))
+   for m in r["measurements"]:
+    meas_rows.append((disp, m["name"], m["value"], m["unit"]))
+  if not peak_rows and not meas_rows:
+   self.notify("解析できる系列がありません。", "warn")
+   return
+  self._show_analysis_window(peak_rows, meas_rows)
+ def _show_analysis_window(self, peak_rows, meas_rows):
+  dlg = QtWidgets.QDialog(self)
+  dlg.setWindowTitle("全系列の解析結果")
+  dlg.resize(760, 600)
+  lay = QtWidgets.QVBoxLayout(dlg)
+  no_edit = QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+  lay.addWidget(QtWidgets.QLabel("■ ピーク（系列ごと）"))
+  pk = QtWidgets.QTableWidget(len(peak_rows), 4)
+  pk.setHorizontalHeaderLabels(["系列", "順位", "時刻", "値"])
+  pk.setEditTriggers(no_edit)
+  for r, (s, rank, tv, val) in enumerate(peak_rows):
+   pk.setItem(r, 0, QtWidgets.QTableWidgetItem(str(s)))
+   pk.setItem(r, 1, QtWidgets.QTableWidgetItem(str(rank)))
+   pk.setItem(r, 2, QtWidgets.QTableWidgetItem("-" if tv is None else f"{tv:.4g} ms"))
+   pk.setItem(r, 3, QtWidgets.QTableWidgetItem(f"{val:.6g}"))
+  pk.resizeColumnsToContents()
+  self._wire_table_export(pk, "全系列ピーク")
+  lay.addWidget(pk)
+  lay.addWidget(QtWidgets.QLabel("■ 測定（系列ごと）"))
+  ms = QtWidgets.QTableWidget(len(meas_rows), 4)
+  ms.setHorizontalHeaderLabels(["系列", "項目", "値", "単位"])
+  ms.setEditTriggers(no_edit)
+  for r, (s, name, val, unit) in enumerate(meas_rows):
+   ms.setItem(r, 0, QtWidgets.QTableWidgetItem(str(s)))
+   ms.setItem(r, 1, QtWidgets.QTableWidgetItem(str(name)))
+   ms.setItem(r, 2, QtWidgets.QTableWidgetItem("-" if val is None else f"{val:.6g}"))
+   ms.setItem(r, 3, QtWidgets.QTableWidgetItem(str(unit)))
+  ms.resizeColumnsToContents()
+  self._wire_table_export(ms, "全系列測定")
+  lay.addWidget(ms, 1)
+  brow = QtWidgets.QHBoxLayout()
+  b_save = QtWidgets.QPushButton("CSVで保存…")
+  b_save.clicked.connect(lambda: self._save_analysis_csv(peak_rows, meas_rows))
+  b_close = QtWidgets.QPushButton("閉じる")
+  b_close.clicked.connect(dlg.close)
+  brow.addStretch(1); brow.addWidget(b_save); brow.addWidget(b_close)
+  lay.addLayout(brow)
+  self._analysis_window = dlg
+  dlg.show()
+ def _save_analysis_csv(self, peak_rows, meas_rows):
+  path, _ = QtWidgets.QFileDialog.getSaveFileName( self, "解析結果をCSVで保存", self.last_dir, "CSV (*.csv)")
+  if not path:
+   return
+  import csv
+  try:
+   with open(path, "w", newline="", encoding="utf-8-sig") as f:
+    w = csv.writer(f)
+    w.writerow(["# ピーク"])
+    w.writerow(["系列", "順位", "時刻[ms]", "値"])
+    for s, rank, tv, val in peak_rows:
+     w.writerow([s, rank, "" if tv is None else f"{tv:.6g}", f"{val:.6g}"])
+    w.writerow([])
+    w.writerow(["# 測定"])
+    w.writerow(["系列", "項目", "値", "単位"])
+    for s, name, val, unit in meas_rows:
+     w.writerow([s, name, "" if val is None else f"{val:.6g}", unit])
+   self.last_dir = os.path.dirname(path)
+   self._set_status(f"解析結果を保存しました: {path}")
+  except Exception as e:
+   QtWidgets.QMessageBox.critical(self, "保存エラー", str(e))
+"""AdvancedMixin: GraphApp から分離した AdvancedMixin 群（挙動は本体と同一）。"""
+class AdvancedMixin:
+ def _on_math_op_change(self, op):
+  binary = op in BINARY_OPS
+  self.math_b.setEnabled(binary); self.math_b_label.setEnabled(binary)
+  needs_param = op in ("移動平均", "ローパス(RC)", "ローパス(Butterworth)", "ハイパス(Butterworth)")
+  self.math_param.setEnabled(needs_param); self.math_param_label.setEnabled(needs_param)
+ def create_math_channel(self):
+  op = self.math_op.currentText()
+  ta, ya = self._xy_by_disp(self.math_a.currentText())
+  if ta is None:
+   self.notify("演算対象Aをデータタブで選択してください。", "warn")
+   return
+  try:
+   if op in BINARY_OPS:
+    tb, yb = self._xy_by_disp(self.math_b.currentText())
+    if tb is None:
+     self.notify("演算対象Bを選択してください。", "warn")
+     return
+    x, r = binary(ta, ya, tb, yb, op)
+   else:
+    param = parse_eng(self.math_param.text(), None)
+    x, r = unary(ta, ya, op, param)
+  except Exception as e:
+   QtWidgets.QMessageBox.critical(self, "演算エラー", str(e)); return
+  import pandas as pd
+  col = f"{op}"
+  self.register_dataset(f"Math: {op}", pd.DataFrame({"時間[s]": x, col: r}), status=f"数学チャンネルを作成: {{label}} ▸ {col}")
+ def create_math_expr(self):
+  import numpy as np
+  import pandas as pd
+  expr = self.math_expr.text().strip()
+  if not expr:
+   self.notify("数式を入力してください。", "warn")
+   return
+  ta, ya = self._xy_by_disp(self.math_a.currentText())
+  if ta is None:
+   self.notify("変数Aの系列をデータタブで選択してください。", "warn")
+   return
+  variables = {"A": ya, "t": ta, "VAR1": parse_eng(self.math_var1.text(), 0.0) or 0.0, "VAR2": parse_eng(self.math_var2.text(), 0.0) or 0.0}
+  tb, yb = self._xy_by_disp(self.math_b.currentText())
+  if tb is not None and yb is not None:
+   variables["B"] = yb if len(yb) == len(ya) else np.interp(ta, tb, yb)
+  try:
+   r = eval_expr(expr, variables)
+   r = np.broadcast_to(np.asarray(r, dtype=float), ya.shape).astype(float)
+  except Exception as e:
+   QtWidgets.QMessageBox.critical(self, "数式エラー", str(e))
+   return
+  self.register_dataset(f"Expr: {expr[:24]}", pd.DataFrame({"時間[s]": ta, "結果": r}), status="数式チャンネルを作成: {label}")
+ def show_param_stats(self):
+  import numpy as np
+  got = self.analysis_xy_or_warn()
+  if got is None:
+   return
+  t, y, label = got
+  yv = np.asarray(y, float)
+  self._show_param_stats_window(label, cycle_statistics(t, yv), measurements(t, yv))
+ def _show_param_stats_window(self, label, stats, meas):
+  dlg = QtWidgets.QDialog(self)
+  dlg.setWindowTitle(f"パラメータ統計: {label}")
+  dlg.resize(700, 560)
+  lay = QtWidgets.QVBoxLayout(dlg)
+  no_edit = QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+  lay.addWidget(QtWidgets.QLabel("■ サイクル統計（周期ごとに測り、平均/最大/最小/σ で集計）"))
+  tb = QtWidgets.QTableWidget(len(stats), 6)
+  tb.setEditTriggers(no_edit)
+  tb.setHorizontalHeaderLabels(["パラメータ", "平均", "最大", "最小", "σ", "数"])
+  for r, (pname, s) in enumerate(stats.items()):
+   tb.setItem(r, 0, QtWidgets.QTableWidgetItem(str(pname)))
+   for c, k in enumerate(["mean", "max", "min", "std"], start=1):
+    v = s.get(k)
+    tb.setItem(r, c, QtWidgets.QTableWidgetItem("-" if v is None else f"{v:.5g}"))
+   tb.setItem(r, 5, QtWidgets.QTableWidgetItem(str(s.get("count", 0))))
+  tb.resizeColumnsToContents()
+  lay.addWidget(tb)
+  lay.addWidget(QtWidgets.QLabel("■ パラメータ間演算（測定値どうしを四則）"))
+  vals = {m["name"]: m["value"] for m in meas if m["value"] is not None}
+  names = list(vals.keys())
+  prow = QtWidgets.QHBoxLayout()
+  ca = QtWidgets.QComboBox(); ca.addItems(names)
+  op = QtWidgets.QComboBox(); op.addItems(["+", "-", "×", "÷"])
+  cb = QtWidgets.QComboBox(); cb.addItems(names)
+  out = QtWidgets.QLabel("= ?")
+  def compute():
+   a = vals.get(ca.currentText()); b = vals.get(cb.currentText())
+   o = op.currentText()
+   try:
+    r = {"+": a + b, "-": a - b, "×": a * b, "÷": (a / b if b else float("nan"))}[o]
+    out.setText(f"= {r:.6g}")
+   except Exception:
+    out.setText("= -")
+  bcalc = QtWidgets.QPushButton("計算"); bcalc.clicked.connect(compute)
+  prow.addWidget(ca); prow.addWidget(op); prow.addWidget(cb)
+  prow.addWidget(bcalc); prow.addWidget(out, 1)
+  lay.addLayout(prow)
+  bclose = QtWidgets.QPushButton("閉じる"); bclose.clicked.connect(dlg.close)
+  lay.addWidget(bclose)
+  self._param_stats_window = dlg
+  dlg.show()
+ def compute_fft_metrics(self):
+  import numpy as np
+  got = self.analysis_xy_or_warn()
+  if got is None:
+   return
+  t, y, label = got
+  win = self.fft_window.currentText()
+  yv = np.asarray(y, float)
+  m = spectrum_metrics(t, yv, window=win)
+  rows = [ ("基本波 f0", m.get("f0"), "Hz"), ("THD", m.get("THD_pct"), "%"), ("THD", m.get("THD_dB"), "dB"), ("SNR", m.get("SNR_dB"), "dB"), ("SINAD", m.get("SINAD_dB"), "dB"), ("ENOB", m.get("ENOB_bits"), "bit"), ("SFDR", m.get("SFDR_dB"), "dB"), ("占有帯域幅(99%)", occupied_bandwidth(t, yv, window=win), "Hz"), ("チャネル電力(全)", channel_power(t, yv, window=win), "V²"), ]
+  for h in harmonic_search(t, yv, n_harm=5, window=win):
+   rows.append((f"第{h['harmonic']}高調波", h["frequency"], "Hz"))
+  self.fft_metrics.setRowCount(len(rows))
+  for r, (name, val, unit) in enumerate(rows):
+   self.fft_metrics.setItem(r, 0, QtWidgets.QTableWidgetItem(name))
+   txt = "-" if val is None else f"{val:.4g} {unit}"
+   self.fft_metrics.setItem(r, 1, QtWidgets.QTableWidgetItem(txt))
+  self._set_status(f"スペクトル指標を計算: {label}")
+ def show_spectrogram(self):
+  import numpy as np
+  got = self.analysis_xy_or_warn()
+  if got is None:
+   return
+  t, y, label = got
+  f, tt, S = spectrogram(t, np.asarray(y, float), window=self.fft_window.currentText())
+  if S is None:
+   self.notify("計算できませんでした。", "warn")
+   return
+  self.prepare_view_axes()
+  mesh = self.ax.pcolormesh(tt, f, S, shading="auto", cmap="viridis")
+  self.ax.set_xlabel("時間 [s]"); self.ax.set_ylabel("周波数 [Hz]")
+  self.ax.set_title(f"スペクトログラム: {label}")
+  try:
+   self.fig.colorbar(mesh, ax=self.ax, label="dB")
+  except Exception:
+   get_logger().debug("show_spectrogram: 無視した例外", exc_info=True)
+  self._apply_aspect()
+  try:
+   self.fig.tight_layout()
+  except Exception:
+   get_logger().debug("show_spectrogram: 無視した例外", exc_info=True)
+  self.canvas.draw()
+  self._has_drawn = False
+  self._set_status(f"スペクトログラム表示: {label}")
+ def show_waterfall(self):
+  import numpy as np
+  got = self.analysis_xy_or_warn()
+  if got is None:
+   return
+  t, y, label = got
+  f, tt, S = spectrogram(t, np.asarray(y, float), window=self.fft_window.currentText())
+  if S is None:
+   self.notify("計算できませんでした。", "warn")
+   return
+  self.prepare_view_axes(three_d=True, white_bg=False)
+  from matplotlib import cm
+  n = S.shape[1]
+  step = max(1, n // 60)
+  f = np.asarray(f, float)
+  for i in range(0, n, step):
+   self.ax.plot(f, np.full_like(f, tt[i]), S[:, i], lw=0.8, color=cm.viridis(i / max(n - 1, 1)))
+  self.ax.set_xlabel("周波数 [Hz]")
+  self.ax.set_ylabel("時間 [s]")
+  self.ax.set_zlabel("振幅 [dB]")
+  self.ax.set_title(f"FFTウォーターフォール: {label}")
+  try:
+   self.ax.view_init(elev=self.elev_spin.value(), azim=self.azim_spin.value())
+  except Exception:
+   get_logger().debug("show_waterfall: 無視した例外", exc_info=True)
+  try:
+   self.fig.tight_layout()
+  except Exception:
+   get_logger().debug("show_waterfall: 無視した例外", exc_info=True)
+  self.canvas.draw()
+  self._has_drawn = False
+  self._set_status(f"FFTウォーターフォール表示: {label}（{(n + step - 1) // step}スライス・" "ドラッグで回転）")
+ def run_mask_test(self):
+  import numpy as np
+  got = self.analysis_xy_or_warn()
+  if got is None:
+   return
+  t, y, label = got
+  up = parse_eng(self.mask_upper.text(), None)
+  lo = parse_eng(self.mask_lower.text(), None)
+  if up is None and lo is None:
+   self.notify("上限または下限を入力してください。", "warn")
+   return
+  res = mask_test(t, np.asarray(y, float), upper=up, lower=lo)
+  self.draw_graph()
+  if getattr(self.ax, "name", None) != "3d":
+   if up is not None:
+    self.ax.axhline(up, color="#d00", ls="--", lw=0.8)
+   if lo is not None:
+    self.ax.axhline(lo, color="#d00", ls="--", lw=0.8)
+   if res["violations"]:
+    vt = res["violation_times"]
+    yv = np.asarray(y, float)[res["mask"]]
+    self.ax.plot(vt, yv, ".", color="#d00", ms=3)
+   self.canvas.draw()
+  verdict = "PASS ✅" if res["passed"] else f"FAIL ❌（{res['violations']}点 超過）"
+  self.adv_result.setText(f"マスク判定: {verdict}")
+  self._set_status(f"マスク判定 {label}: {verdict}")
+ def show_eye_diagram(self):
+  import numpy as np
+  got = self.analysis_xy_or_warn()
+  if got is None:
+   return
+  t, y, label = got
+  val = parse_eng(self.eye_rate.text(), 1e6)
+  sym_period = (1.0 / val) if val and val > 1 else (val or 1e-6)
+  phase, yy = eye_diagram(t, np.asarray(y, float), sym_period, n_ui=2)
+  self.prepare_view_axes()
+  self.ax.plot(phase * 1e6, yy, ".", ms=0.5, alpha=0.3, color="#1f77b4")
+  self.ax.set_xlabel("UI内時間 [µs]"); self.ax.set_ylabel("電圧")
+  self.ax.set_title(f"アイダイアグラム: {label}")
+  self.ax.grid(True, alpha=0.3)
+  em = eye_measurements(t, np.asarray(y, float), sym_period)
+  if em:
+   self.ax.axhline(em["level1"], color="#2ca02c", ls=":", lw=0.9)
+   self.ax.axhline(em["level0"], color="#2ca02c", ls=":", lw=0.9)
+   def _g(k):
+    v = em.get(k)
+    return float("nan") if v is None else v
+   self.adv_result.setText( "アイ測定: 振幅={:.4g} 高さ={:.4g} 幅={:.4g}µs Q={:.3g} " "ER={:.3g}dB ジッタpp={:.3g}ns".format( _g("eye_amplitude"), _g("eye_height"), _g("eye_width") * 1e6, _g("q_factor"), _g("extinction_ratio_db"), _g("jitter_pp") * 1e9))
+  try:
+   self.fig.tight_layout()
+  except Exception:
+   get_logger().debug("show_eye_diagram: 無視した例外", exc_info=True)
+  self.canvas.draw()
+  self._has_drawn = False
+  self._set_status(f"アイダイアグラム表示: {label}")
+ def run_jitter(self):
+  import numpy as np
+  got = self.analysis_xy_or_warn()
+  if got is None:
+   return
+  t, y, label = got
+  jr = jitter_tie(t, np.asarray(y, float))
+  if not jr:
+   self.notify("エッジが不足し計算できませんでした。", "warn")
+   return
+  msg = (f"ジッタ: RMS={format_eng(jr['rms'])}s  " f"pp={format_eng(jr['pp'])}s  " f"クロック≈{format_eng(jr['freq'])}Hz  エッジ{jr['edges']}本")
+  self.adv_result.setText(msg)
+  self._set_status(msg)
+ def show_cycle_stats(self):
+  import numpy as np
+  got = self.analysis_xy_or_warn()
+  if got is None:
+   return
+  t, y, label = got
+  cm = cycle_measurements(t, np.asarray(y, float))
+  fs = measurement_stats(cm["freq"])
+  amps = measurement_stats(cm["vpp"])
+  lines = []
+  if fs["count"]:
+   lines.append(f"周波数: 平均{format_eng(fs['mean'])}Hz σ={format_eng(fs['std'])} " f"min{format_eng(fs['min'])}〜max{format_eng(fs['max'])} ({fs['count']}サイクル)")
+  if amps["count"]:
+   lines.append(f"Vpp: 平均{amps['mean']:.4g} σ={amps['std']:.3g} " f"min{amps['min']:.4g}〜max{amps['max']:.4g}")
+  self.adv_result.setText("　".join(lines) or "サイクルを検出できませんでした。")
+  self._set_status(f"サイクル統計: {label}")
+ def show_trend(self):
+  import numpy as np
+  got = self.analysis_xy_or_warn()
+  if got is None:
+   return
+  t, y, label = got
+  cm = cycle_measurements(t, np.asarray(y, float))
+  if len(cm["cycle_time"]) < 2:
+   self.notify("サイクルが不足しています。", "warn")
+   return
+  self.prepare_view_axes()
+  self.ax.plot(cm["cycle_time"], cm["freq"], "-o", ms=3, color="#1f77b4")
+  self.ax.set_xlabel("時間 [s]"); self.ax.set_ylabel("周波数 [Hz]")
+  self.ax.set_title(f"周波数トレンド（サイクルごと）: {label}")
+  self.ax.grid(True, alpha=0.3)
+  try:
+   self.fig.tight_layout()
+  except Exception:
+   get_logger().debug("show_trend: 無視した例外", exc_info=True)
+  self.canvas.draw()
+  self._has_drawn = False
+  self._set_status(f"トレンド表示: {label}")
+ def show_phase(self):
+  import numpy as np
+  t1, y1, l1 = self._analysis_xy()
+  t2, y2 = self._xy_by_disp(self.phase_target2.currentText())
+  if t1 is None or t2 is None:
+   self.notify("解析対象と対象2を選択してください。", "warn")
+   return
+  delay, phase = phase_delay(t1, np.asarray(y1, float), np.asarray(y2, float))
+  if delay is None:
+   self.notify("計算できませんでした。", "warn")
+   return
+  ph = "-" if phase is None else f"{phase:.1f}°"
+  msg = f"位相差/遅延（{l1} vs {self.phase_target2.currentText()}）: 遅延={format_eng(delay)}s  位相={ph}"
+  self.adv_result.setText(msg); self._set_status(msg)
+ def _on_proto_change(self, proto):
+  cfg = { "UART": (["信号線", "", ""], "ボーレート", "115200"), "I2C": (["SCL", "SDA", ""], "不使用", ""), "SPI": (["SCK", "MOSI", "CS(任意)"], "不使用", ""), "CAN": (["CAN(RXまたは差動)", "", ""], "ビットレート", "500k"), "LIN": (["信号線", "", ""], "ボーレート", "19200"), "1-Wire": (["信号線", "", ""], "不使用", ""), }[proto]
+  labels, baud_lbl, baud_val = cfg
+  for i in range(3):
+   show = labels[i] != ""
+   self.proto_ch_labels[i].setText(labels[i]); self.proto_ch_labels[i].setVisible(show)
+   self.proto_ch[i].setVisible(show)
+  self.proto_baud.setEnabled(proto in ("UART", "CAN", "LIN"))
+  if baud_val:
+   self.proto_baud.setText(baud_val)
+ def decode_protocol(self):
+  import numpy as np
+  proto = self.proto_combo.currentText()
+  t1, y1 = self._xy_by_disp(self.proto_ch[0].currentText())
+  if t1 is None:
+   self.notify("Ch1（信号線）をデータタブで選択してください。", "warn")
+   return
+  try:
+   if proto == "UART":
+    baud = parse_eng(self.proto_baud.text(), 115200)
+    ev = decode_uart(t1, np.asarray(y1, float), baud=baud)
+    rows = [(e["time"], "data", e["hex"], (e["char"] + ("" if e["ok"] else " ⚠")).strip()) for e in ev]
+   elif proto == "I2C":
+    t2, y2 = self._xy_by_disp(self.proto_ch[1].currentText())
+    if t2 is None:
+     self.notify("SDA(Ch2)も選択してください。", "warn"); return
+    ev = decode_i2c(t1, np.asarray(y1, float), np.asarray(y2, float))
+    rows = []
+    for e in ev:
+     if e["type"] in ("START", "STOP"):
+      rows.append((e["time"], e["type"], "", ""))
+     else:
+      rows.append((e["time"], e["type"], e["hex"], f"{e.get('rw','')} {e.get('ack','')}".strip()))
+   elif proto == "SPI":
+    t2, y2 = self._xy_by_disp(self.proto_ch[1].currentText())
+    if t2 is None:
+     self.notify("MOSI(Ch2)も選択してください。", "warn"); return
+    cs = None
+    if self.proto_ch[2].currentText():
+     _, cs = self._xy_by_disp(self.proto_ch[2].currentText())
+     cs = np.asarray(cs, float) if cs is not None else None
+    ev = decode_spi(t1, np.asarray(y1, float), np.asarray(y2, float), cs=cs)
+    rows = [(e["time"], "data", e["hex"], "") for e in ev]
+   elif proto == "CAN":
+    rate = parse_eng(self.proto_baud.text(), 500e3)
+    ev = decode_can(t1, np.asarray(y1, float), bitrate=rate)
+    rows = []
+    for e in ev:
+     idw = f"{e['id']:08X}" if e["ext"] else f"{e['id']:03X}"
+     kind = ("CANx" if e["ext"] else "CAN") + ("/RTR" if e["rtr"] else "")
+     note = f"DLC={e['dlc']}" + ("" if e["crc_ok"] else " CRC⚠")
+     rows.append((e["time"], kind, f"ID={idw} [{e['hex']}]", note))
+   elif proto == "LIN":
+    baud = parse_eng(self.proto_baud.text(), 19200)
+    ev = decode_lin(t1, np.asarray(y1, float), baud=baud)
+    rows = []
+    for e in ev:
+     if e["type"] == "BREAK":
+      rows.append((e["time"], "BREAK", "", ""))
+     elif e["type"] == "PID":
+      rows.append((e["time"], "PID", f"0x{e['value']:02X}", "" if e.get("ok") else "パリティ⚠"))
+     elif e["type"] == "CSUM":
+      rows.append((e["time"], "CSUM", f"0x{e['value']:02X}", "OK" if e.get("ok") else "不一致⚠"))
+     else:
+      rows.append((e["time"], e["type"], f"0x{e['value']:02X}", ""))
+   else:
+    ev = decode_onewire(t1, np.asarray(y1, float))
+    rows = [(e["time"], e["type"], f"0x{e['value']:02X}" if e["type"] == "data" else "", "") for e in ev]
+  except Exception as e:
+   QtWidgets.QMessageBox.critical(self, "解読エラー", str(e)); return
+  self.proto_table.setRowCount(len(rows))
+  for r, (tm, kind, hexv, note) in enumerate(rows):
+   self.proto_table.setItem(r, 0, QtWidgets.QTableWidgetItem(f"{tm*1e3:.4g} ms"))
+   self.proto_table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(kind)))
+   self.proto_table.setItem(r, 2, QtWidgets.QTableWidgetItem(str(hexv)))
+   self.proto_table.setItem(r, 3, QtWidgets.QTableWidgetItem(str(note)))
+  self._proto_annotations = {"rows": rows, "proto": proto}
+  if (getattr(self, "proto_overlay_check", None) and self.proto_overlay_check.isChecked() and self._has_drawn):
+   self.draw_graph()
+  self._set_status(f"{proto} 解読: {len(rows)} 件")
+ def _on_proto_overlay_toggled(self, *_):
+  if self.datasets and self._has_drawn:
+   self.draw_graph()
+ def _build_tab_advanced(self):
+  outer = QtWidgets.QScrollArea(); outer.setWidgetResizable(True)
+  w = QtWidgets.QWidget(); outer.setWidget(w)
+  v = QtWidgets.QVBoxLayout(w)
+  v.addWidget(self._bold("数学チャンネル（演算で新しい波形を作成）"))
+  mg = QtWidgets.QGridLayout()
+  mg.addWidget(QtWidgets.QLabel("演算"), 0, 0)
+  self.math_op = QtWidgets.QComboBox()
+  self.math_op.addItems(BINARY_OPS + UNARY_OPS)
+  self.math_op.currentTextChanged.connect(self._on_math_op_change)
+  mg.addWidget(self.math_op, 0, 1, 1, 3)
+  mg.addWidget(QtWidgets.QLabel("A"), 1, 0)
+  self.math_a = QtWidgets.QComboBox(); mg.addWidget(self.math_a, 1, 1)
+  self.math_b_label = QtWidgets.QLabel("B"); mg.addWidget(self.math_b_label, 1, 2)
+  self.math_b = QtWidgets.QComboBox(); mg.addWidget(self.math_b, 1, 3)
+  self.math_param_label = QtWidgets.QLabel("パラメータ"); mg.addWidget(self.math_param_label, 2, 0)
+  self.math_param = QtWidgets.QLineEdit("5"); self.math_param.setToolTip("移動平均=窓長(点)、ローパス=カットオフ[Hz]")
+  mg.addWidget(self.math_param, 2, 1)
+  b_math = QtWidgets.QPushButton("数学チャンネルを作成"); b_math.clicked.connect(self.create_math_channel)
+  mg.addWidget(b_math, 2, 2, 1, 2)
+  v.addLayout(mg)
+  eg = QtWidgets.QGridLayout()
+  eg.addWidget(QtWidgets.QLabel("数式"), 0, 0)
+  self.math_expr = QtWidgets.QLineEdit()
+  self.math_expr.setPlaceholderText("例: sqrt(A**2+B**2) / sin(2*pi*t)*VAR1 / A-VAR1")
+  self.math_expr.setToolTip("変数: A=対象A, B=対象B, t=時間, VAR1, VAR2, 定数 pi/e。\n" "関数: sin/cos/tan/asin/.../exp/log/log10/log2/sqrt/abs/sign/min/max/clip/where。")
+  eg.addWidget(self.math_expr, 0, 1, 1, 3)
+  eg.addWidget(QtWidgets.QLabel("VAR1"), 1, 0)
+  self.math_var1 = QtWidgets.QLineEdit("1"); eg.addWidget(self.math_var1, 1, 1)
+  eg.addWidget(QtWidgets.QLabel("VAR2"), 1, 2)
+  self.math_var2 = QtWidgets.QLineEdit("0"); eg.addWidget(self.math_var2, 1, 3)
+  b_expr = QtWidgets.QPushButton("数式でチャンネル作成"); b_expr.clicked.connect(self.create_math_expr)
+  eg.addWidget(b_expr, 2, 0, 1, 4)
+  v.addLayout(eg)
+  v.addWidget(self._hline())
+  v.addWidget(self._bold("FFT 詳細（窓・dB・THD/SNR・スペクトログラム）"))
+  fg = QtWidgets.QGridLayout()
+  fg.addWidget(QtWidgets.QLabel("窓関数"), 0, 0)
+  self.fft_window = QtWidgets.QComboBox(); self.fft_window.addItems(WINDOWS)
+  self.fft_window.setCurrentText("hann"); fg.addWidget(self.fft_window, 0, 1)
+  self.fft_db = QtWidgets.QCheckBox("dB表示"); fg.addWidget(self.fft_db, 0, 2)
+  b_m = QtWidgets.QPushButton("THD/SNR等を計算"); b_m.clicked.connect(self.compute_fft_metrics)
+  fg.addWidget(b_m, 1, 0, 1, 2)
+  b_sp = QtWidgets.QPushButton("スペクトログラム"); b_sp.clicked.connect(self.show_spectrogram)
+  fg.addWidget(b_sp, 1, 2, 1, 1)
+  b_wf = QtWidgets.QPushButton("ウォーターフォール")
+  b_wf.setToolTip("STFTの時間スライスを3Dに重ねて表示（周波数成分の時間変化を見る）。" "ドラッグで回転できます。")
+  b_wf.clicked.connect(self.show_waterfall)
+  fg.addWidget(b_wf, 1, 3, 1, 1)
+  v.addLayout(fg)
+  self.fft_metrics = QtWidgets.QTableWidget(0, 2)
+  self.fft_metrics.setHorizontalHeaderLabels(["指標", "値"])
+  self.fft_metrics.horizontalHeader().setStretchLastSection(True)
+  self.fft_metrics.setMaximumHeight(170)
+  self._wire_table_export(self.fft_metrics, "FFT指標")
+  v.addWidget(self.fft_metrics)
+  v.addWidget(self._hline())
+  v.addWidget(self._bold("マスク試験 / アイダイアグラム / ジッタ"))
+  mk = QtWidgets.QGridLayout()
+  mk.addWidget(QtWidgets.QLabel("上限"), 0, 0)
+  self.mask_upper = QtWidgets.QLineEdit(); self.mask_upper.setPlaceholderText("なし")
+  self.mask_upper.setAccessibleName("マスク上限")
+  mk.addWidget(self.mask_upper, 0, 1)
+  mk.addWidget(QtWidgets.QLabel("下限"), 0, 2)
+  self.mask_lower = QtWidgets.QLineEdit(); self.mask_lower.setPlaceholderText("なし")
+  self.mask_lower.setAccessibleName("マスク下限")
+  mk.addWidget(self.mask_lower, 0, 3)
+  b_mask = QtWidgets.QPushButton("マスク判定"); b_mask.clicked.connect(self.run_mask_test)
+  mk.addWidget(b_mask, 1, 0, 1, 2)
+  mk.addWidget(QtWidgets.QLabel("シンボルレート[Hz]/周期[s]"), 2, 0, 1, 2)
+  self.eye_rate = QtWidgets.QLineEdit("1e6"); mk.addWidget(self.eye_rate, 2, 2)
+  b_eye = QtWidgets.QPushButton("アイダイアグラム"); b_eye.clicked.connect(self.show_eye_diagram)
+  mk.addWidget(b_eye, 2, 3)
+  b_jit = QtWidgets.QPushButton("ジッタ解析(TIE)"); b_jit.clicked.connect(self.run_jitter)
+  mk.addWidget(b_jit, 1, 2, 1, 2)
+  v.addLayout(mk)
+  self.adv_result = QtWidgets.QLabel(""); self.adv_result.setWordWrap(True)
+  self.adv_result.setStyleSheet("color:#0a3;")
+  v.addWidget(self.adv_result)
+  v.addWidget(self._hline())
+  v.addWidget(self._bold("シリアルプロトコル解読"))
+  pg = QtWidgets.QGridLayout()
+  pg.addWidget(QtWidgets.QLabel("プロトコル"), 0, 0)
+  self.proto_combo = QtWidgets.QComboBox()
+  self.proto_combo.addItems(["UART", "I2C", "SPI", "CAN", "LIN", "1-Wire"])
+  self.proto_combo.currentTextChanged.connect(self._on_proto_change)
+  pg.addWidget(self.proto_combo, 0, 1)
+  pg.addWidget(QtWidgets.QLabel("ボーレート/不使用"), 0, 2)
+  self.proto_baud = QtWidgets.QLineEdit("115200"); pg.addWidget(self.proto_baud, 0, 3)
+  self.proto_ch_labels = [QtWidgets.QLabel("Ch1"), QtWidgets.QLabel("Ch2"), QtWidgets.QLabel("Ch3")]
+  self.proto_ch = [QtWidgets.QComboBox(), QtWidgets.QComboBox(), QtWidgets.QComboBox()]
+  for i in range(3):
+   pg.addWidget(self.proto_ch_labels[i], 1 + i, 0)
+   pg.addWidget(self.proto_ch[i], 1 + i, 1, 1, 3)
+  b_dec = QtWidgets.QPushButton("解読"); b_dec.clicked.connect(self.decode_protocol)
+  pg.addWidget(b_dec, 4, 0, 1, 4)
+  self.proto_overlay_check = QtWidgets.QCheckBox("解読結果をグラフに注記表示")
+  self.proto_overlay_check.setToolTip( "解読したフレームの値を波形の上に直接注記します（Saleae風・先頭80件まで）。\n" "CRC/パリティ等の不一致は赤で表示。折れ線/散布図の2D表示で有効。")
+  self.proto_overlay_check.toggled.connect(self._on_proto_overlay_toggled)
+  pg.addWidget(self.proto_overlay_check, 5, 0, 1, 4)
+  v.addLayout(pg)
+  self.proto_table = QtWidgets.QTableWidget(0, 4)
+  self.proto_table.setHorizontalHeaderLabels(["時刻", "種別", "値(hex)", "備考"])
+  self.proto_table.horizontalHeader().setStretchLastSection(True)
+  self._wire_table_export(self.proto_table, "プロトコル解読")
+  v.addWidget(self.proto_table, 1)
+  self._on_math_op_change(self.math_op.currentText())
+  self._on_proto_change("UART")
+  return outer
+"""DataSciMixin: 「データサイエンス」タブの解析アクション。
+選択中のY系列に対し、線形回帰（線形性）・記述統計・相関・正規性検定などを計算して表で表示する。
+実体の計算は datasci モジュール（GUI 非依存）に置き、ここは取得→計算→表示の橋渡しに徹する。
+"""
+class DataSciMixin:
+ def _ds_xy(self):
+  disp = self.ds_target.currentText()
+  if not disp:
+   self.notify("データタブでY系列を選択してください。", "warn")
+   return None, None, None
+  t, y = self._xy_by_disp(disp)
+  if t is None:
+   self.notify("対象の数値データが取得できません。", "warn")
+   return None, None, None
+  return disp, t, y
+ def _ds_show(self, title, rows):
+  had = bool(getattr(self, "_ds_annotations", None))
+  self._ds_annotations = []
+  self.ds_title.setText(title)
+  self.ds_table.setRowCount(len(rows))
+  for r, (k, v) in enumerate(rows):
+   self.ds_table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(k)))
+   self.ds_table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(v)))
+   cb = QtWidgets.QCheckBox()
+   cb.setToolTip("チェックすると、この項目の値をグラフ上に注記表示します。")
+   cb.toggled.connect(self._refresh_ds_annotations)
+   self.ds_table.setCellWidget(r, 2, cb)
+  if had and getattr(self, "_has_drawn", False):
+   self.draw_graph()
+ def _refresh_ds_annotations(self, *_):
+  anns = []
+  for r in range(self.ds_table.rowCount()):
+   cb = self.ds_table.cellWidget(r, 2)
+   if cb is not None and cb.isChecked():
+    k = self.ds_table.item(r, 0)
+    v = self.ds_table.item(r, 1)
+    if k is not None and v is not None:
+     anns.append(f"{k.text()} = {v.text()}")
+  self._ds_annotations = anns
+  if self.datasets:
+   self.draw_graph()
+ @staticmethod
+ def _fmt(v):
+  if v is None:
+   return "—"
+  if isinstance(v, bool):
+   return "はい" if v else "いいえ"
+  if isinstance(v, int):
+   return str(v)
+  try:
+   return f"{float(v):.6g}"
+  except (TypeError, ValueError):
+   return str(v)
+ def run_regression(self):
+  disp, t, y = self._ds_xy()
+  if t is None:
+   return
+  d = linear_regression(t, y)
+  if not d:
+   self.notify("回帰に十分なデータがありません。", "warn")
+   return
+  f = self._fmt
+  rows = [ ("点数 n", f(d["n"])), ("傾き slope", f(d["slope"])), ("切片 intercept", f(d["intercept"])), ("相関 r (ピアソン)", f(d["r"])), ("決定係数 R²", f(d["r2"])), ("p値 (傾き=0)", f(d["p_value"])), ("傾きの標準誤差", f(d["std_err"])), ("RMSE (残差)", f(d["rmse"])), ("直線性誤差 [%FS]", f(d["linearity_error_pct"])), ]
+  sp = correlation(t, y, "spearman")
+  if sp:
+   rows.append(("相関 (スピアマン)", f(sp["r"])))
+  self._ds_show(f"線形回帰: {disp}（Y vs X）", rows)
+  if self.ds_fit_check.isChecked():
+   self.trend_combo.setCurrentText("線形")
+   self.draw_graph()
+ def show_describe(self):
+  disp, t, y = self._ds_xy()
+  if t is None:
+   return
+  d = describe(y)
+  if not d:
+   self.notify("数値データがありません。", "warn")
+   return
+  f = self._fmt
+  order = [ ("件数", "count"), ("平均", "mean"), ("中央値", "median"), ("標準偏差 σ", "std"), ("分散", "var"), ("最小", "min"), ("最大", "max"), ("範囲", "range"), ("変動係数 CV", "cv"), ("歪度 skew", "skew"), ("尖度 kurtosis", "kurtosis"), ("第1四分位 Q1", "p25"), ("中央 Q2", "p50"), ("第3四分位 Q3", "p75"), ("四分位範囲 IQR", "iqr"), ]
+  self._ds_show(f"記述統計: {disp}", [(lbl, f(d.get(k))) for lbl, k in order])
+ def run_normality(self):
+  disp, t, y = self._ds_xy()
+  if t is None:
+   return
+  d = normality(y)
+  if not d:
+   self.notify("正規性検定には scipy が必要です（または点数不足）。", "warn")
+   return
+  f = self._fmt
+  rows = [ ("W統計量", f(d["W"])), ("p値", f(d["p_value"])), ("5%有意で正規とみなせる", f(d["normal_5pct"])), ]
+  self._ds_show(f"正規性検定 (Shapiro-Wilk): {disp}", rows)
+ def show_corr_matrix(self):
+  items = self._selected_series_items()
+  if len(items) < 2:
+   self.notify("相関行列には2系列以上をデータタブで選択してください。", "warn")
+   return
+  named = []
+  for fl, col, disp in items:
+   t, y = self._xy_by_disp(disp)
+   if y is not None:
+    named.append((disp, y))
+  names, mat = correlation_matrix(named, "pearson")
+  if mat is None:
+   self.notify("相関行列を計算できませんでした。", "warn")
+   return
+  self._show_corr_window(names, mat)
+ def _show_corr_window(self, names, mat):
+  dlg = QtWidgets.QDialog(self)
+  dlg.setWindowTitle("相関行列（ピアソン）")
+  dlg.resize(min(120 + 90 * len(names), 900), min(120 + 30 * len(names), 700))
+  lay = QtWidgets.QVBoxLayout(dlg)
+  n = len(names)
+  tbl = QtWidgets.QTableWidget(n, n)
+  tbl.setHorizontalHeaderLabels(names)
+  tbl.setVerticalHeaderLabels(names)
+  for i in range(n):
+   for j in range(n):
+    v = float(mat[i, j])
+    it = QtWidgets.QTableWidgetItem(f"{v:.3f}")
+    it.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+    a = max(0.0, min(1.0, abs(v)))
+    if v >= 0:
+     it.setBackground(QtGui.QColor(255, int(255 * (1 - a)), int(255 * (1 - a))))
+    else:
+     it.setBackground(QtGui.QColor(int(255 * (1 - a)), int(255 * (1 - a)), 255))
+    tbl.setItem(i, j, it)
+  lay.addWidget(tbl)
+  btn = QtWidgets.QPushButton("閉じる")
+  btn.clicked.connect(dlg.accept)
+  lay.addWidget(btn)
+  dlg.exec()
+ def run_custom_fit(self):
+  disp, t, y = self._ds_xy()
+  if t is None:
+   return
+  dlg = QtWidgets.QDialog(self)
+  dlg.setWindowTitle(f"任意関数フィット: {disp}")
+  form = QtWidgets.QFormLayout(dlg)
+  last = getattr(self, "_fit_last", {})
+  e_expr = QtWidgets.QLineEdit(last.get("expr", "a*exp(-x/b)+c"))
+  e_expr.setToolTip("変数 x とパラメータ名で書くモデル式。\n" "使える関数: sin/cos/tan/exp/log/log10/sqrt/abs など" "（数学チャンネルの数式と同じ）。")
+  e_par = QtWidgets.QLineEdit(last.get("params", "a, b, c"))
+  e_par.setToolTip("フィットするパラメータ名（カンマ区切り）")
+  e_p0 = QtWidgets.QLineEdit(last.get("p0", "1, 1, 0"))
+  e_p0.setToolTip("各パラメータの初期値（カンマ区切り・パラメータ名と同順）")
+  c_add = QtWidgets.QCheckBox("フィット曲線を新しいデータとして追加（グラフに重ねられる）")
+  c_add.setChecked(True)
+  form.addRow("モデル式 f(x) =", e_expr)
+  form.addRow("パラメータ", e_par)
+  form.addRow("初期値", e_p0)
+  form.addRow(c_add)
+  bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+  bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+  form.addRow(bb)
+  if not dlg.exec():
+   return
+  expr = e_expr.text().strip()
+  params = [p.strip() for p in e_par.text().split(",") if p.strip()]
+  try:
+   p0 = [float(v) for v in e_p0.text().split(",")]
+  except ValueError:
+   self.notify("初期値は数値をカンマ区切りで入力してください。", "warn")
+   return
+  if not expr or not params or len(p0) != len(params):
+   self.notify("式・パラメータ名・初期値（同数）を入力してください。", "warn")
+   return
+  self._fit_last = {"expr": expr, "params": e_par.text(), "p0": e_p0.text()}
+  try:
+   d = fit_custom(t, y, expr, params, p0)
+  except Exception as e:
+   self.notify(f"フィットできませんでした:\n{e}\n\n" "初期値を変える・式を見直すと収束することがあります。", "warn")
+   return
+  if not d:
+   self.notify("フィットに十分なデータがありません（要scipy・点数>パラメータ数+1）。", "warn")
+   return
+  f = self._fmt
+  rows = [("モデル式", f"f(x) = {expr}"), ("点数 n", f(d["n"]))]
+  for nm, v, err in d["params"]:
+   rows.append((f"{nm}", f"{v:.6g} ± {err:.3g}"))
+  rows += [("決定係数 R²", f(d["r2"])), ("RMSE (残差)", f(d["rmse"]))]
+  self._ds_show(f"任意関数フィット: {disp}", rows)
+  if c_add.isChecked():
+   import pandas as pd
+   xname = self.x_combo.currentText() or "x"
+   df = pd.DataFrame({xname: d["x"], f"fit({disp})": d["yfit"]})
+   self.register_dataset( f"FIT: {disp}", df, status=(f"フィット完了: R²={f(d['r2'])}。曲線を『{{label}}』として追加しました" "（ツリーでチェックすると重ね描きできます）。"))
+  else:
+   self._set_status(f"フィット完了: R²={f(d['r2'])}")
+ def run_t_test(self):
+  disp, t, y = self._ds_xy()
+  if t is None:
+   return
+  others = [d for _fl, _c, d in self._selected_series_items() if d != disp]
+  dlg = QtWidgets.QDialog(self)
+  dlg.setWindowTitle(f"t検定: {disp}")
+  form = QtWidgets.QFormLayout(dlg)
+  kind = QtWidgets.QComboBox()
+  kind.addItems(["1標本（母平均μ0と比較）", "対応なし2標本（Welch）", "対応あり2標本"])
+  e_mu = QtWidgets.QLineEdit("0")
+  cb_b = QtWidgets.QComboBox(); cb_b.addItems(others)
+  form.addRow("種類", kind)
+  form.addRow("μ0（1標本のとき）", e_mu)
+  form.addRow("対象B（2標本のとき）", cb_b)
+  bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+  bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+  form.addRow(bb)
+  if not dlg.exec():
+   return
+  ki = kind.currentIndex()
+  b = None
+  if ki > 0:
+   if not cb_b.currentText():
+    self.notify("2標本の検定には対象Bの系列もデータタブで選択してください。", "warn")
+    return
+   _tb, b = self._xy_by_disp(cb_b.currentText())
+  d = t_test(y, b=b, mu=_parse_float(e_mu.text(), 0.0) or 0.0, paired=(ki == 2))
+  if not d:
+   self.notify("t検定を計算できませんでした（要scipy・点数を確認）。", "warn")
+   return
+  f = self._fmt
+  name = ["1標本", "対応なし(Welch)", "対応あり"][ki]
+  rows = [("種類", name), ("平均 A", f(d["mean_a"]))]
+  if d["mean_b"] is not None:
+   rows.append(("平均 B", f(d["mean_b"])))
+  rows += [("t統計量", f(d["t"])), ("p値", f(d["p_value"]))]
+  if d["df"] is not None:
+   rows.append(("自由度", f(d["df"])))
+  rows.append(("5%有意差あり", f(d["sig_5pct"])))
+  self._ds_show(f"t検定（{name}）: {disp}" + (f" vs {cb_b.currentText()}" if ki > 0 else ""), rows)
+ def run_anova(self):
+  items = self._selected_series_items()
+  if len(items) < 2:
+   self.notify("分散分析には2系列以上をデータタブで選択してください。", "warn")
+   return
+  groups = []
+  for _fl, _c, disp in items:
+   _t, y = self._xy_by_disp(disp)
+   if y is not None:
+    groups.append((disp, y))
+  d = anova_oneway(groups)
+  if not d:
+   self.notify("分散分析を計算できませんでした（要scipy）。", "warn")
+   return
+  f = self._fmt
+  rows = [("F統計量", f(d["F"])), ("p値", f(d["p_value"])), ("5%有意差あり", f(d["sig_5pct"]))]
+  for name, n, mean, std in d["groups"]:
+   rows.append((f"{name}", f"n={n}, 平均={mean:.6g}, σ={std:.6g}"))
+  self._ds_show(f"一元配置ANOVA（{len(d['groups'])}群）", rows)
+ def _build_tab_datasci(self):
+  outer = QtWidgets.QScrollArea(); outer.setWidgetResizable(True)
+  w = QtWidgets.QWidget(); outer.setWidget(w)
+  v = QtWidgets.QVBoxLayout(w)
+  v.addWidget(self._bold("統計解析（回帰・記述統計・相関・正規性）"))
+  info = QtWidgets.QLabel("選択中のY系列を、現在のX軸列に対して解析します。" "データタブでX軸とY系列を選んでから実行してください。")
+  info.setWordWrap(True); info.setStyleSheet("color:#555;")
+  v.addWidget(info)
+  row = QtWidgets.QHBoxLayout()
+  row.addWidget(QtWidgets.QLabel("対象:"))
+  self.ds_target = QtWidgets.QComboBox()
+  self.ds_target.setToolTip("解析するY系列。データタブでY系列を選ぶと候補に出ます")
+  row.addWidget(self.ds_target, 1)
+  v.addLayout(row)
+  b_reg = QtWidgets.QPushButton("線形回帰（Y vs X）")
+  b_reg.setToolTip("傾き・切片・R²・相関r・直線性誤差[%FS] を計算（線形性の評価）")
+  b_reg.clicked.connect(self.run_regression)
+  self.ds_fit_check = QtWidgets.QCheckBox("回帰直線を重ねる")
+  self.ds_fit_check.setToolTip("回帰実行時に近似曲線（線形）をグラフへ重ねて表示します")
+  reg_row = QtWidgets.QHBoxLayout()
+  reg_row.addWidget(b_reg); reg_row.addWidget(self.ds_fit_check); reg_row.addStretch(1)
+  v.addLayout(reg_row)
+  brow = QtWidgets.QHBoxLayout()
+  b_desc = QtWidgets.QPushButton("記述統計"); b_desc.clicked.connect(self.show_describe)
+  b_desc.setToolTip("平均/中央値/標準偏差/分散/歪度/尖度/四分位 など")
+  b_norm = QtWidgets.QPushButton("正規性検定"); b_norm.clicked.connect(self.run_normality)
+  b_norm.setToolTip("Shapiro-Wilk 検定（scipy 必要）")
+  b_corr = QtWidgets.QPushButton("相関行列"); b_corr.clicked.connect(self.show_corr_matrix)
+  b_corr.setToolTip("選択中の全Y系列どうしのピアソン相関を行列で表示")
+  brow.addWidget(b_desc); brow.addWidget(b_norm); brow.addWidget(b_corr)
+  v.addLayout(brow)
+  brow2 = QtWidgets.QHBoxLayout()
+  b_cfit = QtWidgets.QPushButton("任意関数フィット…")
+  b_cfit.setToolTip("モデル式（例: a*exp(-x/b)+c）とパラメータ初期値を指定して\n" "非線形フィット。パラメータ±標準誤差とR²を表示し、\n" "フィット曲線を新データとして重ね描きできます（scipy 必要）。")
+  b_cfit.clicked.connect(self.run_custom_fit)
+  b_tt = QtWidgets.QPushButton("t検定…")
+  b_tt.setToolTip("1標本（母平均と比較）／対応なし2標本（Welch）／対応あり2標本（scipy 必要）")
+  b_tt.clicked.connect(self.run_t_test)
+  b_an = QtWidgets.QPushButton("ANOVA")
+  b_an.setToolTip("一元配置分散分析。選択中の全Y系列を群として比較します（scipy 必要）")
+  b_an.clicked.connect(self.run_anova)
+  brow2.addWidget(b_cfit); brow2.addWidget(b_tt); brow2.addWidget(b_an)
+  v.addLayout(brow2)
+  self.ds_title = self._bold("結果")
+  v.addWidget(self.ds_title)
+  hint = QtWidgets.QLabel("右端の「表示」にチェックした項目は、その値をグラフに注記表示します。")
+  hint.setWordWrap(True); hint.setStyleSheet("color:#555;")
+  v.addWidget(hint)
+  self.ds_table = QtWidgets.QTableWidget(0, 3)
+  self.ds_table.setHorizontalHeaderLabels(["項目", "値", "表示"])
+  hh = self.ds_table.horizontalHeader()
+  hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+  hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+  hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+  self.ds_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+  self._wire_table_export(self.ds_table, "統計解析")
+  v.addWidget(self.ds_table, 1)
+  return outer
+"""CSV / TSV / 波形データ グラフ・解析ツール（PySide6 / Qt）。
+使い方:
+    python graph_app.py
+機能:
+    - 複数の CSV/TSV/波形ファイルをまとめて読み込み、系列を重ねて描画
+    - 文字コード・区切りの自動判定（手動指定も可）
+    - 8種のグラフ＋系列ごとの色/線種/線幅/マーカー、軸範囲/対数軸/凡例位置
+    - Excel相当のグラフ編集：近似曲線（線形/多項式/指数/対数/移動平均＋R²）、
+      データラベル、第2軸・複合グラフ（系列ごと主/第2軸＋線/棒/面の混在）、エラーバー
+    - データのセル編集（表を直接編集→DataFrameへ反映、行/列追加・削除、CSV保存）
+    - オシロスコープ表示（time/div・V/div・位置・divグリッド）
+    - オシロ相当の解析（第1/第2…ピーク検出、各種測定、FFT）
+    - 設定の保存／読み込み（終了時自動保存・起動時復元）
+GUI は matplotlib の qt_compat 経由で実装しており、PySide6 / PyQt6（Qt6系）で動作する。
 """
 class HostMixin:
  def _tab_hook(self, name, *args, default=None):
@@ -3049,7 +5368,18 @@ class HostMixin:
    if d == disp:
     return self.series_xy(fl, col, gated=False)
   return None, None
-"""UIBuildMixin: GraphApp から分離した UIBuildMixin 群（挙動は本体と同一）。"""
+ def register_dataset(self, base_label, df, *, path=None, enc="-", delim="-", status=None):
+  label, i = base_label, 2
+  while label in self.datasets:
+   label = f"{base_label} ({i})"
+   i += 1
+  self.datasets[label] = df
+  self.meta[label] = {"path": path if path is not None else label, "enc": enc, "delim": delim}
+  self._add_file_item(label)
+  self._refresh_columns()
+  if status:
+   self._set_status(status.format(label=label))
+  return label
 class UIBuildMixin:
  def _menu_action(self, menu, label, slot, shortcut=None, tip=None):
   act = QtGui.QAction(label, self)
@@ -5005,1214 +7335,6 @@ QToolBar { background:$title_bg; spacing:1px; }
   tips = { self.legend_loc: "凡例の表示位置", self.xlog: "X軸を対数目盛に（0以下の値は表示できません）", self.ylog: "Y軸を対数目盛に（0以下の値は表示できません）", self.bins_spin: "ヒストグラムの区間数（ヒストグラム選択時のみ有効）", self.pct_check: "円グラフでパーセント表示（円グラフ選択時のみ有効）", self.xmin: "X軸の最小値。空欄で自動。指数表記(1e-3)も可", self.xmax: "X軸の最大値。空欄で自動", self.ymin: "Y軸の最小値。空欄で自動", self.ymax: "Y軸の最大値。空欄で自動", self.dpi_spin: "保存画像の解像度。印刷向けは300以上", self.transparent_check: "保存時に背景を透明にします（PNG/PDF/SVG）", self.analysis_target: "解析するY系列。データタブでY系列を選ぶと候補に出ます", self.npeaks: "検出するピークの個数（第1〜第N）", self.show_peaks_check: "検出ピークを折れ線/散布図に重ねて表示", self.scope_check: "オシロスコープ風のdiv表示（折れ線/散布図）", self.tdiv: "1目盛りあたりの時間。1e-3 のような指数表記も可", self.vdiv: "1目盛りあたりの値。1e-3 のような指数表記も可", self.xpos: "表示の中心時間", self.ypos: "表示の中心値", }
   for w, t in tips.items():
    w.setToolTip(t)
-"""DataIOMixin: GraphApp から分離した DataIOMixin 群（挙動は本体と同一）。"""
-class DataIOMixin:
- def dragEnterEvent(self, event):
-  if event.mimeData().hasUrls():
-   event.acceptProposedAction()
- _ACCEPT_EXTS = ACCEPT_EXTS
- def dropEvent(self, event):
-  paths = []
-  for url in event.mimeData().urls():
-   p = url.toLocalFile()
-   if p and os.path.splitext(p)[1].lower() in self._ACCEPT_EXTS:
-    paths.append(p)
-  if not paths:
-   return
-  self.last_dir = os.path.dirname(paths[-1])
-  self._load_files_async(paths)
- def add_file(self):
-  paths, _ = QtWidgets.QFileDialog.getOpenFileNames( self, "ファイルを追加（複数選択可）", self.last_dir, file_dialog_filter())
-  if paths:
-   self.last_dir = os.path.dirname(paths[-1])
-   self._load_files_async(paths)
- def paste_from_clipboard(self):
-  import io
-  import pandas as pd
-  text = QtWidgets.QApplication.clipboard().text()
-  if not text or not text.strip():
-   self.notify("クリップボードに表データがありません。", "info")
-   return
-  first = text.splitlines()[0]
-  sep = "\t" if first.count("\t") >= first.count(",") else ","
-  try:
-   df = pd.read_csv(io.StringIO(text), sep=sep, engine="python", skip_blank_lines=True)
-   df = _normalize_columns(df)
-  except Exception as e:
-   self.notify(f"表として読み取れませんでした:\n{e}", "warn")
-   return
-  if df.shape[1] == 0 or len(df) == 0:
-   self.notify("表として読み取れませんでした。", "warn")
-   return
-  label, i = "貼り付け", 2
-  while label in self.datasets:
-   label = f"貼り付け ({i})"; i += 1
-  self.datasets[label] = df
-  self.meta[label] = {"path": "(clipboard)", "enc": "clipboard", "delim": sep}
-  self._add_file_item(label)
-  self.file_list.setCurrentRow(self.file_list.count() - 1)
-  self._refresh_columns()
-  self._set_status(f"クリップボードから {len(df)}行 × {len(df.columns)}列 を貼り付けました。")
- def _load_job(self, path):
-  enc = self.enc_combo.currentText()
-  enc = None if enc.startswith("自動") else enc
-  delim = None
-  dt = self.delim_combo.currentText()
-  if not dt.startswith("自動"):
-   for ch, lbl in DELIMITER_LABELS.items():
-    if lbl == dt:
-     delim = ch
-     break
-  sheet = None
-  if os.path.splitext(path)[1].lower() in (".xlsx", ".xlsm", ".xls"):
-   try:
-    sheets = excel_sheet_names(path)
-   except Exception as e:
-    self.notify(f"{os.path.basename(path)} のシートを読めませんでした。", "error", str(e))
-    return None
-   if len(sheets) > 1:
-    sheet, ok = QtWidgets.QInputDialog.getItem( self, "シートの選択", f"{os.path.basename(path)} のシート:", sheets, 0, False)
-    if not ok:
-     return None
-  return {"path": path, "enc": enc, "delim": delim, "sheet": sheet}
- def register_dataset(self, base_label, df, *, path=None, enc="-", delim="-", status=None):
-  label, i = base_label, 2
-  while label in self.datasets:
-   label = f"{base_label} ({i})"
-   i += 1
-  self.datasets[label] = df
-  self.meta[label] = {"path": path if path is not None else label, "enc": enc, "delim": delim}
-  self._add_file_item(label)
-  self._refresh_columns()
-  if status:
-   self._set_status(status.format(label=label))
-  return label
- def _register_loaded(self, job, result):
-  path, sheet = job["path"], job.get("sheet")
-  df, used_enc, used_delim = result
-  label = os.path.basename(path)
-  if sheet:
-   label = f"{label}[{sheet}]"
-  base, i = label, 2
-  while label in self.datasets and self.meta.get(label, {}).get("path") != path:
-   label = f"{base} ({i})"; i += 1
-  self.datasets[label] = df
-  self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim, "sheet": sheet}
-  if not self._find_file_item(label):
-   self._add_file_item(label)
-  self._push_recent(path)
-  self._set_status(f"{label} を読み込み（{len(df)}行 × {len(df.columns)}列, {used_enc}）")
-  return label
- def _load_file(self, path):
-  if os.path.splitext(path)[1].lower() in RUNNABLE_EXTS:
-   self.run_ltspice_asc(path)
-   return
-  job = self._load_job(path)
-  if job is None:
-   return
-  size = os.path.getsize(path) if os.path.isfile(path) else 0
-  busy = size > 5_000_000
-  if busy:
-   QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
-   self._set_status(f"読み込み中… {os.path.basename(path)}")
-   QtWidgets.QApplication.processEvents()
-  try:
-   result = load_table( path, encoding=job["enc"], delimiter=job["delim"], sheet=job["sheet"])
-  except Exception as e:
-   self.notify(f"{os.path.basename(path)} を読み込めませんでした。", "error", str(e))
-   return
-  finally:
-   if busy:
-    QtWidgets.QApplication.restoreOverrideCursor()
-  self._register_loaded(job, result)
- def _load_files_async(self, paths, on_finished=None):
-  paths = list(paths)
-  for p in [p for p in paths if os.path.splitext(p)[1].lower() in RUNNABLE_EXTS]:
-   self.run_ltspice_asc(p)
-  targets = [p for p in paths if os.path.splitext(p)[1].lower() not in RUNNABLE_EXTS]
-  jobs = []
-  for p in targets:
-   job = self._load_job(p)
-   if job is not None:
-    jobs.append(job)
-  if not jobs:
-   if on_finished:
-    on_finished([])
-   return None
-  if getattr(self, "_load_thread", None) is not None:
-   self.notify("前の読み込みが実行中です。終わるまでお待ちください。", "warn")
-   return None
-  loaded, errors = [], []
-  total_bytes = 0
-  for job in jobs:
-   try:
-    total_bytes += os.path.getsize(job["path"])
-   except OSError:
-    get_logger().debug("_load_files_async: 無視した例外", exc_info=True)
-  if len(jobs) <= ASYNC_LOAD_COUNT and total_bytes <= ASYNC_LOAD_BYTES:
-   for job in jobs:
-    name = os.path.basename(job["path"])
-    try:
-     res = load_table( job["path"], encoding=job["enc"], delimiter=job["delim"], sheet=job["sheet"])
-     loaded.append(self._register_loaded(job, res))
-    except Exception as e:
-     errors.append(f"{name}: {e}")
-   self._refresh_columns()
-   if loaded and self._has_drawn:
-    self.draw_graph()
-   if errors:
-    self.notify(f"{len(errors)} 件のファイルを読み込めませんでした。", "error", "\n".join(errors))
-   if on_finished:
-    on_finished(loaded)
-   return None
-  def _on_one(index, result, err):
-   job = jobs[index]
-   name = os.path.basename(job["path"])
-   if result is None:
-    errors.append(f"{name}: {err}")
-   else:
-    try:
-     loaded.append(self._register_loaded(job, result))
-    except Exception as e:
-     errors.append(f"{name}: {e}")
-   self.progress_strip.update(index + 1)
-  def _on_progress(done, name):
-   self.progress_strip.update(done, f"読み込み中… {name}（{done + 1}/{len(jobs)}）")
-  def _on_finished():
-   thread = getattr(self, "_load_thread", None)
-   canceled = bool(thread is not None and thread.is_canceled())
-   self._load_thread = None
-   self.progress_strip.finish()
-   self._refresh_columns()
-   if loaded and self._has_drawn:
-    self.draw_graph()
-   if errors:
-    self.notify(f"{len(errors)} 件のファイルを読み込めませんでした。", "error", "\n".join(errors))
-   elif canceled:
-    self.notify(f"読み込みを中止しました（{len(loaded)} 件は読み込み済み）。", "warn")
-   elif loaded:
-    self.notify(f"{len(loaded)} 件のファイルを読み込みました。", "ok")
-   if on_finished:
-    on_finished(loaded)
-  thread = TableLoadThread(jobs, self)
-  self._load_thread = thread
-  thread.one_done.connect(_on_one)
-  thread.progressed.connect(_on_progress)
-  thread.finished.connect(_on_finished)
-  self.progress_strip.start(f"読み込み中…（0/{len(jobs)}）", len(jobs))
-  thread.start()
-  return thread
- def _cancel_background(self):
-  thread = getattr(self, "_load_thread", None)
-  if thread is not None:
-   thread.cancel()
-   self._set_status("読み込みの中止を要求しました（実行中の1件が終わり次第停止）。")
- def _stop_background_tasks(self):
-  thread = getattr(self, "_load_thread", None)
-  if thread is not None:
-   thread.cancel()
-   thread.wait(5000)
-   self._load_thread = None
- def wait_for_loads(self, timeout_ms=30000):
-  app = QtWidgets.QApplication.instance()
-  deadline = QtCore.QElapsedTimer()
-  deadline.start()
-  while getattr(self, "_load_thread", None) is not None:
-   if deadline.hasExpired(timeout_ms):
-    return False
-   if app is not None:
-    app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 20)
-  if app is not None:
-   app.processEvents()
-  return True
- def add_folder(self):
-  d = QtWidgets.QFileDialog.getExistingDirectory(self, "フォルダを開く", self.last_dir)
-  if d:
-   self._load_folder(d)
- def _load_folder(self, d):
-  exts = set(TABLE_EXTS)
-  try:
-   names = sorted(os.listdir(d))
-  except OSError as e:
-   QtWidgets.QMessageBox.critical(self, "フォルダを開く", str(e))
-   return
-  files = [os.path.join(d, f) for f in names if os.path.splitext(f)[1].lower() in exts and os.path.isfile(os.path.join(d, f))]
-  if not files:
-   self.notify("このフォルダに読み込めるデータファイルがありません。", "warn")
-   return
-  if len(files) > 40:
-   ret = QtWidgets.QMessageBox.question( self, "フォルダを開く", f"{len(files)} 個のファイルが見つかりました。すべて読み込みますか？")
-   if ret != QtWidgets.QMessageBox.StandardButton.Yes:
-    return
-  self.last_dir = d
-  self._load_files_async( files, on_finished=lambda labels: self.notify( f"フォルダを読み込みました: {os.path.basename(d)}" f"（{len(labels)}/{len(files)} ファイル）", "ok"))
- _LTSPICE_CANDIDATES = ( r"C:\Program Files\ADI\LTspice\LTspice.exe", r"C:\Program Files\LTC\LTspiceXVII\XVIIx64.exe", r"C:\Program Files (x86)\LTC\LTspiceIV\scad3.exe", )
- def _ltspice_exe(self):
-  p = self._ui_settings().value("ltspice/exe")
-  if p and os.path.isfile(str(p)):
-   return str(p)
-  cands = list(self._LTSPICE_CANDIDATES) + [ os.path.expanduser(r"~\AppData\Local\Programs\ADI\LTspice\LTspice.exe")]
-  for c in cands:
-   if os.path.isfile(c):
-    return c
-  try:
-   from spicelib.simulators.ltspice_simulator import LTspice
-   for c in LTspice.spice_exe:
-    if os.path.isfile(str(c)):
-     return str(c)
-  except Exception:
-   get_logger().debug("_ltspice_exe: 無視した例外", exc_info=True)
-  import shutil
-  return shutil.which("LTspice") or shutil.which("XVIIx64")
- def set_ltspice_path(self):
-  path, _ = QtWidgets.QFileDialog.getOpenFileName( self, "LTspice実行ファイルの場所", r"C:\Program Files", "LTspice (*.exe)")
-  if path:
-   self._ui_settings().setValue("ltspice/exe", path)
-   self._set_status(f"LTspiceの場所を設定しました: {path}")
- def run_ltspice_asc(self, path=None):
-  if getattr(self, "_lt_proc", None) is not None \
-                and self._lt_proc.state() != QtCore.QProcess.ProcessState.NotRunning:
-   self._set_status("LTspiceシミュレーションを実行中です。完了までお待ちください。")
-   return
-  if not path:
-   path, _ = QtWidgets.QFileDialog.getOpenFileName( self, "LTspice回路を実行", self.last_dir, "LTspice回路/ネットリスト (*.asc *.net)")
-   if not path:
-    return
-  exe = self._ltspice_exe()
-  if not exe:
-   ret = QtWidgets.QMessageBox.question( self, "LTspiceが見つかりません", "LTspice の実行ファイルが見つかりませんでした。\n場所を指定しますか？")
-   if ret == QtWidgets.QMessageBox.StandardButton.Yes:
-    self.set_ltspice_path()
-    exe = self._ltspice_exe()
-   if not exe:
-    return
-  self.last_dir = os.path.dirname(path)
-  raw = os.path.splitext(path)[0] + ".raw"
-  proc = QtCore.QProcess(self)
-  self._lt_proc = proc
-  proc.finished.connect( lambda code, _st, p=path, r=raw: self._on_ltspice_finished(code, p, r))
-  proc.start(exe, ["-b", path])
-  if not proc.waitForStarted(5000):
-   self._lt_proc = None
-   QtWidgets.QMessageBox.critical(self, "LTspice", f"起動できませんでした: {exe}")
-   return
-  self._set_status(f"LTspiceシミュレーション実行中… {os.path.basename(path)}" "（完了すると自動で波形を読み込みます）")
- def _on_ltspice_finished(self, code, asc_path, raw_path):
-  self._lt_proc = None
-  if not os.path.isfile(raw_path):
-   self.notify(f"シミュレーションは終了しましたが .raw が見つかりません（終了コード {code}）。\n" f"回路にエラーがないか LTspice で確認してください:\n{asc_path}", "warn")
-   return
-  self._load_file(raw_path)
-  self._refresh_columns()
-  if self._has_drawn:
-   self.draw_graph()
-  note = ("（ファイル監視ONなので、LTspice側で再実行すると自動更新されます）" if self._watch_enabled() else "（メニュー『ファイル→ファイルの変更を監視』をONにすると、" "LTspice側の再実行で自動更新されます）")
-  self._set_status(f"LTspice完了: {os.path.basename(raw_path)} を読み込みました {note}")
- def _watch_enabled(self):
-  return bool(getattr(self, "_watch_action", None) and self._watch_action.isChecked())
- def toggle_file_watch(self, on):
-  self._ui_settings().setValue("ui/watch_files", "1" if on else "0")
-  if on:
-   self._ensure_watcher()
-   self._rebuild_watch_paths()
-   self._set_status("ファイル監視: ON（監視中のファイルが更新されると自動で再読込・再描画します）")
-  else:
-   w = getattr(self, "_fs_watcher", None)
-   if w is not None and w.files():
-    w.removePaths(w.files())
-   self._set_status("ファイル監視: OFF")
- def _ensure_watcher(self):
-  if getattr(self, "_fs_watcher", None) is None:
-   self._fs_watcher = QtCore.QFileSystemWatcher(self)
-   self._fs_watcher.fileChanged.connect(self._on_watched_file_changed)
-   self._watch_pending = set()
-   self._watch_timer = QtCore.QTimer(self)
-   self._watch_timer.setSingleShot(True)
-   self._watch_timer.setInterval(600)
-   self._watch_timer.timeout.connect(self._reload_watched)
- def _rebuild_watch_paths(self):
-  if not self._watch_enabled():
-   return
-  self._ensure_watcher()
-  w = self._fs_watcher
-  if w.files():
-   w.removePaths(w.files())
-  paths = sorted({m.get("path") for m in self.meta.values() if m.get("path") and os.path.isfile(m.get("path"))})
-  if paths:
-   w.addPaths(paths)
- def _on_watched_file_changed(self, path):
-  self._watch_pending.add(path)
-  self._watch_timer.start()
- def _reload_watched(self):
-  pending, self._watch_pending = set(self._watch_pending), set()
-  labels = [l for l, m in self.meta.items() if m.get("path") in pending]
-  reloaded = []
-  for label in labels:
-   if self._reload_label_inplace(label):
-    reloaded.append(label)
-  self._rebuild_watch_paths()
-  if reloaded:
-   self._refresh_columns()
-   if self._has_drawn:
-    self.draw_graph()
-   self._set_status("自動再読込: " + ", ".join(reloaded))
- def _reload_all_files(self):
-  reloaded = [l for l in list(self.datasets) if self._reload_label_inplace(l)]
-  if reloaded:
-   self._refresh_columns()
-   if self._has_drawn:
-    self.draw_graph()
-   self._set_status(f"再読込しました: {len(reloaded)}ファイル")
-  else:
-   self._set_status("再読込できるファイルがありません（貼り付け・生成データのみ）。")
- def _reload_label_inplace(self, label):
-  meta = self.meta.get(label) or {}
-  path = meta.get("path")
-  if not path or not os.path.isfile(path):
-   return False
-  enc = meta.get("enc")
-  enc = None if (not enc or str(enc).startswith(("自動", "clipboard"))) else enc
-  try:
-   df, used_enc, used_delim = load_table( path, encoding=enc, delimiter=meta.get("delim"), sheet=meta.get("sheet"))
-  except Exception:
-   return False
-  self.datasets[label] = df
-  self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim, "sheet": meta.get("sheet")}
-  if getattr(self, "_preview_label", None) == label:
-   self._populate_preview(df, label=label)
-  return True
- def _find_file_item(self, label):
-  for i in range(self.file_list.count()):
-   if self.file_list.item(i).text() == label:
-    return self.file_list.item(i)
-  return None
- def _add_file_item(self, label):
-  it = QtWidgets.QListWidgetItem(label)
-  it.setToolTip(label)
-  self.file_list.addItem(it)
- def _push_recent(self, path):
-  if path in self.recent_files:
-   self.recent_files.remove(path)
-  self.recent_files.insert(0, path)
-  del self.recent_files[12:]
-  self._rebuild_recent_menu()
- def _rebuild_recent_menu(self):
-  self.recent_menu.clear()
-  if not self.recent_files:
-   act = self.recent_menu.addAction("（履歴なし）"); act.setEnabled(False)
-   return
-  for p in self.recent_files:
-   self.recent_menu.addAction(os.path.basename(p), lambda checked=False, q=p: self._open_recent(q))
- def _open_recent(self, path):
-  if not os.path.isfile(path):
-   self.notify(f"ファイルが見つかりません:\n{path}", "warn")
-   self.recent_files = [q for q in self.recent_files if q != path]
-   self._rebuild_recent_menu()
-   return
-  self._load_file(path)
-  self._refresh_columns()
-  if self._has_drawn:
-   self.draw_graph()
- def remove_file(self):
-  items = self.file_list.selectedItems()
-  if not items and self.file_list.currentItem():
-   items = [self.file_list.currentItem()]
-  labels = [it.text() for it in items]
-  if not labels:
-   self.notify("削除するファイルを選択してください。", "warn")
-   return
-  if len(labels) > 1:
-   ret = QtWidgets.QMessageBox.question( self, "一括削除", f"{len(labels)} 個のファイルを一覧から削除しますか？")
-   if ret != QtWidgets.QMessageBox.StandardButton.Yes:
-    return
-  self._remove_labels(labels)
-  self._set_status(f"{len(labels)} 個のファイルを削除しました。")
- def clear_all_files(self):
-  if not self.datasets:
-   self.notify("読み込み済みファイルがありません。", "warn")
-   return
-  ret = QtWidgets.QMessageBox.question( self, "全削除", f"読み込み済みの {len(self.datasets)} 個すべてを一覧から削除しますか？")
-  if ret != QtWidgets.QMessageBox.StandardButton.Yes:
-   return
-  n = len(self.datasets)
-  self._remove_labels(list(self.datasets.keys()))
-  self._set_status(f"すべて（{n} 個）のファイルを削除しました。")
- def _remove_labels(self, labels):
-  labelset = set(labels)
-  self._clear_dynamic_resample()
-  for label in labels:
-   self.datasets.pop(label, None)
-   self.meta.pop(label, None)
-  for key in [k for k in self.series_styles if k.split("\t", 1)[0] in labelset]:
-   self.series_styles.pop(key, None)
-  self._meas_annotations = []
-  self._ds_annotations = []
-  self._proto_annotations = None
-  if hasattr(self, "meas_table"):
-   self.meas_table.setRowCount(0)
-  if hasattr(self, "ds_table"):
-   self.ds_table.setRowCount(0)
-  self.file_list.blockSignals(True)
-  for i in range(self.file_list.count() - 1, -1, -1):
-   if self.file_list.item(i).text() in labelset:
-    self.file_list.takeItem(i)
-  self.file_list.blockSignals(False)
-  self._refresh_columns()
-  if self.datasets:
-   self.file_list.setCurrentRow(0)
-  else:
-   self._preview_label = None
-   self.table.clearContents()
-   self.table.setRowCount(0)
-   self.table.setColumnCount(0)
-   self._draw_placeholder()
- def reload_current(self):
-  it = self.file_list.currentItem()
-  if not it:
-   self.notify("ファイルを選択してください。", "warn")
-   return
-  label = it.text()
-  meta = dict(self.meta.get(label) or {})
-  path = meta.get("path", "")
-  if not path or not os.path.isfile(path):
-   self.notify(f"『{label}』は読み込み元のファイルが無いので再読込できません。", "warn", "貼り付けたデータや、数学チャンネル・カーブフィットなどで" "作ったデータセットが該当します（データはそのまま残しました）。")
-   return
-  df = self.datasets.get(label)
-  row = self.file_list.row(it)
-  self.datasets.pop(label, None)
-  self.meta.pop(label, None)
-  self.file_list.takeItem(row)
-  self._load_file(path)
-  if label not in self.datasets and df is not None:
-   self.datasets[label] = df
-   self.meta[label] = meta
-   if not self._find_file_item(label):
-    self._add_file_item(label)
-   self.notify(f"『{label}』を読み直せなかったので、元の内容を残しました。", "warn")
-  self._refresh_columns()
- def _on_file_selected(self, _row):
-  it = self.file_list.currentItem()
-  if it and it.text() in self.datasets:
-   self._populate_preview(self.datasets[it.text()], label=it.text())
-   meta = self.meta[it.text()]
-   self.enc_combo.setCurrentText(meta["enc"]) if self.enc_combo.findText(meta["enc"]) >= 0 else None
- def _refresh_columns(self):
-  seen, xcols = set(), []
-  for df in self.datasets.values():
-   for c in df.columns:
-    if c not in seen:
-     seen.add(c); xcols.append(c)
-  cur_x = self.x_combo.currentText()
-  self.x_combo.blockSignals(True)
-  self.x_combo.clear(); self.x_combo.addItems(xcols)
-  if cur_x in xcols:
-   self.x_combo.setCurrentText(cur_x)
-  self.x_combo.blockSignals(False)
-  if hasattr(self, "z_combo"):
-   cur_z = self.z_combo.currentText()
-   self.z_combo.blockSignals(True)
-   self.z_combo.clear(); self.z_combo.addItems(xcols)
-   if cur_z in xcols:
-    self.z_combo.setCurrentText(cur_z)
-   elif xcols:
-    self.z_combo.setCurrentText(xcols[-1])
-   self.z_combo.blockSignals(False)
-  checked = QtCore.Qt.CheckState.Checked
-  unchecked = QtCore.Qt.CheckState.Unchecked
-  if hasattr(self, "x_list"):
-   prev_x = {self.x_list.item(i).data(UserRole) for i in range(self.x_list.count()) if self.x_list.item(i).checkState() == checked}
-   self.x_list.blockSignals(True)
-   self.x_list.clear()
-   for c in xcols:
-    it = QtWidgets.QListWidgetItem(str(c))
-    it.setData(UserRole, c)
-    it.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsEnabled)
-    it.setCheckState(checked if c in prev_x else unchecked)
-    self.x_list.addItem(it)
-   self.x_list.blockSignals(False)
-  prev = {self.y_list.item(i).data(UserRole) for i in range(self.y_list.count()) if self.y_list.item(i).checkState() == checked}
-  self.y_list.blockSignals(True)
-  self.y_list.clear()
-  multi = len(self.datasets) > 1
-  use_left = self._use_leftmost_x()
-  for label, df in self.datasets.items():
-   for ci, c in enumerate(df.columns):
-    if use_left and ci == 0:
-     continue
-    disp = f"{label} | {c}" if multi else c
-    item = QtWidgets.QListWidgetItem(disp)
-    item.setData(UserRole, (label, c))
-    item.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsEnabled)
-    item.setCheckState(checked if (label, c) in prev else unchecked)
-    self.y_list.addItem(item)
-  self.y_list.blockSignals(False)
-  if hasattr(self, "explorer"):
-   self._rebuild_explorer()
-  self._rebuild_watch_paths()
-  self._on_y_selection_changed()
- def _selected_series_items(self):
-  out = []
-  for i in range(self.y_list.count()):
-   it = self.y_list.item(i)
-   if it.checkState() == QtCore.Qt.CheckState.Checked:
-    fl, col = it.data(UserRole)
-    out.append((fl, col, it.text()))
-  return out
- def _populate_preview(self, df, label=None):
-  import pandas as pd
-  self._preview_loading = True
-  try:
-   head = df.head(PREVIEW_ROWS)
-   cols = list(df.columns)
-   self.table.clear()
-   self.table.setColumnCount(len(cols))
-   self.table.setRowCount(len(head))
-   self.table.setHorizontalHeaderLabels([str(c) for c in cols])
-   nan_bg = QtGui.QBrush(QtGui.QColor("#ffe4e1"))
-   for r in range(len(head)):
-    for c in range(len(cols)):
-     v = head.iat[r, c]
-     missing = pd.isna(v)
-     it = QtWidgets.QTableWidgetItem("" if missing else str(v))
-     if missing:
-      it.setBackground(nan_bg)
-      it.setToolTip("欠損値（NaN）")
-     self.table.setItem(r, c, it)
-   for c, col in enumerate(cols):
-    s = df[col]
-    n_nan = int(s.isna().sum())
-    tip = [f"列: {col}", f"型: {s.dtype}", f"全 {len(s):,} 行"]
-    if n_nan:
-     tip.append(f"⚠ 欠損: {n_nan:,} 行（{n_nan / max(len(s), 1):.1%}）")
-    if pd.api.types.is_numeric_dtype(s):
-     v = s.dropna()
-     if len(v):
-      tip.append(f"範囲: {v.min():.6g} 〜 {v.max():.6g}")
-    hi = QtWidgets.QTableWidgetItem(("⚠ " if n_nan else "") + str(col))
-    hi.setToolTip("\n".join(tip))
-    self.table.setHorizontalHeaderItem(c, hi)
-   self.table.resizeColumnsToContents()
-   if label is not None:
-    self._preview_label = label
-  finally:
-   self._preview_loading = False
- def _on_edit_toggle(self, on):
-  ET = QtWidgets.QAbstractItemView.EditTrigger
-  self.table.setEditTriggers( (ET.DoubleClicked | ET.EditKeyPressed | ET.AnyKeyPressed) if on else ET.NoEditTriggers)
- def _on_cell_edited(self, item):
-  if self._preview_loading or not getattr(self, "_preview_label", None):
-   return
-  import pandas as pd
-  df = self.datasets.get(self._preview_label)
-  if df is None:
-   return
-  r, c = item.row(), item.column()
-  if r >= len(df) or c >= df.shape[1]:
-   return
-  col = df.columns[c]
-  text = item.text()
-  if pd.api.types.is_numeric_dtype(df[col]):
-   val = pd.to_numeric(text, errors="coerce")
-  else:
-   val = text
-  old = df.iat[r, c]
-  df.iat[r, c] = val
-  self._data_record({"kind": "cell", "label": self._preview_label, "row": r, "col": c, "old": old, "new": val})
-  self._set_status(f"編集: {self._preview_label} 行{r}「{col}」= {text}")
-  self._request_redraw()
- def _edit_target(self):
-  lbl = getattr(self, "_preview_label", None)
-  if not lbl or lbl not in self.datasets:
-   self.notify("左の一覧でファイルを選択してください。", "warn")
-   return None
-  return lbl
- def _row_add(self):
-  import numpy as np
-  lbl = self._edit_target()
-  if not lbl:
-   return
-  df = self.datasets[lbl]
-  df.loc[len(df)] = [np.nan] * df.shape[1]
-  df.reset_index(drop=True, inplace=True)
-  self._data_record({"kind": "row_add", "label": lbl})
-  self._populate_preview(df, label=lbl)
-  if len(df) > PREVIEW_ROWS:
-   self._set_status(f"行を追加（全{len(df)}行。表示は先頭{PREVIEW_ROWS}行）")
-  self._request_redraw()
- def _row_del(self):
-  lbl = self._edit_target()
-  if not lbl:
-   return
-  rows = sorted({i.row() for i in self.table.selectedIndexes()})
-  if not rows:
-   self._set_status("削除する行を選択してください。")
-   return
-  df = self.datasets[lbl]
-  self._data_record({"kind": "row_del", "label": lbl, "rows": rows, "data": df.iloc[rows].copy()})
-  df.drop(df.index[rows], inplace=True)
-  df.reset_index(drop=True, inplace=True)
-  self._populate_preview(df, label=lbl)
-  self._request_redraw()
- def _col_add(self):
-  lbl = self._edit_target()
-  if not lbl:
-   return
-  name, ok = QtWidgets.QInputDialog.getText(self, "列追加", "新しい列名:")
-  name = (name or "").strip()
-  if not ok or not name:
-   return
-  df = self.datasets[lbl]
-  if name in df.columns:
-   self.notify("同名の列が既にあります。", "warn")
-   return
-  df[name] = 0.0
-  self._data_record({"kind": "col_add", "label": lbl, "name": name})
-  self._populate_preview(df, label=lbl)
-  self._refresh_columns()
-  self._set_status(f"列「{name}」を追加（値0.0で初期化）")
- def _data_record(self, op):
-  if not hasattr(self, "_data_hist"):
-   self._data_hist, self._data_hist_i = [], -1
-  del self._data_hist[self._data_hist_i + 1:]
-  self._data_hist.append(op)
-  if len(self._data_hist) > 100:
-   self._data_hist.pop(0)
-  self._data_hist_i = len(self._data_hist) - 1
- def _data_undo(self):
-  hist = getattr(self, "_data_hist", None)
-  if not hist or self._data_hist_i < 0:
-   self._set_status("戻せるデータ編集はありません。")
-   return
-  op = hist[self._data_hist_i]
-  if self._data_apply(op, forward=False):
-   self._data_hist_i -= 1
-   self._set_status(f"データ編集を戻しました（{self._data_op_name(op)}）。")
- def _data_redo(self):
-  hist = getattr(self, "_data_hist", None)
-  if not hist or self._data_hist_i >= len(hist) - 1:
-   self._set_status("やり直せるデータ編集はありません。")
-   return
-  op = hist[self._data_hist_i + 1]
-  if self._data_apply(op, forward=True):
-   self._data_hist_i += 1
-   self._set_status(f"データ編集をやり直しました（{self._data_op_name(op)}）。")
- @staticmethod
- def _data_op_name(op):
-  return {"cell": "セル編集", "row_add": "行追加", "row_del": "行削除", "col_add": "列追加"}.get(op["kind"], op["kind"])
- def _data_apply(self, op, forward):
-  import pandas as pd
-  label = op["label"]
-  df = self.datasets.get(label)
-  if df is None:
-   self._set_status(f"対象ファイル「{label}」は読み込まれていません。")
-   return False
-  kind = op["kind"]
-  if kind == "cell":
-   r, c = op["row"], op["col"]
-   if r >= len(df) or c >= df.shape[1]:
-    return False
-   df.iat[r, c] = op["new"] if forward else op["old"]
-  elif kind == "row_add":
-   if forward:
-    import numpy as np
-    df.loc[len(df)] = [np.nan] * df.shape[1]
-    df.reset_index(drop=True, inplace=True)
-   else:
-    if not len(df):
-     return False
-    df.drop(df.index[-1], inplace=True)
-    df.reset_index(drop=True, inplace=True)
-  elif kind == "row_del":
-   if forward:
-    df.drop(df.index[op["rows"]], inplace=True)
-    df.reset_index(drop=True, inplace=True)
-   else:
-    parts, prev = [], 0
-    for j, r in enumerate(op["rows"]):
-     cut = r - j
-     parts.append(df.iloc[prev:cut])
-     parts.append(op["data"].iloc[[j]])
-     prev = cut
-    parts.append(df.iloc[prev:])
-    self.datasets[label] = pd.concat(parts, ignore_index=True)
-  elif kind == "col_add":
-   if forward:
-    self.datasets[label][op["name"]] = 0.0
-   else:
-    self.datasets[label].drop(columns=[op["name"]], inplace=True, errors="ignore")
-  df2 = self.datasets[label]
-  if getattr(self, "_preview_label", None) == label:
-   self._populate_preview(df2, label=label)
-  if kind == "col_add":
-   self._refresh_columns()
-  self._request_redraw()
-  return True
- def _save_csv(self):
-  lbl = self._edit_target()
-  if not lbl:
-   return
-  default = lbl if lbl.lower().endswith((".csv", ".tsv")) else lbl + ".csv"
-  path, _ = QtWidgets.QFileDialog.getSaveFileName( self, "CSV/TSVとして保存", default, "CSV (*.csv);;TSV (*.tsv);;全てのファイル (*.*)")
-  if not path:
-   return
-  try:
-   sep = "\t" if path.lower().endswith(".tsv") else ","
-   self.datasets[lbl].to_csv(path, index=False, sep=sep, encoding="utf-8-sig")
-   self._set_status(f"保存しました: {path}（全{len(self.datasets[lbl])}行）")
-  except Exception as e:
-   QtWidgets.QMessageBox.critical(self, "保存エラー", str(e))
- def _build_tab_data(self):
-  w = QtWidgets.QWidget()
-  v = QtWidgets.QVBoxLayout(w)
-  v.setContentsMargins(2, 2, 2, 2)
-  note = QtWidgets.QLabel("Y系列の選択は「読み込み済みファイル」ウィンドウで行います" "（表示メニューから再表示できます）。")
-  note.setWordWrap(True); note.setStyleSheet("color:#666;")
-  v.addWidget(note)
-  sec_axes = self._fmt_section("軸の選択（X・Z・3D）", "axes_sel", True)
-  v.addWidget(sec_axes)
-  av = QtWidgets.QVBoxLayout()
-  av.addWidget(QtWidgets.QLabel("X軸（横軸 / ラベル）"))
-  self.xleft_check = QtWidgets.QCheckBox("一番左の列をX軸にする（位置で固定）")
-  self.xleft_check.setToolTip( "ONにすると各ファイルの『一番左の列』をX軸に使います（列名が違っても適用）。\n" "複数ファイル／バッチ出力でX軸を固定したいときに便利。\n" "OFFなら下のコンボで列名を指定します。")
-  self.xleft_check.toggled.connect(self._on_xleft_toggled)
-  av.addWidget(self.xleft_check)
-  self.x_combo = QtWidgets.QComboBox()
-  self.x_combo.setToolTip("横軸に使う列（列名で指定）。波形なら時間列を選びます。")
-  self.x_combo.currentTextChanged.connect(self._on_x_changed)
-  av.addWidget(self.x_combo)
-  xrow = QtWidgets.QHBoxLayout()
-  self.swap_xy_check = QtWidgets.QCheckBox("X↔Y 入れ替え")
-  self.swap_xy_check.setToolTip("XとYを入れ替えて描く（軸の“向き反転”0→1↔1→0 とは別）。" "散布図・折れ線などの2D種別で有効。")
-  self.swap_xy_check.toggled.connect(self._request_redraw)
-  xrow.addWidget(self.swap_xy_check)
-  self.multix_check = QtWidgets.QCheckBox("X軸を複数選択")
-  self.multix_check.setToolTip("ONにすると下のリストでチェックした複数の列をXにし、" "各X×各Yの組み合わせを系列として描きます。")
-  self.multix_check.setEnabled(False)
-  self.multix_check.toggled.connect(self._on_multix_toggled)
-  xrow.addWidget(self.multix_check); xrow.addStretch(1)
-  av.addLayout(xrow)
-  self.x_list = CheckListWidget()
-  self.x_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
-  self.x_list.setToolTip("『X軸を複数選択』ON時に、Xに使う列をチェックします。")
-  self.x_list.setStyleSheet("QListWidget::indicator { width:16px; height:16px; }")
-  self.x_list.setMaximumHeight(90)
-  self.x_list.itemChanged.connect(self._request_redraw)
-  self.x_list.setEnabled(False)
-  av.addWidget(self.x_list)
-  self.z_label = QtWidgets.QLabel("Z軸（3Dの奥行き）")
-  av.addWidget(self.z_label)
-  self.z_combo = QtWidgets.QComboBox()
-  self.z_combo.setToolTip("3Dグラフの奥行き（Z軸）に使う列。3D種別のときだけ有効になります。")
-  self.z_combo.currentTextChanged.connect(self._on_x_changed)
-  self.z_combo.setEnabled(False)
-  av.addWidget(self.z_combo)
-  self.threed_check = QtWidgets.QCheckBox("3D表示（Z軸を使う・ドラッグで回転）")
-  self.threed_check.setToolTip( "散布図・折れ線・棒でONにするとZ軸を使った3D描画になります。\n" "曲面は常に3Dです。3D対応でない種別では選べません（種別は書式パネルで選択）。")
-  self.threed_check.setEnabled(False)
-  self.threed_check.toggled.connect(self._on_3d_toggled)
-  av.addWidget(self.threed_check)
-  view = QtWidgets.QHBoxLayout()
-  view.addWidget(QtWidgets.QLabel("3D視点 仰角"))
-  self.elev_spin = QtWidgets.QSpinBox(); self.elev_spin.setRange(-90, 90)
-  self.elev_spin.setValue(30)
-  self.elev_spin.setToolTip("3Dグラフの仰角（上下の見おろし角）。ドラッグでも回転できます。")
-  self.elev_spin.valueChanged.connect(self._on_view_angle_changed)
-  view.addWidget(self.elev_spin)
-  view.addWidget(QtWidgets.QLabel("方位"))
-  self.azim_spin = QtWidgets.QSpinBox(); self.azim_spin.setRange(-180, 180)
-  self.azim_spin.setValue(-60)
-  self.azim_spin.setToolTip("3Dグラフの方位（左右の回転角）。ドラッグでも回転できます。")
-  self.azim_spin.valueChanged.connect(self._on_view_angle_changed)
-  view.addWidget(self.azim_spin)
-  view.addStretch(1)
-  self.elev_spin.setEnabled(False); self.azim_spin.setEnabled(False)
-  av.addLayout(view)
-  sec_axes.set_content_layout(av)
-  self.y_list = CheckListWidget()
-  self.y_list.setVisible(False)
-  self.y_list.itemChanged.connect(self._on_y_check_changed)
-  self.y_list.itemDoubleClicked.connect(self._on_y_double_clicked)
-  v.addStretch(1)
-  return w
-"""StyleTableMixin: GraphApp から分離した StyleTableMixin 群（挙動は本体と同一）。"""
-class StyleTableMixin:
- def _on_x_changed(self, *_):
-  self._request_redraw()
- def _on_xleft_toggled(self, on):
-  self._refresh_columns()
-  self._update_x_combo_enabled()
-  self._update_x_multi_enabled()
- def _update_x_combo_enabled(self):
-  info = CHART_INFO.get(self.chart_combo.currentText(), {})
-  self.x_combo.setEnabled(info.get("use_x", True) and not self._use_leftmost_x())
- def _update_z_combo_enabled(self):
-  if not hasattr(self, "z_combo"):
-   return
-  self.z_combo.setEnabled(self._want_3d())
- def _use_leftmost_x(self):
-  return bool(getattr(self, "xleft_check", None) and self.xleft_check.isChecked())
- def _x_values(self, df, xname=None):
-  if xname is None and self._use_leftmost_x():
-   return df.iloc[:, 0].to_numpy()
-  name = xname if xname is not None else self.x_combo.currentText()
-  return df[name].to_numpy() if name in df.columns else df.iloc[:, 0].to_numpy()
- def _selected_x_columns(self):
-  if (getattr(self, "multix_check", None) and self.multix_check.isChecked() and not self._use_leftmost_x()):
-   cols = [self.x_list.item(i).data(UserRole) for i in range(self.x_list.count()) if self.x_list.item(i).checkState() == QtCore.Qt.CheckState.Checked]
-   if cols:
-    return cols
-  return [None if self._use_leftmost_x() else self.x_combo.currentText()]
- def _update_x_multi_enabled(self):
-  if not hasattr(self, "multix_check"):
-   return
-  info = CHART_INFO.get(self.chart_combo.currentText(), {})
-  ok = (self.chart_combo.currentText() in _SWAP_TYPES and not self._use_leftmost_x() and not self._want_3d())
-  if not ok and self.multix_check.isChecked():
-   self.multix_check.blockSignals(True)
-   self.multix_check.setChecked(False)
-   self.multix_check.blockSignals(False)
-  self.multix_check.setEnabled(ok)
-  self.x_list.setEnabled(ok and self.multix_check.isChecked())
- def _z_values(self, df):
-  zname = self.z_combo.currentText() if hasattr(self, "z_combo") else ""
-  return df[zname].to_numpy() if zname in df.columns else df.iloc[:, -1].to_numpy()
- def _effective_x_label(self):
-  if self._use_leftmost_x():
-   items = self._selected_series_items()
-   if items:
-    df = self.datasets.get(items[0][0])
-    if df is not None and len(df.columns):
-     return str(df.columns[0])
-   return ""
-  xcols = self._selected_x_columns()
-  if len(xcols) > 1:
-   return " / ".join(str(c) for c in xcols)
-  return self.x_combo.currentText()
- @staticmethod
- def _auto_y_label(names, ctype):
-  if ctype == "ヒストグラム":
-   return ""
-  uniq = list(dict.fromkeys(n for n in names if n))
-  if not uniq:
-   return ""
-  if len(uniq) == 1:
-   return uniq[0]
-  joined = " / ".join(uniq)
-  return joined if len(joined) <= 40 else f"{uniq[0]} ほか{len(uniq) - 1}系列"
- def _file_display_name(self, fl):
-  if hasattr(self, "show_ext_check") and not self.show_ext_check.isChecked():
-   return os.path.splitext(fl)[0]
-  return fl
- def _series_label(self, fl, col):
-  st = self.series_styles.get(self._style_key(fl, col)) or {}
-  if st.get("label"):
-   return st["label"]
-  multi = len(self.datasets) > 1
-  show_fn = (not hasattr(self, "show_filename_check")) or self.show_filename_check.isChecked()
-  if multi and show_fn:
-   return f"{self._file_display_name(fl)} | {col}"
-  return col
- def _effective_y_label(self):
-  names = []
-  for fl, col, disp in self._selected_series_items():
-   st = self.series_styles.get(self._style_key(fl, col)) or {}
-   if st.get("axis", "primary") == "secondary":
-    continue
-   names.append(st.get("label") or col)
-  return self._auto_y_label(names, self.chart_combo.currentText())
- def _on_y_check_changed(self, _item):
-  if self._suspend_redraw:
-   return
-  self._rebuild_series_bar()
-  timer = getattr(self, "_ysel_timer", None)
-  if timer is None:
-   timer = self._ysel_timer = QtCore.QTimer(self)
-   timer.setSingleShot(True)
-   timer.timeout.connect(self._apply_y_selection_deferred)
-  timer.start(30)
- def _apply_y_selection_deferred(self):
-  self._rebuild_style_table()
-  self._update_analysis_targets()
-  self._request_redraw()
- def _set_all_checks(self, func):
-  ck = QtCore.Qt.CheckState.Checked
-  un = QtCore.Qt.CheckState.Unchecked
-  self.y_list.blockSignals(True)
-  for i in range(self.y_list.count()):
-   it = self.y_list.item(i)
-   it.setCheckState(ck if func(it) else un)
-  self.y_list.blockSignals(False)
-  self._on_y_selection_changed()
- def _check_all_y(self, checked):
-  self._set_all_checks(lambda it: checked)
- def _invert_y(self):
-  ck = QtCore.Qt.CheckState.Checked
-  self._set_all_checks(lambda it: it.checkState() != ck)
- def select_by_name(self):
-  text = self.y_filter.text().strip()
-  if not text:
-   self._set_status("名前を入力してください（例: 電圧）。")
-   return
-  tl = text.lower()
-  def match(it):
-   fl, col = it.data(UserRole)
-   return tl in str(col).lower() or tl in it.text().lower()
-  self._set_all_checks(match)
-  n = sum(1 for i in range(self.y_list.count()) if self.y_list.item(i).checkState() == QtCore.Qt.CheckState.Checked)
-  self._set_status(f"「{text}」を含む系列を {n} 件選択しました。" if n else f"「{text}」を含む系列はありません。")
- def _select_same_name(self, item):
-  if item is None:
-   return
-  col = item.data(UserRole)[1]
-  self._set_all_checks(lambda it: it.data(UserRole)[1] == col)
-  self._set_status(f"列名「{col}」の系列をすべて選択しました。")
- def _on_y_double_clicked(self, item):
-  self._set_all_checks(lambda it: it is item)
-  self.draw_graph()
- def _maybe_draw(self):
-  if self.datasets:
-   self.draw_graph()
- def _series_menu(self, item):
-  menu = QtWidgets.QMenu(self)
-  if item is not None:
-   menu.addAction("この系列だけ表示", lambda: self._solo_series(item))
-   menu.addAction("この系列を非表示", lambda: self._hide_series(item))
-   menu.addAction("同じ列名をすべて選択", lambda: (self._select_same_name(item), self._maybe_draw()))
-   menu.addSeparator()
-  menu.addAction("すべて表示", lambda: (self._check_all_y(True), self._maybe_draw()))
-  menu.addAction("すべて非表示", lambda: (self._check_all_y(False), self._maybe_draw()))
-  return menu
- def _y_list_menu(self, pos):
-  item = self.y_list.itemAt(pos)
-  self._series_menu(item).exec(self.y_list.viewport().mapToGlobal(pos))
- def _solo_series(self, item):
-  self._set_all_checks(lambda it: it is item)
-  self._maybe_draw()
- def _hide_series(self, item):
-  item.setCheckState(QtCore.Qt.CheckState.Unchecked)
-  self._maybe_draw()
- def _on_style_label_edited(self, item):
-  if self._suspend_redraw or item.column() != 0:
-   return
-  key = item.data(UserRole)
-  if not key:
-   return
-  text = item.text().strip()
-  st = self.series_styles.setdefault(key, dict(DEFAULT_STYLE))
-  st["label"] = text or None
-  self._request_redraw()
- def _on_y_selection_changed(self):
-  self._rebuild_style_table()
-  self._rebuild_series_bar()
-  self._update_analysis_targets()
-  self._request_redraw()
- def _update_analysis_targets(self):
-  names = [d for _, _, d in self._selected_series_items()]
-  combos = [self.analysis_target]
-  for attr in ("phase_target2", "math_a", "math_b", "ds_target", "fill_a"):
-   if hasattr(self, attr):
-    combos.append(getattr(self, attr))
-  if hasattr(self, "proto_ch"):
-   combos.extend(self.proto_ch)
-  for cb in combos:
-   cur = cb.currentText()
-   cb.blockSignals(True)
-   cb.clear()
-   cb.addItems(names)
-   idx = cb.findText(cur)
-   if idx >= 0:
-    cb.setCurrentIndex(idx)
-   cb.blockSignals(False)
-  if hasattr(self, "fill_b"):
-   cur = self.fill_b.currentText()
-   self.fill_b.blockSignals(True)
-   self.fill_b.clear()
-   self.fill_b.addItem("0（X軸）")
-   self.fill_b.addItems(names)
-   idx = self.fill_b.findText(cur)
-   if idx >= 0:
-    self.fill_b.setCurrentIndex(idx)
-   self.fill_b.blockSignals(False)
- @staticmethod
- def _style_key(fl, col):
-  return f"{fl}\t{col}"
- def _rebuild_style_table(self):
-  items = self._selected_series_items()
-  new_keys = [self._style_key(fl, col) for fl, col, _ in items]
-  old_keys = [ (self.style_table.item(r, 0).data(UserRole) if self.style_table.item(r, 0) else None) for r in range(self.style_table.rowCount())]
-  if new_keys == old_keys:
-   return
-  i = 0
-  m = min(len(new_keys), len(old_keys))
-  while i < m and new_keys[i] == old_keys[i]:
-   i += 1
-  prev_suspend = self._suspend_redraw
-  self._suspend_redraw = True
-  vbar = self.style_table.verticalScrollBar().value()
-  self.style_table.setUpdatesEnabled(False)
-  self.style_table.setRowCount(len(items))
-  for r in range(i, len(items)):
-   fl, col, disp = items[r]
-   self._build_style_row(r, fl, col, disp)
-  self.style_table.setUpdatesEnabled(True)
-  self.style_table.verticalScrollBar().setValue(vbar)
-  self._suspend_redraw = prev_suspend
- def _build_style_row(self, r, fl, col, disp):
-  key = self._style_key(fl, col)
-  st = self.series_styles.setdefault(key, dict(DEFAULT_STYLE))
-  name_item = QtWidgets.QTableWidgetItem(st.get("label") or disp)
-  name_item.setData(UserRole, key)
-  name_item.setFlags(name_item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
-  self.style_table.setItem(r, 0, name_item)
-  btn = QtWidgets.QPushButton(st.get("color") or "自動")
-  if st.get("color"):
-   btn.setStyleSheet(f"background:{st['color']};")
-  btn.clicked.connect(lambda _=False, k=key, b=btn: self._pick_color(k, b))
-  self.style_table.setCellWidget(r, 1, btn)
-  cb = QtWidgets.QComboBox(); cb.addItems(list(LINESTYLES.keys()))
-  cur_ls = next((k2 for k2, vv in LINESTYLES.items() if vv == st["linestyle"]), "実線")
-  cb.setCurrentText(cur_ls)
-  cb.currentTextChanged.connect(lambda v, k=key: self._set_style(k, "linestyle", LINESTYLES[v]))
-  self.style_table.setCellWidget(r, 2, cb)
-  sp = QtWidgets.QDoubleSpinBox(); sp.setRange(0.2, 10); sp.setSingleStep(0.5); sp.setValue(st["linewidth"])
-  sp.valueChanged.connect(lambda v, k=key: self._set_style(k, "linewidth", v))
-  self.style_table.setCellWidget(r, 3, sp)
-  mb = QtWidgets.QComboBox(); mb.addItems(list(MARKERS.keys()))
-  cur_mk = next((k2 for k2, vv in MARKERS.items() if vv == st["marker"]), "なし")
-  mb.setCurrentText(cur_mk)
-  mb.currentTextChanged.connect(lambda v, k=key: self._set_style(k, "marker", MARKERS[v]))
-  self.style_table.setCellWidget(r, 4, mb)
-  msp = QtWidgets.QDoubleSpinBox(); msp.setRange(1, 50); msp.setSingleStep(1); msp.setDecimals(1)
-  msp.setValue(st.get("markersize", 4.0))
-  msp.setToolTip("マーカーの大きさ（マーカーを「なし」以外にすると反映）")
-  msp.valueChanged.connect(lambda v, k=key: self._set_style(k, "markersize", v))
-  self.style_table.setCellWidget(r, 5, msp)
-  axb = QtWidgets.QComboBox(); axb.addItems(list(SERIES_AXES.keys()))
-  axb.setCurrentText(next((k2 for k2, vv in SERIES_AXES.items() if vv == st.get("axis", "primary")), "主軸"))
-  axb.currentTextChanged.connect( lambda v, k=key: self._set_style(k, "axis", SERIES_AXES[v]))
-  self.style_table.setCellWidget(r, 6, axb)
-  kb = QtWidgets.QComboBox(); kb.addItems(list(SERIES_KINDS.keys()))
-  kb.setCurrentText(next((k2 for k2, vv in SERIES_KINDS.items() if vv == st.get("kind", "")), "自動"))
-  kb.currentTextChanged.connect( lambda v, k=key: self._set_style(k, "kind", SERIES_KINDS[v]))
-  self.style_table.setCellWidget(r, 7, kb)
-  cur_e = st.get("errcol")
-  eb = LazyColumnCombo( (lambda fl=fl: list(self.datasets[fl].columns) if fl in self.datasets else []), cur_e if cur_e is not None else None)
-  eb.currentTextChanged.connect( lambda v, k=key: self._set_style(k, "errcol", None if v == "なし" else v))
-  self.style_table.setCellWidget(r, 8, eb)
- def _pick_color(self, skey, btn):
-  col = QtWidgets.QColorDialog.getColor(parent=self)
-  if col.isValid():
-   hexc = col.name()
-   self._set_style(skey, "color", hexc)
-   btn.setText(hexc); btn.setStyleSheet(f"background:{hexc};")
- _COLOR_BUTTONS = { "bg": ("bg_color", "bg_btn", "背景色: "), "trend": ("trend_color", "trend_color_btn", "色: "), "fill": ("fill_color", "fill_color_btn", "色: "), }
- def pick_color(self, kind):
-  attr, btn_name, prefix = self._COLOR_BUTTONS[kind]
-  col = QtWidgets.QColorDialog.getColor(parent=self)
-  if not col.isValid():
-   return
-  setattr(self, attr, col.name())
-  btn = getattr(self, btn_name)
-  btn.setText(prefix + col.name())
-  btn.setStyleSheet(f"background:{col.name()};")
-  self._request_redraw()
- def reset_color(self, kind):
-  attr, btn_name, prefix = self._COLOR_BUTTONS[kind]
-  setattr(self, attr, "")
-  btn = getattr(self, btn_name)
-  btn.setText(prefix + "自動")
-  btn.setStyleSheet("")
-  self._request_redraw()
- def _wire_color_button(self, kind):
-  _attr, btn_name, _prefix = self._COLOR_BUTTONS[kind]
-  btn = getattr(self, btn_name)
-  btn.clicked.connect(lambda *_a, k=kind: self.pick_color(k))
-  btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-  btn.customContextMenuRequested.connect(lambda *_a, k=kind: self.reset_color(k))
-  return btn
- def _reset_bg_color(self):
-  self.reset_color("bg")
- def _reset_trend_color(self):
-  self.reset_color("trend")
- def _reset_fill_color(self):
-  self.reset_color("fill")
- _STYLE_VISUAL = frozenset({"color", "linewidth", "linestyle", "marker", "markersize"})
- def _set_style(self, skey, attr, value):
-  self.series_styles.setdefault(skey, dict(DEFAULT_STYLE))[attr] = value
-  if not self._try_style_fastpath(skey, attr, value):
-   self._request_redraw()
- def _build_style_artist_map(self, series, ctype, decimated):
-  m = {}
-  if ctype != "折れ線" or decimated:
-   return m
-  items = self._selected_series_items()
-  if len(items) != len(series):
-   return m
-  for sr in series:
-   if (sr.get("kind") or "") not in ("", "line") or sr.get("yerr") is not None:
-    return m
-  from matplotlib.lines import Line2D
-  def _data_lines(axx):
-   return [ln for ln in axx.get_lines() if isinstance(ln, Line2D) and not str(ln.get_label()).startswith("_") and "近似" not in str(ln.get_label())]
-  ax = self.ax
-  ax2 = getattr(ax, "_twin_secondary", None)
-  prim = _data_lines(ax)
-  sec = _data_lines(ax2) if ax2 is not None else []
-  prim_items = [it for it, sr in zip(items, series) if sr.get("axis") != "secondary"]
-  sec_items = [it for it, sr in zip(items, series) if sr.get("axis") == "secondary"]
-  if len(prim_items) != len(prim) or len(sec_items) != len(sec):
-   return m
-  for (fl, col, _disp), ln in zip(prim_items, prim):
-   m[self._style_key(fl, col)] = ln
-  for (fl, col, _disp), ln in zip(sec_items, sec):
-   m[self._style_key(fl, col)] = ln
-  return m
- def _try_style_fastpath(self, skey, attr, value):
-  if attr not in self._STYLE_VISUAL:
-   return False
-  if self._suspend_redraw or not self._has_drawn:
-   return False
-  if not getattr(self, "live_check", None) or not self.live_check.isChecked():
-   return False
-  if self._redraw_timer.isActive():
-   return False
-  if self.chart_combo.currentText() != "折れ線":
-   return False
-  if attr == "color" and not value:
-   return False
-  ln = self._style_artists.get(skey)
-  if ln is None or ln.axes is None:
-   return False
-  try:
-   if attr == "color":
-    ln.set_color(value)
-   elif attr == "linewidth":
-    ln.set_linewidth(float(value))
-   elif attr == "linestyle":
-    ln.set_linestyle(value)
-   elif attr == "marker":
-    ln.set_marker(value or "")
-   elif attr == "markersize":
-    ln.set_markersize(float(value))
-  except Exception:
-   return False
-  if attr == "color":
-   if self.legend_check.isChecked():
-    self._rebuild_legend_inplace()
-   self._rebuild_series_bar(self.chart_combo.currentText())
-  self.canvas.draw_idle()
-  return True
- def _rebuild_legend_inplace(self):
-  ax = self.ax
-  handles, labels = ax.get_legend_handles_labels()
-  ax2 = getattr(ax, "_twin_secondary", None)
-  if ax2 is not None:
-   h2, l2 = ax2.get_legend_handles_labels()
-   handles = handles + h2; labels = labels + l2
-  if handles:
-   f = self._fonts()
-   ax.legend(handles, labels, loc=self.legend_loc.currentText(), fontsize=(f.get("legend") or f.get("tick", 9)))
-"""PlotMixin: GraphApp から分離した PlotMixin 群（挙動は本体と同一）。"""
 class PlotMixin:
  def _request_redraw(self, *args):
   if self._suspend_redraw or not self._has_drawn:
@@ -6904,1500 +8026,383 @@ class PlotMixin:
  def _set_status(self, text, level="info", detail=""):
   self.status.showMessage(str(text))
   self._log_message(text, level, detail)
-"""ScopeCursorMixin: GraphApp から分離した ScopeCursorMixin 群（挙動は本体と同一）。"""
-class ScopeCursorMixin:
- def toggle_cursors(self, on):
-  if on and getattr(self, "gate_btn", None) and self.gate_btn.isChecked():
-   self.gate_btn.setChecked(False)
-  if on:
-   self._cursors = []
-   self._cursor_drag = None
-   self._cursor_text = None
-   self._clear_cursor_artists()
-   self._cursor_cid = ( self.canvas.mpl_connect("button_press_event", self._on_cursor_press), self.canvas.mpl_connect("motion_notify_event", self._on_cursor_motion), self.canvas.mpl_connect("button_release_event", self._on_cursor_release), )
-   self._set_status("カーソル: クリックで2本設置 → 線をドラッグで微調整（波形に追従）")
-  else:
-   if self._cursor_cid:
-    for c in self._cursor_cid:
-     self.canvas.mpl_disconnect(c)
-    self._cursor_cid = None
-   self._clear_cursor_artists()
-   self.canvas.draw_idle()
- def _clear_cursor_artists(self):
-  for a in self._cursor_artists:
-   try:
-    a.remove()
-   except Exception:
-    get_logger().debug("_clear_cursor_artists: 無視した例外", exc_info=True)
-  self._cursor_artists = []
-  self._cursors = []
-  self._cursor_text = None
- def _cursor_track_y(self, x):
-  if not self._plotted_artists:
-   return 0.0
-  try:
-   import numpy as np
-   line = self._plotted_artists[0][1]
-   xd = np.asarray(line.get_xdata(), float)
-   yd = np.asarray(line.get_ydata(), float)
-   order = np.argsort(xd)
-   return float(np.interp(x, xd[order], yd[order]))
-  except Exception:
-   return 0.0
- def _add_cursor(self, x):
-  y = self._cursor_track_y(x)
-  vl = self.ax.axvline(x, color="#e6194b", lw=0.9, ls="--")
-  mk, = self.ax.plot([x], [y], "o", color="#e6194b", ms=6)
-  self._cursors.append({"x": x, "vline": vl, "marker": mk})
-  self._cursor_artists += [vl, mk]
- def _cursor_near(self, event):
-  for i, c in enumerate(self._cursors):
-   try:
-    cx_px = self.ax.transData.transform((c["x"], 0))[0]
-    if abs(event.x - cx_px) < 8:
-     return i
-   except Exception:
-    get_logger().debug("_cursor_near: 無視した例外", exc_info=True)
-  return None
- def _on_cursor_press(self, event):
-  if event.inaxes is not self.ax or event.xdata is None:
+class StyleTableMixin:
+ def _on_x_changed(self, *_):
+  self._request_redraw()
+ def _on_xleft_toggled(self, on):
+  self._refresh_columns()
+  self._update_x_combo_enabled()
+  self._update_x_multi_enabled()
+ def _update_x_combo_enabled(self):
+  info = CHART_INFO.get(self.chart_combo.currentText(), {})
+  self.x_combo.setEnabled(info.get("use_x", True) and not self._use_leftmost_x())
+ def _update_z_combo_enabled(self):
+  if not hasattr(self, "z_combo"):
    return
-  if getattr(self.ax, "name", None) == "3d":
+  self.z_combo.setEnabled(self._want_3d())
+ def _use_leftmost_x(self):
+  return bool(getattr(self, "xleft_check", None) and self.xleft_check.isChecked())
+ def _x_values(self, df, xname=None):
+  if xname is None and self._use_leftmost_x():
+   return df.iloc[:, 0].to_numpy()
+  name = xname if xname is not None else self.x_combo.currentText()
+  return df[name].to_numpy() if name in df.columns else df.iloc[:, 0].to_numpy()
+ def _selected_x_columns(self):
+  if (getattr(self, "multix_check", None) and self.multix_check.isChecked() and not self._use_leftmost_x()):
+   cols = [self.x_list.item(i).data(UserRole) for i in range(self.x_list.count()) if self.x_list.item(i).checkState() == QtCore.Qt.CheckState.Checked]
+   if cols:
+    return cols
+  return [None if self._use_leftmost_x() else self.x_combo.currentText()]
+ def _update_x_multi_enabled(self):
+  if not hasattr(self, "multix_check"):
    return
-  near = self._cursor_near(event)
-  if near is not None:
-   self._cursor_drag = near
-   return
-  if len(self._cursors) >= 2:
-   self._clear_cursor_artists()
-  self._add_cursor(event.xdata)
-  self._update_cursor_readout()
-  self.canvas.draw_idle()
- def _on_cursor_motion(self, event):
-  if self._cursor_drag is None or event.inaxes is not self.ax or event.xdata is None:
-   return
-  c = self._cursors[self._cursor_drag]
-  c["x"] = event.xdata
-  c["vline"].set_xdata([event.xdata, event.xdata])
-  c["marker"].set_data([event.xdata], [self._cursor_track_y(event.xdata)])
-  self._update_cursor_readout()
-  self.canvas.draw_idle()
- def _on_cursor_release(self, event):
-  self._cursor_drag = None
- def _update_cursor_readout(self):
-  if self._cursor_text is not None:
-   try:
-    self._cursor_text.remove()
-   except Exception:
-    get_logger().debug("_update_cursor_readout: 無視した例外", exc_info=True)
-   self._cursor_text = None
-  if len(self._cursors) == 2:
-   x1, x2 = self._cursors[0]["x"], self._cursors[1]["x"]
-   y1, y2 = self._cursor_track_y(x1), self._cursor_track_y(x2)
-   dt, dv = x2 - x1, y2 - y1
-   freq = (1.0 / dt) if dt else float("inf")
-   txt = (f"Δt={format_eng(abs(dt))}  ΔV={format_eng(abs(dv))}" f"  1/Δt={format_eng(abs(freq))}Hz")
-   self._cursor_text = self.ax.text( 0.5, 0.98, txt, transform=self.ax.transAxes, ha="center", va="top", color="#e6194b", fontsize=9, bbox=dict(facecolor="white", alpha=0.75, edgecolor="#e6194b"))
-   self._cursor_artists.append(self._cursor_text)
-   self._set_status("カーソル  " + txt)
- def _scope_active(self):
-  return (self.scope_check.isChecked() and self.chart_combo.currentText() in ("折れ線", "散布図") and self._has_drawn and self._cursor_cid is None and not getattr(self.toolbar, "mode", ""))
- def _scope_overlay(self, text):
-  self._remove_scope_overlay()
-  self._scope_ov = self.ax.text( 0.99, 0.02, text, transform=self.ax.transAxes, ha="right", va="bottom", color="#7CFC00", fontsize=11, bbox=dict(facecolor="black", alpha=0.65, edgecolor="#7CFC00"))
- def _remove_scope_overlay(self):
-  if self._scope_ov is not None:
-   try:
-    self._scope_ov.remove()
-   except Exception:
-    get_logger().debug("_remove_scope_overlay: 無視した例外", exc_info=True)
-   self._scope_ov = None
- def _shift_held(self, event=None):
-  try:
-   mods = QtWidgets.QApplication.keyboardModifiers()
-   if bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier):
-    return True
-  except Exception:
-   get_logger().debug("_shift_held: 無視した例外", exc_info=True)
-  return bool(event is not None and event.key and "shift" in str(event.key))
- def _scope_on_press(self, event):
-  if (event.dblclick and event.button == 1 and event.inaxes is not None and event.inaxes in self.fig.axes and self._cursor_cid is None and not getattr(self.toolbar, "mode", "") and getattr(event.inaxes, "name", None) != "3d" and event.inaxes.get_label() != "<colorbar>" and getattr(self, "_has_drawn", False)):
-   self._autoscale_view()
-   return
-  if (not self._scope_active() or event.inaxes is not self.ax or event.button not in (1, 3) or event.x is None):
-   return
-  bbox = self.ax.get_window_extent()
-  self._scope_drag = { "button": event.button, "shift": self._shift_held(event), "px": (event.x, event.y), "xlim": self.ax.get_xlim(), "ylim": self.ax.get_ylim(), "tdiv": parse_eng(self.tdiv.currentText(), 1e-3) or 1e-3, "vdiv": parse_eng(self.vdiv.currentText(), 1.0) or 1.0, "w": max(bbox.width, 1.0), "h": max(bbox.height, 1.0), }
- def _scope_on_motion(self, event):
-  d = self._scope_drag
-  if not d or event.x is None:
-   return
-  dxpx = event.x - d["px"][0]
-  dypx = event.y - d["px"][1]
-  xd, yd = self.xdivs.value(), self.ydivs.value()
-  if d["button"] == 1 and not d["shift"]:
-   x0, x1 = d["xlim"]; y0, y1 = d["ylim"]
-   dpx = (x1 - x0) / d["w"]; dpy = (y1 - y0) / d["h"]
-   nx0, nx1 = x0 - dxpx * dpx, x1 - dxpx * dpx
-   ny0, ny1 = y0 - dypx * dpy, y1 - dypx * dpy
-   self.ax.set_xlim(nx0, nx1); self.ax.set_ylim(ny0, ny1)
-   self._scope_overlay(f"位置  X中心={format_eng((nx0+nx1)/2)}  " f"Y中心={format_eng((ny0+ny1)/2)}")
-  else:
-   xc = (d["xlim"][0] + d["xlim"][1]) / 2
-   yc = (d["ylim"][0] + d["ylim"][1]) / 2
-   ntdiv = d["tdiv"] * (2 ** (dxpx / 150.0))
-   nvdiv = d["vdiv"] * (2 ** (-dypx / 150.0))
-   self.ax.set_xlim(xc - xd / 2 * ntdiv, xc + xd / 2 * ntdiv)
-   self.ax.set_ylim(yc - yd / 2 * nvdiv, yc + yd / 2 * nvdiv)
-   self._scope_overlay(f"{format_eng(ntdiv)}s/div   " f"{format_eng(nvdiv)}/div")
-  self.canvas.draw_idle()
- def _scope_on_release(self, event):
-  if not self._scope_drag:
-   return
-  self._scope_drag = None
-  self._remove_scope_overlay()
-  x0, x1 = self.ax.get_xlim(); y0, y1 = self.ax.get_ylim()
-  xd, yd = self.xdivs.value(), self.ydivs.value()
-  self._suspend_redraw = True
-  self.xpos.setText(f"{(x0+x1)/2:.6g}"); self.ypos.setText(f"{(y0+y1)/2:.6g}")
-  self.tdiv.setCurrentText(format_eng((x1 - x0) / xd) + "s")
-  self.vdiv.setCurrentText(format_eng((y1 - y0) / yd))
-  self._suspend_redraw = False
-  self.draw_graph()
- def _scope_on_scroll(self, event):
-  if event.inaxes is not self.ax:
-   return
-  if self._scope_active():
-   step = 0.8 if event.button == "up" else 1.25
-   self._suspend_redraw = True
-   if self._shift_held(event):
-    cur = parse_eng(self.vdiv.currentText(), 1.0) or 1.0
-    self.vdiv.setCurrentText(format_eng(cur * step))
-   else:
-    cur = parse_eng(self.tdiv.currentText(), 1e-3) or 1e-3
-    self.tdiv.setCurrentText(format_eng(cur * step) + "s")
-   self._suspend_redraw = False
-   self.draw_graph()
-   return
-  self._wheel_zoom(event)
- def _wheel_zoom(self, event):
-  ax = event.inaxes if event.inaxes in self.fig.axes else self.ax
-  if (self._cursor_cid is not None or getattr(self.toolbar, "mode", "") or not getattr(self, "_has_drawn", False) or self.chart_combo.currentText() == "円" or getattr(ax, "name", None) == "3d" or ax.get_label() == "<colorbar>"):
-   return
-  factor = 0.8 if event.button == "up" else 1.25
-  x0, x1 = ax.get_xlim()
-  y0, y1 = ax.get_ylim()
-  xc = event.xdata if event.xdata is not None else (x0 + x1) / 2.0
-  yc = event.ydata if event.ydata is not None else (y0 + y1) / 2.0
-  xlog = ax.get_xscale() == "log"
-  ylog = ax.get_yscale() == "log"
-  ax.set_xlim(*self._zoom_pair(x0, x1, xc, factor, xlog))
-  if not self._shift_held(event):
-   ax.set_ylim(*self._zoom_pair(y0, y1, yc, factor, ylog))
-  self.canvas.draw_idle()
- def toggle_gate(self, on):
-  if on:
-   if getattr(self.ax, "name", None) == "3d":
-    self._set_status("区間測定は2Dグラフで使えます（3D表示では無効）。")
-    self.gate_btn.setChecked(False)
-    return
-   if self.cursor_btn.isChecked():
-    self.cursor_btn.setChecked(False)
-   from matplotlib.widgets import SpanSelector
-   self._gate_span = SpanSelector( self.ax, self._on_gate_select, "horizontal", useblit=True, props=dict(alpha=0.2, facecolor="#2b6cb0"), interactive=True)
-   self._set_status("区間測定: グラフ上を横にドラッグしてX範囲を選ぶと、" "その区間だけの測定値を下の表に表示します。")
-  else:
-   sp = getattr(self, "_gate_span", None)
-   if sp is not None:
-    try:
-     sp.set_visible(False)
-     sp.disconnect_events()
-    except Exception:
-     get_logger().debug("toggle_gate: 無視した例外", exc_info=True)
-   self._gate_span = None
-   self.canvas.draw_idle()
- def _regate(self):
-  if getattr(self, "gate_btn", None) and self.gate_btn.isChecked():
-   self.toggle_gate(False)
-   if getattr(self.ax, "name", None) == "3d":
-    self.gate_btn.setChecked(False)
-   else:
-    self.toggle_gate(True)
- def _on_gate_select(self, x0, x1):
-  if x1 < x0:
-   x0, x1 = x1, x0
-  if x0 == x1:
-   return
-  self._run_gated_analysis(float(x0), float(x1))
- def _autoscale_view(self):
-  if (self.scope_check.isChecked() and self.chart_combo.currentText() in ("折れ線", "散布図")):
-   self.auto_scale_scope()
-   return
-  self._suspend_redraw = True
-  for le in (self.xmin, self.xmax, self.ymin, self.ymax):
-   le.clear()
-  self._suspend_redraw = False
-  self.draw_graph()
-  self._set_status("全体表示に戻しました（ダブルクリックでいつでも戻れます）。")
- def _hover_lines(self, ax):
-  axs = [ax]
-  twin = getattr(ax, "_twin_secondary", None)
-  if twin is not None:
-   axs.append(twin)
-  if ax is getattr(self.ax, "_twin_secondary", None):
-   axs.append(self.ax)
-  return [(str(ln.get_label()), ln) for a in axs for ln in a.get_lines() if not str(ln.get_label()).startswith("_") and "近似" not in str(ln.get_label())]
- def _hover_values(self, ax, x_disp):
-  import numpy as np
-  out = []
-  for label, ln in self._hover_lines(ax):
-   try:
-    xd = np.asarray(ln.get_xdata(), float)
-    yd = np.asarray(ln.get_ydata(), float)
-   except (TypeError, ValueError):
-    continue
-   if xd.size == 0 or xd.size != yd.size:
-    continue
-   m = np.isfinite(xd) & np.isfinite(yd)
-   if not m.any():
-    continue
-   xs, ys = xd[m], yd[m]
-   i = int(np.argmin(np.abs(xs - x_disp)))
-   out.append((label, ln.get_color(), float(xs[i]), float(ys[i])))
-  return out
- def _hover_readout(self, event):
-  lbl = getattr(self, "_hover_label", None)
-  if lbl is None:
-   return
-  ax = event.inaxes
-  if (ax is None or ax not in self.fig.axes or event.x is None or event.xdata is None or not getattr(self, "_has_drawn", False) or getattr(ax, "name", None) == "3d" or ax.get_label() == "<colorbar>" or self._scope_drag or self._cursor_drag is not None):
-   if lbl.text():
-    lbl.setText("")
-   self._hide_hover_ui()
-   return
-  import time
-  now = time.monotonic()
-  if now - getattr(self, "_hover_t", 0.0) < 0.05:
-   return
-  self._hover_t = now
-  import numpy as np
-  vals = self._hover_values(ax, float(event.xdata))
-  best = None
-  for label, _c, x, y in vals:
-   pt = ax.transData.transform([[x, y]])[0]
-   d2 = (pt[0] - event.x) ** 2 + (pt[1] - event.y) ** 2
-   if best is None or d2 < best[0]:
-    best = (d2, label, x, y)
-  if best is not None and best[0] <= 20.0 ** 2:
-   _, label, x, y = best
-   lbl.setText(f"{label}:  X={format_eng(x)}  Y={format_eng(y)}  ")
-  elif lbl.text():
-   lbl.setText("")
-  if vals:
-   rows = [f"<b>X = {format_eng(float(event.xdata))}</b>"]
-   for label, color, _x, y in vals[:12]:
-    rows.append(f"<span style='color:{color}'>■</span> " f"{label}: <b>{format_eng(y)}</b>")
-   if len(vals) > 12:
-    rows.append(f"…他 {len(vals) - 12} 系列")
-   QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "<br>".join(rows), self.canvas)
-  else:
-   QtWidgets.QToolTip.hideText()
-  self._draw_crosshair(ax, event.xdata, event.ydata)
- def _hide_hover_ui(self):
-  QtWidgets.QToolTip.hideText()
-  if getattr(self, "_xhair_bg", None) is None:
-   return
-  size = (int(self.fig.bbox.width), int(self.fig.bbox.height), self.canvas.width(), self.canvas.height())
-  if getattr(self, "_xhair_size", None) != size or getattr(self, "_drawing", False):
-   self._xhair_bg = None
-   return
-  try:
-   self.canvas.restore_region(self._xhair_bg)
-   self.canvas.blit(self.fig.bbox)
-  except Exception:
-   get_logger().debug("_hide_hover_ui: 無視した例外", exc_info=True)
-  self._xhair_bg = None
- def _invalidate_crosshair(self, *_):
-  self._xhair_bg = None
- def _draw_crosshair(self, ax, x, y):
-  if (x is None or y is None or (getattr(self, "gate_btn", None) and self.gate_btn.isChecked()) or self._cursor_cid is not None or getattr(self.toolbar, "mode", "")):
-   return
-  xh = getattr(self, "_xhair", None)
-  if not xh or xh[0].axes is not ax:
-   if xh:
-    for a in xh:
-     try:
-      a.remove()
-     except Exception:
-      get_logger().debug("_draw_crosshair: 無視した例外", exc_info=True)
-   v = ax.axvline(x, color="#888", lw=0.7, ls="--", animated=True, zorder=30)
-   h = ax.axhline(y, color="#888", lw=0.7, ls="--", animated=True, zorder=30)
-   self._xhair = (v, h)
-   self._xhair_bg = None
-  size = (int(self.fig.bbox.width), int(self.fig.bbox.height), self.canvas.width(), self.canvas.height())
-  if getattr(self, "_xhair_size", None) != size:
-   self._xhair_bg = None
-  if getattr(self, "_drawing", False):
-   return
-  try:
-   if getattr(self, "_xhair_bg", None) is None:
-    self._xhair_bg = self.canvas.copy_from_bbox(self.fig.bbox)
-    self._xhair_size = size
-   self.canvas.restore_region(self._xhair_bg)
-   self._xhair[0].set_xdata([x, x])
-   self._xhair[1].set_ydata([y, y])
-   ax.draw_artist(self._xhair[0])
-   ax.draw_artist(self._xhair[1])
-   self.canvas.blit(self.fig.bbox)
-  except Exception:
-   self._xhair_bg = None
+  info = CHART_INFO.get(self.chart_combo.currentText(), {})
+  ok = (self.chart_combo.currentText() in _SWAP_TYPES and not self._use_leftmost_x() and not self._want_3d())
+  if not ok and self.multix_check.isChecked():
+   self.multix_check.blockSignals(True)
+   self.multix_check.setChecked(False)
+   self.multix_check.blockSignals(False)
+  self.multix_check.setEnabled(ok)
+  self.x_list.setEnabled(ok and self.multix_check.isChecked())
+ def _z_values(self, df):
+  zname = self.z_combo.currentText() if hasattr(self, "z_combo") else ""
+  return df[zname].to_numpy() if zname in df.columns else df.iloc[:, -1].to_numpy()
+ def _effective_x_label(self):
+  if self._use_leftmost_x():
+   items = self._selected_series_items()
+   if items:
+    df = self.datasets.get(items[0][0])
+    if df is not None and len(df.columns):
+     return str(df.columns[0])
+   return ""
+  xcols = self._selected_x_columns()
+  if len(xcols) > 1:
+   return " / ".join(str(c) for c in xcols)
+  return self.x_combo.currentText()
  @staticmethod
- def _zoom_pair(lo, hi, center, factor, log=False):
-  import numpy as np
-  if log and lo > 0 and hi > 0 and center > 0:
-   l0, l1, lc = np.log10(lo), np.log10(hi), np.log10(center)
-   return 10.0 ** (lc - (lc - l0) * factor), 10.0 ** (lc + (l1 - lc) * factor)
-  return center - (center - lo) * factor, center + (hi - center) * factor
- def auto_scale_scope(self):
-  import numpy as np
-  import pandas as pd
-  items = self._selected_series_items()
-  if not items:
-   self.notify("データタブでY系列を選択してください。", "warn")
-   return
-  xname = self.x_combo.currentText()
-  xspec = self.xscale_edit.text()
-  yspec = self.yscale_edit.text()
-  tmins, tmaxs, ymins, ymaxs = [], [], [], []
-  for fl, col, _ in items:
-   df = self.datasets[fl]
-   raw = df[xname].to_numpy() if xname in df.columns else df.iloc[:, 0].to_numpy()
-   tt = pd.to_numeric(pd.Series(raw), errors="coerce").to_numpy(dtype=float)
-   if np.isnan(tt).mean() > 0.5:
-    tt = np.arange(len(tt), dtype=float)
-   yy = pd.to_numeric(pd.Series(df[col].to_numpy()), errors="coerce").to_numpy(dtype=float)
-   tt = axis_scale(tt, xspec)
-   yy = axis_scale(yy, yspec)
-   tt, yy = tt[np.isfinite(tt)], yy[np.isfinite(yy)]
-   if tt.size:
-    tmins.append(tt.min()); tmaxs.append(tt.max())
-   if yy.size:
-    ymins.append(yy.min()); ymaxs.append(yy.max())
-  if not tmins or not ymins:
-   self.notify("数値データがありません。", "warn")
-   return
-  tmin, tmax = min(tmins), max(tmaxs)
-  ymin, ymax = min(ymins), max(ymaxs)
-  xd, yd = self.xdivs.value(), self.ydivs.value()
-  tpd = (tmax - tmin) / xd if tmax > tmin else 1e-3
-  vpd = (ymax - ymin) / (yd - 1) if ymax > ymin else 1.0
-  self._suspend_redraw = True
-  self.tdiv.setCurrentText(format_eng(tpd) + "s")
-  self.vdiv.setCurrentText(format_eng(vpd))
-  self.xpos.setText(f"{(tmin+tmax)/2:.4g}"); self.ypos.setText(f"{(ymin+ymax)/2:.4g}")
-  self.scope_check.setChecked(True)
-  self._suspend_redraw = False
-  self.draw_graph()
- def _build_tab_scope(self):
-  w = QtWidgets.QWidget()
-  v = QtWidgets.QVBoxLayout(w)
-  self.scope_check = QtWidgets.QCheckBox("オシロスコープ表示（折れ線/散布図）")
-  v.addWidget(self.scope_check)
-  g = QtWidgets.QGridLayout()
-  g.addWidget(QtWidgets.QLabel("time/div [s]"), 0, 0)
-  self.tdiv = QtWidgets.QComboBox(); self.tdiv.setEditable(True)
-  self.tdiv.addItems(eng_125_sequence(1e-9, 1.0, "s"))
-  self.tdiv.setCurrentText("1ms")
-  g.addWidget(self.tdiv, 0, 1)
-  g.addWidget(QtWidgets.QLabel("V/div"), 0, 2)
-  self.vdiv = QtWidgets.QComboBox(); self.vdiv.setEditable(True)
-  self.vdiv.addItems(eng_125_sequence(1e-3, 100.0, ""))
-  self.vdiv.setCurrentText("500m")
-  g.addWidget(self.vdiv, 0, 3)
-  g.addWidget(QtWidgets.QLabel("X位置(中心)"), 1, 0)
-  self.xpos = QtWidgets.QLineEdit("0"); g.addWidget(self.xpos, 1, 1)
-  g.addWidget(QtWidgets.QLabel("Y位置(中心)"), 1, 2)
-  self.ypos = QtWidgets.QLineEdit("0"); g.addWidget(self.ypos, 1, 3)
-  g.addWidget(QtWidgets.QLabel("X div数"), 2, 0)
-  self.xdivs = QtWidgets.QSpinBox(); self.xdivs.setRange(2, 20); self.xdivs.setValue(10)
-  g.addWidget(self.xdivs, 2, 1)
-  g.addWidget(QtWidgets.QLabel("Y div数"), 2, 2)
-  self.ydivs = QtWidgets.QSpinBox(); self.ydivs.setRange(2, 20); self.ydivs.setValue(8)
-  g.addWidget(self.ydivs, 2, 3)
-  v.addLayout(g)
-  b_auto = QtWidgets.QPushButton("自動スケール（解析対象に合わせる）")
-  b_auto.clicked.connect(self.auto_scale_scope)
-  v.addWidget(b_auto)
-  scope_hint = QtWidgets.QLabel( "💡 オシロ表示中はグラフを直接操作可：左ドラッグ=位置移動／右ドラッグ=time/V/div／" "ホイール=time/div・Shift+ホイール=V/div（ドラッグ中は数値を表示）")
-  scope_hint.setWordWrap(True); scope_hint.setStyleSheet("color:#0a7a55; font-size:11px;")
-  v.addWidget(scope_hint)
-  v.addWidget(self._hline())
-  row = QtWidgets.QHBoxLayout()
-  row.addWidget(QtWidgets.QLabel("解析対象:"))
-  self.analysis_target = QtWidgets.QComboBox()
-  row.addWidget(self.analysis_target, 1)
-  v.addLayout(row)
-  row2 = QtWidgets.QHBoxLayout()
-  row2.addWidget(QtWidgets.QLabel("ピーク数 N:"))
-  self.npeaks = QtWidgets.QSpinBox(); self.npeaks.setRange(1, 50); self.npeaks.setValue(5)
-  row2.addWidget(self.npeaks)
-  row2.addWidget(QtWidgets.QLabel("平滑化(点):"))
-  self.smooth_spin = QtWidgets.QSpinBox(); self.smooth_spin.setRange(0, 501)
-  self.smooth_spin.setSingleStep(2); self.smooth_spin.setValue(0)
-  self.smooth_spin.setToolTip("ノイズの多い実測データで偽ピークを抑える。0=平滑化なし。窓の点数（奇数推奨）。")
-  row2.addWidget(self.smooth_spin); row2.addStretch(1)
-  v.addLayout(row2)
-  self.show_peaks_check = QtWidgets.QCheckBox("ピークをグラフに表示"); self.show_peaks_check.setChecked(False)
-  v.addWidget(self.show_peaks_check)
-  self.window_meas_check = QtWidgets.QCheckBox("表示範囲のみ測定（ズーム/オシロ窓に追従）")
-  self.window_meas_check.setToolTip("オンにすると、画面に見えているX範囲だけを対象に解析します。")
-  v.addWidget(self.window_meas_check)
-  b_an = QtWidgets.QPushButton("解析実行"); b_an.clicked.connect(self.run_analysis)
-  b_an.setToolTip("解析対象コンボで選んだ1系列のピーク・測定を下の表に表示")
-  b_all = QtWidgets.QPushButton("全系列を解析…")
-  b_all.setToolTip("選択中の全系列のピーク・測定を別ウィンドウに一覧表示（CSV保存可）")
-  b_all.clicked.connect(self.analyze_all_series)
-  b_fft = QtWidgets.QPushButton("FFT表示"); b_fft.clicked.connect(self.show_fft)
-  b_fft.setToolTip("FFTスペクトル表示：選択中の全系列のFFTを1枚に重ね描き（系列ごとに色分け）")
-  b_cur = QtWidgets.QPushButton("カーソル測定"); b_cur.setCheckable(True)
-  b_cur.setToolTip("グラフを2回クリックして Δt・ΔV・1/Δt を測ります")
-  b_cur.toggled.connect(self.toggle_cursors)
-  self.cursor_btn = b_cur
-  brow = QtWidgets.QHBoxLayout()
-  brow.addWidget(b_an); brow.addWidget(b_all); brow.addWidget(b_fft)
-  v.addLayout(brow)
-  b_gate = QtWidgets.QPushButton("区間測定")
-  b_gate.setCheckable(True)
-  b_gate.setToolTip("ONにしてグラフ上を横にドラッグすると、選んだX区間だけの\n" "測定値（平均/RMS/周期など）を下の表に表示します。")
-  b_gate.toggled.connect(self.toggle_gate)
-  self.gate_btn = b_gate
-  brow2 = QtWidgets.QHBoxLayout()
-  brow2.addWidget(b_cur); brow2.addWidget(b_gate)
-  v.addLayout(brow2)
-  v.addWidget(self._bold("ピーク（第1=最大）"))
-  self.peak_table = QtWidgets.QTableWidget(0, 3)
-  self.peak_table.setHorizontalHeaderLabels(["順位", "時間/周波数", "値"])
-  self.peak_table.horizontalHeader().setStretchLastSection(True)
-  self.peak_table.setMaximumHeight(160)
-  self._wire_table_export(self.peak_table, "ピーク")
-  v.addWidget(self.peak_table)
-  v.addWidget(self._bold("測定値（右端「表示」でグラフに注記）"))
-  self.meas_table = QtWidgets.QTableWidget(0, 3)
-  self.meas_table.setHorizontalHeaderLabels(["項目", "値", "表示"])
-  mh = self.meas_table.horizontalHeader()
-  mh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-  mh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
-  mh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-  self.meas_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-  self._wire_table_export(self.meas_table, "測定値")
-  v.addWidget(self.meas_table, 1)
-  srow = QtWidgets.QHBoxLayout()
-  b_stat = QtWidgets.QPushButton("サイクル統計"); b_stat.clicked.connect(self.show_cycle_stats)
-  b_trend = QtWidgets.QPushButton("トレンド表示"); b_trend.clicked.connect(self.show_trend)
-  b_pstat = QtWidgets.QPushButton("パラメータ統計…")
-  b_pstat.setToolTip("サイクルごとの統計（平均/最大/最小/σ）とパラメータ間演算を別ウィンドウで表示")
-  b_pstat.clicked.connect(self.show_param_stats)
-  srow.addWidget(b_stat); srow.addWidget(b_trend); srow.addWidget(b_pstat)
-  v.addLayout(srow)
-  prow = QtWidgets.QHBoxLayout()
-  prow.addWidget(QtWidgets.QLabel("位相差 対象2:"))
-  self.phase_target2 = QtWidgets.QComboBox(); prow.addWidget(self.phase_target2, 1)
-  b_phase = QtWidgets.QPushButton("位相差/遅延"); b_phase.clicked.connect(self.show_phase)
-  prow.addWidget(b_phase)
-  v.addLayout(prow)
-  return w
-"""AnalysisMixin: GraphApp から分離した AnalysisMixin 群（挙動は本体と同一）。"""
-class AnalysisMixin:
- def _peak_markers(self):
-  if self.chart_combo.currentText() not in ("折れ線", "散布図"):
-   return None
-  t, y, _ = self._analysis_xy()
-  if t is None:
-   return None
-  try:
-   peaks = find_signal_peaks(y, t=t, n=self.npeaks.value(), smooth=self.smooth_spin.value())
-  except Exception:
-   return None
-  xspec, yspec = self.xscale_edit.text(), self.yscale_edit.text()
-  out = []
-  for p in peaks:
-   if p["time"] is None:
+ def _auto_y_label(names, ctype):
+  if ctype == "ヒストグラム":
+   return ""
+  uniq = list(dict.fromkeys(n for n in names if n))
+  if not uniq:
+   return ""
+  if len(uniq) == 1:
+   return uniq[0]
+  joined = " / ".join(uniq)
+  return joined if len(joined) <= 40 else f"{uniq[0]} ほか{len(uniq) - 1}系列"
+ def _file_display_name(self, fl):
+  if hasattr(self, "show_ext_check") and not self.show_ext_check.isChecked():
+   return os.path.splitext(fl)[0]
+  return fl
+ def _series_label(self, fl, col):
+  st = self.series_styles.get(self._style_key(fl, col)) or {}
+  if st.get("label"):
+   return st["label"]
+  multi = len(self.datasets) > 1
+  show_fn = (not hasattr(self, "show_filename_check")) or self.show_filename_check.isChecked()
+  if multi and show_fn:
+   return f"{self._file_display_name(fl)} | {col}"
+  return col
+ def _effective_y_label(self):
+  names = []
+  for fl, col, disp in self._selected_series_items():
+   st = self.series_styles.get(self._style_key(fl, col)) or {}
+   if st.get("axis", "primary") == "secondary":
     continue
-   out.append({"x": float(axis_scale([p["time"]], xspec)[0]), "y": float(axis_scale([p["value"]], yspec)[0]), "text": f"第{p['rank']}", "color": "#ff3030"})
-  return out
- def run_analysis(self):
-  got = self.analysis_xy_or_warn()
-  if got is None:
+   names.append(st.get("label") or col)
+  return self._auto_y_label(names, self.chart_combo.currentText())
+ def _on_y_check_changed(self, _item):
+  if self._suspend_redraw:
    return
-  t, y, label = got
-  import numpy as np
-  y = np.asarray(y, float)
-  res = analyze(t, y, n_peaks=self.npeaks.value(), smooth=self.smooth_spin.value())
-  self._show_analysis_result(res, f"解析しました: {label}")
- def _run_gated_analysis(self, x0, x1):
-  import numpy as np
-  t, y, label = self._analysis_xy()
-  if t is None:
-   self._set_status("区間測定: 『オシロ/解析』の解析対象で系列を選択してください。")
+  self._rebuild_series_bar()
+  timer = getattr(self, "_ysel_timer", None)
+  if timer is None:
+   timer = self._ysel_timer = QtCore.QTimer(self)
+   timer.setSingleShot(True)
+   timer.timeout.connect(self._apply_y_selection_deferred)
+  timer.start(30)
+ def _apply_y_selection_deferred(self):
+  self._rebuild_style_table()
+  self._update_analysis_targets()
+  self._request_redraw()
+ def _set_all_checks(self, func):
+  ck = QtCore.Qt.CheckState.Checked
+  un = QtCore.Qt.CheckState.Unchecked
+  self.y_list.blockSignals(True)
+  for i in range(self.y_list.count()):
+   it = self.y_list.item(i)
+   it.setCheckState(ck if func(it) else un)
+  self.y_list.blockSignals(False)
+  self._on_y_selection_changed()
+ def _check_all_y(self, checked):
+  self._set_all_checks(lambda it: checked)
+ def _invert_y(self):
+  ck = QtCore.Qt.CheckState.Checked
+  self._set_all_checks(lambda it: it.checkState() != ck)
+ def select_by_name(self):
+  text = self.y_filter.text().strip()
+  if not text:
+   self._set_status("名前を入力してください（例: 電圧）。")
    return
-  t = np.asarray(t, float)
-  t_disp = axis_scale(t, self.xscale_edit.text())
-  mask = (t_disp >= x0) & (t_disp <= x1)
-  if int(mask.sum()) < 3:
-   self._set_status("区間測定: 選択した区間のデータ点が少なすぎます（3点以上必要）。")
+  tl = text.lower()
+  def match(it):
+   fl, col = it.data(UserRole)
+   return tl in str(col).lower() or tl in it.text().lower()
+  self._set_all_checks(match)
+  n = sum(1 for i in range(self.y_list.count()) if self.y_list.item(i).checkState() == QtCore.Qt.CheckState.Checked)
+  self._set_status(f"「{text}」を含む系列を {n} 件選択しました。" if n else f"「{text}」を含む系列はありません。")
+ def _select_same_name(self, item):
+  if item is None:
    return
-  res = analyze(t[mask], np.asarray(y, float)[mask], n_peaks=self.npeaks.value(), smooth=self.smooth_spin.value())
-  self._show_analysis_result( res, f"区間測定 [{format_eng(x0)} 〜 {format_eng(x1)}]: " f"{label}（{int(mask.sum()):,}点）", redraw_ok=False)
- def _show_analysis_result(self, res, status, redraw_ok=True):
-  self.peak_table.setRowCount(len(res["peaks"]))
-  for r, p in enumerate(res["peaks"]):
-   self.peak_table.setItem(r, 0, QtWidgets.QTableWidgetItem(f"第{p['rank']}"))
-   tv = "-" if p["time"] is None else f"{p['time']*1e3:.4g} ms"
-   self.peak_table.setItem(r, 1, QtWidgets.QTableWidgetItem(tv))
-   self.peak_table.setItem(r, 2, QtWidgets.QTableWidgetItem(f"{p['value']:.4g}"))
-  rows = res["measurements"]
-  had_ann = bool(getattr(self, "_meas_annotations", None))
-  self._meas_annotations = []
-  self.meas_table.setRowCount(len(rows))
-  for r, m in enumerate(rows):
-   val = m["value"]
-   txt = "-" if val is None else f"{val:.6g} {m['unit']}"
-   self.meas_table.setItem(r, 0, QtWidgets.QTableWidgetItem(m["name"]))
-   self.meas_table.setItem(r, 1, QtWidgets.QTableWidgetItem(txt))
-   cb = QtWidgets.QCheckBox()
-   cb.setToolTip("チェックすると、この測定値をグラフ上に注記表示します。")
-   cb.toggled.connect(self._refresh_meas_annotations)
-   self.meas_table.setCellWidget(r, 2, cb)
-  if redraw_ok and (self.show_peaks_check.isChecked() or had_ann):
-   self.draw_graph()
-  self._set_status(status)
- def _refresh_meas_annotations(self, *_):
-  anns = []
-  for r in range(self.meas_table.rowCount()):
-   cb = self.meas_table.cellWidget(r, 2)
-   if cb is not None and cb.isChecked():
-    k = self.meas_table.item(r, 0)
-    val = self.meas_table.item(r, 1)
-    if k is not None and val is not None:
-     anns.append(f"{k.text()} = {val.text()}")
-  self._meas_annotations = anns
+  col = item.data(UserRole)[1]
+  self._set_all_checks(lambda it: it.data(UserRole)[1] == col)
+  self._set_status(f"列名「{col}」の系列をすべて選択しました。")
+ def _on_y_double_clicked(self, item):
+  self._set_all_checks(lambda it: it is item)
+  self.draw_graph()
+ def _maybe_draw(self):
   if self.datasets:
    self.draw_graph()
- def show_fft(self):
-  items = self._selected_series_items()
-  if not items:
-   self.notify("解析する系列を選択してください。", "warn")
+ def _series_menu(self, item):
+  menu = QtWidgets.QMenu(self)
+  if item is not None:
+   menu.addAction("この系列だけ表示", lambda: self._solo_series(item))
+   menu.addAction("この系列を非表示", lambda: self._hide_series(item))
+   menu.addAction("同じ列名をすべて選択", lambda: (self._select_same_name(item), self._maybe_draw()))
+   menu.addSeparator()
+  menu.addAction("すべて表示", lambda: (self._check_all_y(True), self._maybe_draw()))
+  menu.addAction("すべて非表示", lambda: (self._check_all_y(False), self._maybe_draw()))
+  return menu
+ def _y_list_menu(self, pos):
+  item = self.y_list.itemAt(pos)
+  self._series_menu(item).exec(self.y_list.viewport().mapToGlobal(pos))
+ def _solo_series(self, item):
+  self._set_all_checks(lambda it: it is item)
+  self._maybe_draw()
+ def _hide_series(self, item):
+  item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+  self._maybe_draw()
+ def _on_style_label_edited(self, item):
+  if self._suspend_redraw or item.column() != 0:
    return
-  import numpy as np
-  win = self.fft_window.currentText() if hasattr(self, "fft_window") else "hann"
-  use_db = hasattr(self, "fft_db") and self.fft_db.isChecked()
-  ylab = "振幅 [dBV]" if use_db else "振幅"
-  series, markers, drawn = [], [], 0
-  for idx, (fl, col, disp) in enumerate(items):
-   t, y = self._xy_for(fl, col)
-   if t is None or len(np.asarray(y)) < 4:
-    continue
-   freqs, amp = fft_spectrum(t, np.asarray(y, float), window=win)
-   if freqs is None:
-    continue
-   color = (self.series_styles.get(self._style_key(fl, col)) or {}).get("color") \
-                or f"C{idx % 10}"
-   disp_amp = to_db(amp) if use_db else amp
-   series.append({"label": f"FFT: {disp}", "x": freqs, "y": disp_amp, "style": {"color": color, "linewidth": 1.0}})
-   for p in find_spectral_peaks(t, np.asarray(y, float), n=self.npeaks.value()):
-    yv = to_db(np.array([p["amplitude"]]))[0] if use_db else p["amplitude"]
-    markers.append({"x": p["frequency"], "y": yv, "text": f"{p['frequency']:.0f}Hz", "color": color})
-   drawn += 1
-  if drawn == 0:
-   self.notify("FFT を計算できませんでした。", "warn")
+  key = item.data(UserRole)
+  if not key:
    return
-  self._ensure_axes_projection(False)
-  self._reset_figure_axes()
-  plot_series( self.ax, series, "折れ線", title=f"FFTスペクトル（{win}窓・{drawn}系列）", xlabel="周波数 [Hz]", ylabel=ylab, grid=True, legend=(drawn > 1), markers=markers, fonts=self._fonts())
-  self._apply_aspect()
-  try:
-   self.fig.tight_layout()
-  except Exception:
-   get_logger().debug("show_fft: 無視した例外", exc_info=True)
-  self.canvas.draw()
-  self._set_status(f"FFT表示: {drawn}系列を重ね描き")
- def analyze_all_series(self):
-  items = self._selected_series_items()
-  if not items:
-   self.notify("解析する系列を選択してください。", "warn")
-   return
-  import numpy as np
-  peak_rows, meas_rows = [], []
-  for fl, col, disp in items:
-   t, y = self._xy_for(fl, col)
-   if t is None or len(np.asarray(y)) < 2:
-    continue
-   r = analyze(t, np.asarray(y, float), n_peaks=self.npeaks.value(), smooth=self.smooth_spin.value())
-   for p in r["peaks"]:
-    tv = None if p["time"] is None else p["time"] * 1e3
-    peak_rows.append((disp, f"第{p['rank']}", tv, p["value"]))
-   for m in r["measurements"]:
-    meas_rows.append((disp, m["name"], m["value"], m["unit"]))
-  if not peak_rows and not meas_rows:
-   self.notify("解析できる系列がありません。", "warn")
-   return
-  self._show_analysis_window(peak_rows, meas_rows)
- def _show_analysis_window(self, peak_rows, meas_rows):
-  dlg = QtWidgets.QDialog(self)
-  dlg.setWindowTitle("全系列の解析結果")
-  dlg.resize(760, 600)
-  lay = QtWidgets.QVBoxLayout(dlg)
-  no_edit = QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
-  lay.addWidget(QtWidgets.QLabel("■ ピーク（系列ごと）"))
-  pk = QtWidgets.QTableWidget(len(peak_rows), 4)
-  pk.setHorizontalHeaderLabels(["系列", "順位", "時刻", "値"])
-  pk.setEditTriggers(no_edit)
-  for r, (s, rank, tv, val) in enumerate(peak_rows):
-   pk.setItem(r, 0, QtWidgets.QTableWidgetItem(str(s)))
-   pk.setItem(r, 1, QtWidgets.QTableWidgetItem(str(rank)))
-   pk.setItem(r, 2, QtWidgets.QTableWidgetItem("-" if tv is None else f"{tv:.4g} ms"))
-   pk.setItem(r, 3, QtWidgets.QTableWidgetItem(f"{val:.6g}"))
-  pk.resizeColumnsToContents()
-  self._wire_table_export(pk, "全系列ピーク")
-  lay.addWidget(pk)
-  lay.addWidget(QtWidgets.QLabel("■ 測定（系列ごと）"))
-  ms = QtWidgets.QTableWidget(len(meas_rows), 4)
-  ms.setHorizontalHeaderLabels(["系列", "項目", "値", "単位"])
-  ms.setEditTriggers(no_edit)
-  for r, (s, name, val, unit) in enumerate(meas_rows):
-   ms.setItem(r, 0, QtWidgets.QTableWidgetItem(str(s)))
-   ms.setItem(r, 1, QtWidgets.QTableWidgetItem(str(name)))
-   ms.setItem(r, 2, QtWidgets.QTableWidgetItem("-" if val is None else f"{val:.6g}"))
-   ms.setItem(r, 3, QtWidgets.QTableWidgetItem(str(unit)))
-  ms.resizeColumnsToContents()
-  self._wire_table_export(ms, "全系列測定")
-  lay.addWidget(ms, 1)
-  brow = QtWidgets.QHBoxLayout()
-  b_save = QtWidgets.QPushButton("CSVで保存…")
-  b_save.clicked.connect(lambda: self._save_analysis_csv(peak_rows, meas_rows))
-  b_close = QtWidgets.QPushButton("閉じる")
-  b_close.clicked.connect(dlg.close)
-  brow.addStretch(1); brow.addWidget(b_save); brow.addWidget(b_close)
-  lay.addLayout(brow)
-  self._analysis_window = dlg
-  dlg.show()
- def _save_analysis_csv(self, peak_rows, meas_rows):
-  path, _ = QtWidgets.QFileDialog.getSaveFileName( self, "解析結果をCSVで保存", self.last_dir, "CSV (*.csv)")
-  if not path:
-   return
-  import csv
-  try:
-   with open(path, "w", newline="", encoding="utf-8-sig") as f:
-    w = csv.writer(f)
-    w.writerow(["# ピーク"])
-    w.writerow(["系列", "順位", "時刻[ms]", "値"])
-    for s, rank, tv, val in peak_rows:
-     w.writerow([s, rank, "" if tv is None else f"{tv:.6g}", f"{val:.6g}"])
-    w.writerow([])
-    w.writerow(["# 測定"])
-    w.writerow(["系列", "項目", "値", "単位"])
-    for s, name, val, unit in meas_rows:
-     w.writerow([s, name, "" if val is None else f"{val:.6g}", unit])
-   self.last_dir = os.path.dirname(path)
-   self._set_status(f"解析結果を保存しました: {path}")
-  except Exception as e:
-   QtWidgets.QMessageBox.critical(self, "保存エラー", str(e))
-"""AdvancedMixin: GraphApp から分離した AdvancedMixin 群（挙動は本体と同一）。"""
-class AdvancedMixin:
- def _on_math_op_change(self, op):
-  binary = op in BINARY_OPS
-  self.math_b.setEnabled(binary); self.math_b_label.setEnabled(binary)
-  needs_param = op in ("移動平均", "ローパス(RC)", "ローパス(Butterworth)", "ハイパス(Butterworth)")
-  self.math_param.setEnabled(needs_param); self.math_param_label.setEnabled(needs_param)
- def create_math_channel(self):
-  op = self.math_op.currentText()
-  ta, ya = self._xy_by_disp(self.math_a.currentText())
-  if ta is None:
-   self.notify("演算対象Aをデータタブで選択してください。", "warn")
-   return
-  try:
-   if op in BINARY_OPS:
-    tb, yb = self._xy_by_disp(self.math_b.currentText())
-    if tb is None:
-     self.notify("演算対象Bを選択してください。", "warn")
-     return
-    x, r = binary(ta, ya, tb, yb, op)
-   else:
-    param = parse_eng(self.math_param.text(), None)
-    x, r = unary(ta, ya, op, param)
-  except Exception as e:
-   QtWidgets.QMessageBox.critical(self, "演算エラー", str(e)); return
-  import pandas as pd
-  col = f"{op}"
-  self.register_dataset(f"Math: {op}", pd.DataFrame({"時間[s]": x, col: r}), status=f"数学チャンネルを作成: {{label}} ▸ {col}")
- def create_math_expr(self):
-  import numpy as np
-  import pandas as pd
-  expr = self.math_expr.text().strip()
-  if not expr:
-   self.notify("数式を入力してください。", "warn")
-   return
-  ta, ya = self._xy_by_disp(self.math_a.currentText())
-  if ta is None:
-   self.notify("変数Aの系列をデータタブで選択してください。", "warn")
-   return
-  variables = {"A": ya, "t": ta, "VAR1": parse_eng(self.math_var1.text(), 0.0) or 0.0, "VAR2": parse_eng(self.math_var2.text(), 0.0) or 0.0}
-  tb, yb = self._xy_by_disp(self.math_b.currentText())
-  if tb is not None and yb is not None:
-   variables["B"] = yb if len(yb) == len(ya) else np.interp(ta, tb, yb)
-  try:
-   r = eval_expr(expr, variables)
-   r = np.broadcast_to(np.asarray(r, dtype=float), ya.shape).astype(float)
-  except Exception as e:
-   QtWidgets.QMessageBox.critical(self, "数式エラー", str(e))
-   return
-  self.register_dataset(f"Expr: {expr[:24]}", pd.DataFrame({"時間[s]": ta, "結果": r}), status="数式チャンネルを作成: {label}")
- def show_param_stats(self):
-  import numpy as np
-  got = self.analysis_xy_or_warn()
-  if got is None:
-   return
-  t, y, label = got
-  yv = np.asarray(y, float)
-  self._show_param_stats_window(label, cycle_statistics(t, yv), measurements(t, yv))
- def _show_param_stats_window(self, label, stats, meas):
-  dlg = QtWidgets.QDialog(self)
-  dlg.setWindowTitle(f"パラメータ統計: {label}")
-  dlg.resize(700, 560)
-  lay = QtWidgets.QVBoxLayout(dlg)
-  no_edit = QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
-  lay.addWidget(QtWidgets.QLabel("■ サイクル統計（周期ごとに測り、平均/最大/最小/σ で集計）"))
-  tb = QtWidgets.QTableWidget(len(stats), 6)
-  tb.setEditTriggers(no_edit)
-  tb.setHorizontalHeaderLabels(["パラメータ", "平均", "最大", "最小", "σ", "数"])
-  for r, (pname, s) in enumerate(stats.items()):
-   tb.setItem(r, 0, QtWidgets.QTableWidgetItem(str(pname)))
-   for c, k in enumerate(["mean", "max", "min", "std"], start=1):
-    v = s.get(k)
-    tb.setItem(r, c, QtWidgets.QTableWidgetItem("-" if v is None else f"{v:.5g}"))
-   tb.setItem(r, 5, QtWidgets.QTableWidgetItem(str(s.get("count", 0))))
-  tb.resizeColumnsToContents()
-  lay.addWidget(tb)
-  lay.addWidget(QtWidgets.QLabel("■ パラメータ間演算（測定値どうしを四則）"))
-  vals = {m["name"]: m["value"] for m in meas if m["value"] is not None}
-  names = list(vals.keys())
-  prow = QtWidgets.QHBoxLayout()
-  ca = QtWidgets.QComboBox(); ca.addItems(names)
-  op = QtWidgets.QComboBox(); op.addItems(["+", "-", "×", "÷"])
-  cb = QtWidgets.QComboBox(); cb.addItems(names)
-  out = QtWidgets.QLabel("= ?")
-  def compute():
-   a = vals.get(ca.currentText()); b = vals.get(cb.currentText())
-   o = op.currentText()
-   try:
-    r = {"+": a + b, "-": a - b, "×": a * b, "÷": (a / b if b else float("nan"))}[o]
-    out.setText(f"= {r:.6g}")
-   except Exception:
-    out.setText("= -")
-  bcalc = QtWidgets.QPushButton("計算"); bcalc.clicked.connect(compute)
-  prow.addWidget(ca); prow.addWidget(op); prow.addWidget(cb)
-  prow.addWidget(bcalc); prow.addWidget(out, 1)
-  lay.addLayout(prow)
-  bclose = QtWidgets.QPushButton("閉じる"); bclose.clicked.connect(dlg.close)
-  lay.addWidget(bclose)
-  self._param_stats_window = dlg
-  dlg.show()
- def compute_fft_metrics(self):
-  import numpy as np
-  got = self.analysis_xy_or_warn()
-  if got is None:
-   return
-  t, y, label = got
-  win = self.fft_window.currentText()
-  yv = np.asarray(y, float)
-  m = spectrum_metrics(t, yv, window=win)
-  rows = [ ("基本波 f0", m.get("f0"), "Hz"), ("THD", m.get("THD_pct"), "%"), ("THD", m.get("THD_dB"), "dB"), ("SNR", m.get("SNR_dB"), "dB"), ("SINAD", m.get("SINAD_dB"), "dB"), ("ENOB", m.get("ENOB_bits"), "bit"), ("SFDR", m.get("SFDR_dB"), "dB"), ("占有帯域幅(99%)", occupied_bandwidth(t, yv, window=win), "Hz"), ("チャネル電力(全)", channel_power(t, yv, window=win), "V²"), ]
-  for h in harmonic_search(t, yv, n_harm=5, window=win):
-   rows.append((f"第{h['harmonic']}高調波", h["frequency"], "Hz"))
-  self.fft_metrics.setRowCount(len(rows))
-  for r, (name, val, unit) in enumerate(rows):
-   self.fft_metrics.setItem(r, 0, QtWidgets.QTableWidgetItem(name))
-   txt = "-" if val is None else f"{val:.4g} {unit}"
-   self.fft_metrics.setItem(r, 1, QtWidgets.QTableWidgetItem(txt))
-  self._set_status(f"スペクトル指標を計算: {label}")
- def show_spectrogram(self):
-  import numpy as np
-  got = self.analysis_xy_or_warn()
-  if got is None:
-   return
-  t, y, label = got
-  f, tt, S = spectrogram(t, np.asarray(y, float), window=self.fft_window.currentText())
-  if S is None:
-   self.notify("計算できませんでした。", "warn")
-   return
-  self.prepare_view_axes()
-  mesh = self.ax.pcolormesh(tt, f, S, shading="auto", cmap="viridis")
-  self.ax.set_xlabel("時間 [s]"); self.ax.set_ylabel("周波数 [Hz]")
-  self.ax.set_title(f"スペクトログラム: {label}")
-  try:
-   self.fig.colorbar(mesh, ax=self.ax, label="dB")
-  except Exception:
-   get_logger().debug("show_spectrogram: 無視した例外", exc_info=True)
-  self._apply_aspect()
-  try:
-   self.fig.tight_layout()
-  except Exception:
-   get_logger().debug("show_spectrogram: 無視した例外", exc_info=True)
-  self.canvas.draw()
-  self._has_drawn = False
-  self._set_status(f"スペクトログラム表示: {label}")
- def show_waterfall(self):
-  import numpy as np
-  got = self.analysis_xy_or_warn()
-  if got is None:
-   return
-  t, y, label = got
-  f, tt, S = spectrogram(t, np.asarray(y, float), window=self.fft_window.currentText())
-  if S is None:
-   self.notify("計算できませんでした。", "warn")
-   return
-  self.prepare_view_axes(three_d=True, white_bg=False)
-  from matplotlib import cm
-  n = S.shape[1]
-  step = max(1, n // 60)
-  f = np.asarray(f, float)
-  for i in range(0, n, step):
-   self.ax.plot(f, np.full_like(f, tt[i]), S[:, i], lw=0.8, color=cm.viridis(i / max(n - 1, 1)))
-  self.ax.set_xlabel("周波数 [Hz]")
-  self.ax.set_ylabel("時間 [s]")
-  self.ax.set_zlabel("振幅 [dB]")
-  self.ax.set_title(f"FFTウォーターフォール: {label}")
-  try:
-   self.ax.view_init(elev=self.elev_spin.value(), azim=self.azim_spin.value())
-  except Exception:
-   get_logger().debug("show_waterfall: 無視した例外", exc_info=True)
-  try:
-   self.fig.tight_layout()
-  except Exception:
-   get_logger().debug("show_waterfall: 無視した例外", exc_info=True)
-  self.canvas.draw()
-  self._has_drawn = False
-  self._set_status(f"FFTウォーターフォール表示: {label}（{(n + step - 1) // step}スライス・" "ドラッグで回転）")
- def run_mask_test(self):
-  import numpy as np
-  got = self.analysis_xy_or_warn()
-  if got is None:
-   return
-  t, y, label = got
-  up = parse_eng(self.mask_upper.text(), None)
-  lo = parse_eng(self.mask_lower.text(), None)
-  if up is None and lo is None:
-   self.notify("上限または下限を入力してください。", "warn")
-   return
-  res = mask_test(t, np.asarray(y, float), upper=up, lower=lo)
-  self.draw_graph()
-  if getattr(self.ax, "name", None) != "3d":
-   if up is not None:
-    self.ax.axhline(up, color="#d00", ls="--", lw=0.8)
-   if lo is not None:
-    self.ax.axhline(lo, color="#d00", ls="--", lw=0.8)
-   if res["violations"]:
-    vt = res["violation_times"]
-    yv = np.asarray(y, float)[res["mask"]]
-    self.ax.plot(vt, yv, ".", color="#d00", ms=3)
-   self.canvas.draw()
-  verdict = "PASS ✅" if res["passed"] else f"FAIL ❌（{res['violations']}点 超過）"
-  self.adv_result.setText(f"マスク判定: {verdict}")
-  self._set_status(f"マスク判定 {label}: {verdict}")
- def show_eye_diagram(self):
-  import numpy as np
-  got = self.analysis_xy_or_warn()
-  if got is None:
-   return
-  t, y, label = got
-  val = parse_eng(self.eye_rate.text(), 1e6)
-  sym_period = (1.0 / val) if val and val > 1 else (val or 1e-6)
-  phase, yy = eye_diagram(t, np.asarray(y, float), sym_period, n_ui=2)
-  self.prepare_view_axes()
-  self.ax.plot(phase * 1e6, yy, ".", ms=0.5, alpha=0.3, color="#1f77b4")
-  self.ax.set_xlabel("UI内時間 [µs]"); self.ax.set_ylabel("電圧")
-  self.ax.set_title(f"アイダイアグラム: {label}")
-  self.ax.grid(True, alpha=0.3)
-  em = eye_measurements(t, np.asarray(y, float), sym_period)
-  if em:
-   self.ax.axhline(em["level1"], color="#2ca02c", ls=":", lw=0.9)
-   self.ax.axhline(em["level0"], color="#2ca02c", ls=":", lw=0.9)
-   def _g(k):
-    v = em.get(k)
-    return float("nan") if v is None else v
-   self.adv_result.setText( "アイ測定: 振幅={:.4g} 高さ={:.4g} 幅={:.4g}µs Q={:.3g} " "ER={:.3g}dB ジッタpp={:.3g}ns".format( _g("eye_amplitude"), _g("eye_height"), _g("eye_width") * 1e6, _g("q_factor"), _g("extinction_ratio_db"), _g("jitter_pp") * 1e9))
-  try:
-   self.fig.tight_layout()
-  except Exception:
-   get_logger().debug("show_eye_diagram: 無視した例外", exc_info=True)
-  self.canvas.draw()
-  self._has_drawn = False
-  self._set_status(f"アイダイアグラム表示: {label}")
- def run_jitter(self):
-  import numpy as np
-  got = self.analysis_xy_or_warn()
-  if got is None:
-   return
-  t, y, label = got
-  jr = jitter_tie(t, np.asarray(y, float))
-  if not jr:
-   self.notify("エッジが不足し計算できませんでした。", "warn")
-   return
-  msg = (f"ジッタ: RMS={format_eng(jr['rms'])}s  " f"pp={format_eng(jr['pp'])}s  " f"クロック≈{format_eng(jr['freq'])}Hz  エッジ{jr['edges']}本")
-  self.adv_result.setText(msg)
-  self._set_status(msg)
- def show_cycle_stats(self):
-  import numpy as np
-  got = self.analysis_xy_or_warn()
-  if got is None:
-   return
-  t, y, label = got
-  cm = cycle_measurements(t, np.asarray(y, float))
-  fs = measurement_stats(cm["freq"])
-  amps = measurement_stats(cm["vpp"])
-  lines = []
-  if fs["count"]:
-   lines.append(f"周波数: 平均{format_eng(fs['mean'])}Hz σ={format_eng(fs['std'])} " f"min{format_eng(fs['min'])}〜max{format_eng(fs['max'])} ({fs['count']}サイクル)")
-  if amps["count"]:
-   lines.append(f"Vpp: 平均{amps['mean']:.4g} σ={amps['std']:.3g} " f"min{amps['min']:.4g}〜max{amps['max']:.4g}")
-  self.adv_result.setText("　".join(lines) or "サイクルを検出できませんでした。")
-  self._set_status(f"サイクル統計: {label}")
- def show_trend(self):
-  import numpy as np
-  got = self.analysis_xy_or_warn()
-  if got is None:
-   return
-  t, y, label = got
-  cm = cycle_measurements(t, np.asarray(y, float))
-  if len(cm["cycle_time"]) < 2:
-   self.notify("サイクルが不足しています。", "warn")
-   return
-  self.prepare_view_axes()
-  self.ax.plot(cm["cycle_time"], cm["freq"], "-o", ms=3, color="#1f77b4")
-  self.ax.set_xlabel("時間 [s]"); self.ax.set_ylabel("周波数 [Hz]")
-  self.ax.set_title(f"周波数トレンド（サイクルごと）: {label}")
-  self.ax.grid(True, alpha=0.3)
-  try:
-   self.fig.tight_layout()
-  except Exception:
-   get_logger().debug("show_trend: 無視した例外", exc_info=True)
-  self.canvas.draw()
-  self._has_drawn = False
-  self._set_status(f"トレンド表示: {label}")
- def show_phase(self):
-  import numpy as np
-  t1, y1, l1 = self._analysis_xy()
-  t2, y2 = self._xy_by_disp(self.phase_target2.currentText())
-  if t1 is None or t2 is None:
-   self.notify("解析対象と対象2を選択してください。", "warn")
-   return
-  delay, phase = phase_delay(t1, np.asarray(y1, float), np.asarray(y2, float))
-  if delay is None:
-   self.notify("計算できませんでした。", "warn")
-   return
-  ph = "-" if phase is None else f"{phase:.1f}°"
-  msg = f"位相差/遅延（{l1} vs {self.phase_target2.currentText()}）: 遅延={format_eng(delay)}s  位相={ph}"
-  self.adv_result.setText(msg); self._set_status(msg)
- def _on_proto_change(self, proto):
-  cfg = { "UART": (["信号線", "", ""], "ボーレート", "115200"), "I2C": (["SCL", "SDA", ""], "不使用", ""), "SPI": (["SCK", "MOSI", "CS(任意)"], "不使用", ""), "CAN": (["CAN(RXまたは差動)", "", ""], "ビットレート", "500k"), "LIN": (["信号線", "", ""], "ボーレート", "19200"), "1-Wire": (["信号線", "", ""], "不使用", ""), }[proto]
-  labels, baud_lbl, baud_val = cfg
-  for i in range(3):
-   show = labels[i] != ""
-   self.proto_ch_labels[i].setText(labels[i]); self.proto_ch_labels[i].setVisible(show)
-   self.proto_ch[i].setVisible(show)
-  self.proto_baud.setEnabled(proto in ("UART", "CAN", "LIN"))
-  if baud_val:
-   self.proto_baud.setText(baud_val)
- def decode_protocol(self):
-  import numpy as np
-  proto = self.proto_combo.currentText()
-  t1, y1 = self._xy_by_disp(self.proto_ch[0].currentText())
-  if t1 is None:
-   self.notify("Ch1（信号線）をデータタブで選択してください。", "warn")
-   return
-  try:
-   if proto == "UART":
-    baud = parse_eng(self.proto_baud.text(), 115200)
-    ev = decode_uart(t1, np.asarray(y1, float), baud=baud)
-    rows = [(e["time"], "data", e["hex"], (e["char"] + ("" if e["ok"] else " ⚠")).strip()) for e in ev]
-   elif proto == "I2C":
-    t2, y2 = self._xy_by_disp(self.proto_ch[1].currentText())
-    if t2 is None:
-     self.notify("SDA(Ch2)も選択してください。", "warn"); return
-    ev = decode_i2c(t1, np.asarray(y1, float), np.asarray(y2, float))
-    rows = []
-    for e in ev:
-     if e["type"] in ("START", "STOP"):
-      rows.append((e["time"], e["type"], "", ""))
-     else:
-      rows.append((e["time"], e["type"], e["hex"], f"{e.get('rw','')} {e.get('ack','')}".strip()))
-   elif proto == "SPI":
-    t2, y2 = self._xy_by_disp(self.proto_ch[1].currentText())
-    if t2 is None:
-     self.notify("MOSI(Ch2)も選択してください。", "warn"); return
-    cs = None
-    if self.proto_ch[2].currentText():
-     _, cs = self._xy_by_disp(self.proto_ch[2].currentText())
-     cs = np.asarray(cs, float) if cs is not None else None
-    ev = decode_spi(t1, np.asarray(y1, float), np.asarray(y2, float), cs=cs)
-    rows = [(e["time"], "data", e["hex"], "") for e in ev]
-   elif proto == "CAN":
-    rate = parse_eng(self.proto_baud.text(), 500e3)
-    ev = decode_can(t1, np.asarray(y1, float), bitrate=rate)
-    rows = []
-    for e in ev:
-     idw = f"{e['id']:08X}" if e["ext"] else f"{e['id']:03X}"
-     kind = ("CANx" if e["ext"] else "CAN") + ("/RTR" if e["rtr"] else "")
-     note = f"DLC={e['dlc']}" + ("" if e["crc_ok"] else " CRC⚠")
-     rows.append((e["time"], kind, f"ID={idw} [{e['hex']}]", note))
-   elif proto == "LIN":
-    baud = parse_eng(self.proto_baud.text(), 19200)
-    ev = decode_lin(t1, np.asarray(y1, float), baud=baud)
-    rows = []
-    for e in ev:
-     if e["type"] == "BREAK":
-      rows.append((e["time"], "BREAK", "", ""))
-     elif e["type"] == "PID":
-      rows.append((e["time"], "PID", f"0x{e['value']:02X}", "" if e.get("ok") else "パリティ⚠"))
-     elif e["type"] == "CSUM":
-      rows.append((e["time"], "CSUM", f"0x{e['value']:02X}", "OK" if e.get("ok") else "不一致⚠"))
-     else:
-      rows.append((e["time"], e["type"], f"0x{e['value']:02X}", ""))
-   else:
-    ev = decode_onewire(t1, np.asarray(y1, float))
-    rows = [(e["time"], e["type"], f"0x{e['value']:02X}" if e["type"] == "data" else "", "") for e in ev]
-  except Exception as e:
-   QtWidgets.QMessageBox.critical(self, "解読エラー", str(e)); return
-  self.proto_table.setRowCount(len(rows))
-  for r, (tm, kind, hexv, note) in enumerate(rows):
-   self.proto_table.setItem(r, 0, QtWidgets.QTableWidgetItem(f"{tm*1e3:.4g} ms"))
-   self.proto_table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(kind)))
-   self.proto_table.setItem(r, 2, QtWidgets.QTableWidgetItem(str(hexv)))
-   self.proto_table.setItem(r, 3, QtWidgets.QTableWidgetItem(str(note)))
-  self._proto_annotations = {"rows": rows, "proto": proto}
-  if (getattr(self, "proto_overlay_check", None) and self.proto_overlay_check.isChecked() and self._has_drawn):
-   self.draw_graph()
-  self._set_status(f"{proto} 解読: {len(rows)} 件")
- def _on_proto_overlay_toggled(self, *_):
-  if self.datasets and self._has_drawn:
-   self.draw_graph()
- def _build_tab_advanced(self):
-  outer = QtWidgets.QScrollArea(); outer.setWidgetResizable(True)
-  w = QtWidgets.QWidget(); outer.setWidget(w)
-  v = QtWidgets.QVBoxLayout(w)
-  v.addWidget(self._bold("数学チャンネル（演算で新しい波形を作成）"))
-  mg = QtWidgets.QGridLayout()
-  mg.addWidget(QtWidgets.QLabel("演算"), 0, 0)
-  self.math_op = QtWidgets.QComboBox()
-  self.math_op.addItems(BINARY_OPS + UNARY_OPS)
-  self.math_op.currentTextChanged.connect(self._on_math_op_change)
-  mg.addWidget(self.math_op, 0, 1, 1, 3)
-  mg.addWidget(QtWidgets.QLabel("A"), 1, 0)
-  self.math_a = QtWidgets.QComboBox(); mg.addWidget(self.math_a, 1, 1)
-  self.math_b_label = QtWidgets.QLabel("B"); mg.addWidget(self.math_b_label, 1, 2)
-  self.math_b = QtWidgets.QComboBox(); mg.addWidget(self.math_b, 1, 3)
-  self.math_param_label = QtWidgets.QLabel("パラメータ"); mg.addWidget(self.math_param_label, 2, 0)
-  self.math_param = QtWidgets.QLineEdit("5"); self.math_param.setToolTip("移動平均=窓長(点)、ローパス=カットオフ[Hz]")
-  mg.addWidget(self.math_param, 2, 1)
-  b_math = QtWidgets.QPushButton("数学チャンネルを作成"); b_math.clicked.connect(self.create_math_channel)
-  mg.addWidget(b_math, 2, 2, 1, 2)
-  v.addLayout(mg)
-  eg = QtWidgets.QGridLayout()
-  eg.addWidget(QtWidgets.QLabel("数式"), 0, 0)
-  self.math_expr = QtWidgets.QLineEdit()
-  self.math_expr.setPlaceholderText("例: sqrt(A**2+B**2) / sin(2*pi*t)*VAR1 / A-VAR1")
-  self.math_expr.setToolTip("変数: A=対象A, B=対象B, t=時間, VAR1, VAR2, 定数 pi/e。\n" "関数: sin/cos/tan/asin/.../exp/log/log10/log2/sqrt/abs/sign/min/max/clip/where。")
-  eg.addWidget(self.math_expr, 0, 1, 1, 3)
-  eg.addWidget(QtWidgets.QLabel("VAR1"), 1, 0)
-  self.math_var1 = QtWidgets.QLineEdit("1"); eg.addWidget(self.math_var1, 1, 1)
-  eg.addWidget(QtWidgets.QLabel("VAR2"), 1, 2)
-  self.math_var2 = QtWidgets.QLineEdit("0"); eg.addWidget(self.math_var2, 1, 3)
-  b_expr = QtWidgets.QPushButton("数式でチャンネル作成"); b_expr.clicked.connect(self.create_math_expr)
-  eg.addWidget(b_expr, 2, 0, 1, 4)
-  v.addLayout(eg)
-  v.addWidget(self._hline())
-  v.addWidget(self._bold("FFT 詳細（窓・dB・THD/SNR・スペクトログラム）"))
-  fg = QtWidgets.QGridLayout()
-  fg.addWidget(QtWidgets.QLabel("窓関数"), 0, 0)
-  self.fft_window = QtWidgets.QComboBox(); self.fft_window.addItems(WINDOWS)
-  self.fft_window.setCurrentText("hann"); fg.addWidget(self.fft_window, 0, 1)
-  self.fft_db = QtWidgets.QCheckBox("dB表示"); fg.addWidget(self.fft_db, 0, 2)
-  b_m = QtWidgets.QPushButton("THD/SNR等を計算"); b_m.clicked.connect(self.compute_fft_metrics)
-  fg.addWidget(b_m, 1, 0, 1, 2)
-  b_sp = QtWidgets.QPushButton("スペクトログラム"); b_sp.clicked.connect(self.show_spectrogram)
-  fg.addWidget(b_sp, 1, 2, 1, 1)
-  b_wf = QtWidgets.QPushButton("ウォーターフォール")
-  b_wf.setToolTip("STFTの時間スライスを3Dに重ねて表示（周波数成分の時間変化を見る）。" "ドラッグで回転できます。")
-  b_wf.clicked.connect(self.show_waterfall)
-  fg.addWidget(b_wf, 1, 3, 1, 1)
-  v.addLayout(fg)
-  self.fft_metrics = QtWidgets.QTableWidget(0, 2)
-  self.fft_metrics.setHorizontalHeaderLabels(["指標", "値"])
-  self.fft_metrics.horizontalHeader().setStretchLastSection(True)
-  self.fft_metrics.setMaximumHeight(170)
-  self._wire_table_export(self.fft_metrics, "FFT指標")
-  v.addWidget(self.fft_metrics)
-  v.addWidget(self._hline())
-  v.addWidget(self._bold("マスク試験 / アイダイアグラム / ジッタ"))
-  mk = QtWidgets.QGridLayout()
-  mk.addWidget(QtWidgets.QLabel("上限"), 0, 0)
-  self.mask_upper = QtWidgets.QLineEdit(); self.mask_upper.setPlaceholderText("なし")
-  self.mask_upper.setAccessibleName("マスク上限")
-  mk.addWidget(self.mask_upper, 0, 1)
-  mk.addWidget(QtWidgets.QLabel("下限"), 0, 2)
-  self.mask_lower = QtWidgets.QLineEdit(); self.mask_lower.setPlaceholderText("なし")
-  self.mask_lower.setAccessibleName("マスク下限")
-  mk.addWidget(self.mask_lower, 0, 3)
-  b_mask = QtWidgets.QPushButton("マスク判定"); b_mask.clicked.connect(self.run_mask_test)
-  mk.addWidget(b_mask, 1, 0, 1, 2)
-  mk.addWidget(QtWidgets.QLabel("シンボルレート[Hz]/周期[s]"), 2, 0, 1, 2)
-  self.eye_rate = QtWidgets.QLineEdit("1e6"); mk.addWidget(self.eye_rate, 2, 2)
-  b_eye = QtWidgets.QPushButton("アイダイアグラム"); b_eye.clicked.connect(self.show_eye_diagram)
-  mk.addWidget(b_eye, 2, 3)
-  b_jit = QtWidgets.QPushButton("ジッタ解析(TIE)"); b_jit.clicked.connect(self.run_jitter)
-  mk.addWidget(b_jit, 1, 2, 1, 2)
-  v.addLayout(mk)
-  self.adv_result = QtWidgets.QLabel(""); self.adv_result.setWordWrap(True)
-  self.adv_result.setStyleSheet("color:#0a3;")
-  v.addWidget(self.adv_result)
-  v.addWidget(self._hline())
-  v.addWidget(self._bold("シリアルプロトコル解読"))
-  pg = QtWidgets.QGridLayout()
-  pg.addWidget(QtWidgets.QLabel("プロトコル"), 0, 0)
-  self.proto_combo = QtWidgets.QComboBox()
-  self.proto_combo.addItems(["UART", "I2C", "SPI", "CAN", "LIN", "1-Wire"])
-  self.proto_combo.currentTextChanged.connect(self._on_proto_change)
-  pg.addWidget(self.proto_combo, 0, 1)
-  pg.addWidget(QtWidgets.QLabel("ボーレート/不使用"), 0, 2)
-  self.proto_baud = QtWidgets.QLineEdit("115200"); pg.addWidget(self.proto_baud, 0, 3)
-  self.proto_ch_labels = [QtWidgets.QLabel("Ch1"), QtWidgets.QLabel("Ch2"), QtWidgets.QLabel("Ch3")]
-  self.proto_ch = [QtWidgets.QComboBox(), QtWidgets.QComboBox(), QtWidgets.QComboBox()]
-  for i in range(3):
-   pg.addWidget(self.proto_ch_labels[i], 1 + i, 0)
-   pg.addWidget(self.proto_ch[i], 1 + i, 1, 1, 3)
-  b_dec = QtWidgets.QPushButton("解読"); b_dec.clicked.connect(self.decode_protocol)
-  pg.addWidget(b_dec, 4, 0, 1, 4)
-  self.proto_overlay_check = QtWidgets.QCheckBox("解読結果をグラフに注記表示")
-  self.proto_overlay_check.setToolTip( "解読したフレームの値を波形の上に直接注記します（Saleae風・先頭80件まで）。\n" "CRC/パリティ等の不一致は赤で表示。折れ線/散布図の2D表示で有効。")
-  self.proto_overlay_check.toggled.connect(self._on_proto_overlay_toggled)
-  pg.addWidget(self.proto_overlay_check, 5, 0, 1, 4)
-  v.addLayout(pg)
-  self.proto_table = QtWidgets.QTableWidget(0, 4)
-  self.proto_table.setHorizontalHeaderLabels(["時刻", "種別", "値(hex)", "備考"])
-  self.proto_table.horizontalHeader().setStretchLastSection(True)
-  self._wire_table_export(self.proto_table, "プロトコル解読")
-  v.addWidget(self.proto_table, 1)
-  self._on_math_op_change(self.math_op.currentText())
-  self._on_proto_change("UART")
-  return outer
-"""DataSciMixin: 「データサイエンス」タブの解析アクション。
-選択中のY系列に対し、線形回帰（線形性）・記述統計・相関・正規性検定などを計算して表で表示する。
-実体の計算は datasci モジュール（GUI 非依存）に置き、ここは取得→計算→表示の橋渡しに徹する。
-"""
-class DataSciMixin:
- def _ds_xy(self):
-  disp = self.ds_target.currentText()
-  if not disp:
-   self.notify("データタブでY系列を選択してください。", "warn")
-   return None, None, None
-  t, y = self._xy_by_disp(disp)
-  if t is None:
-   self.notify("対象の数値データが取得できません。", "warn")
-   return None, None, None
-  return disp, t, y
- def _ds_show(self, title, rows):
-  had = bool(getattr(self, "_ds_annotations", None))
-  self._ds_annotations = []
-  self.ds_title.setText(title)
-  self.ds_table.setRowCount(len(rows))
-  for r, (k, v) in enumerate(rows):
-   self.ds_table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(k)))
-   self.ds_table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(v)))
-   cb = QtWidgets.QCheckBox()
-   cb.setToolTip("チェックすると、この項目の値をグラフ上に注記表示します。")
-   cb.toggled.connect(self._refresh_ds_annotations)
-   self.ds_table.setCellWidget(r, 2, cb)
-  if had and getattr(self, "_has_drawn", False):
-   self.draw_graph()
- def _refresh_ds_annotations(self, *_):
-  anns = []
-  for r in range(self.ds_table.rowCount()):
-   cb = self.ds_table.cellWidget(r, 2)
-   if cb is not None and cb.isChecked():
-    k = self.ds_table.item(r, 0)
-    v = self.ds_table.item(r, 1)
-    if k is not None and v is not None:
-     anns.append(f"{k.text()} = {v.text()}")
-  self._ds_annotations = anns
-  if self.datasets:
-   self.draw_graph()
+  text = item.text().strip()
+  st = self.series_styles.setdefault(key, dict(DEFAULT_STYLE))
+  st["label"] = text or None
+  self._request_redraw()
+ def _on_y_selection_changed(self):
+  self._rebuild_style_table()
+  self._rebuild_series_bar()
+  self._update_analysis_targets()
+  self._request_redraw()
+ def _update_analysis_targets(self):
+  names = [d for _, _, d in self._selected_series_items()]
+  combos = [self.analysis_target]
+  for attr in ("phase_target2", "math_a", "math_b", "ds_target", "fill_a"):
+   if hasattr(self, attr):
+    combos.append(getattr(self, attr))
+  if hasattr(self, "proto_ch"):
+   combos.extend(self.proto_ch)
+  for cb in combos:
+   cur = cb.currentText()
+   cb.blockSignals(True)
+   cb.clear()
+   cb.addItems(names)
+   idx = cb.findText(cur)
+   if idx >= 0:
+    cb.setCurrentIndex(idx)
+   cb.blockSignals(False)
+  if hasattr(self, "fill_b"):
+   cur = self.fill_b.currentText()
+   self.fill_b.blockSignals(True)
+   self.fill_b.clear()
+   self.fill_b.addItem("0（X軸）")
+   self.fill_b.addItems(names)
+   idx = self.fill_b.findText(cur)
+   if idx >= 0:
+    self.fill_b.setCurrentIndex(idx)
+   self.fill_b.blockSignals(False)
  @staticmethod
- def _fmt(v):
-  if v is None:
-   return "—"
-  if isinstance(v, bool):
-   return "はい" if v else "いいえ"
-  if isinstance(v, int):
-   return str(v)
-  try:
-   return f"{float(v):.6g}"
-  except (TypeError, ValueError):
-   return str(v)
- def run_regression(self):
-  disp, t, y = self._ds_xy()
-  if t is None:
-   return
-  d = linear_regression(t, y)
-  if not d:
-   self.notify("回帰に十分なデータがありません。", "warn")
-   return
-  f = self._fmt
-  rows = [ ("点数 n", f(d["n"])), ("傾き slope", f(d["slope"])), ("切片 intercept", f(d["intercept"])), ("相関 r (ピアソン)", f(d["r"])), ("決定係数 R²", f(d["r2"])), ("p値 (傾き=0)", f(d["p_value"])), ("傾きの標準誤差", f(d["std_err"])), ("RMSE (残差)", f(d["rmse"])), ("直線性誤差 [%FS]", f(d["linearity_error_pct"])), ]
-  sp = correlation(t, y, "spearman")
-  if sp:
-   rows.append(("相関 (スピアマン)", f(sp["r"])))
-  self._ds_show(f"線形回帰: {disp}（Y vs X）", rows)
-  if self.ds_fit_check.isChecked():
-   self.trend_combo.setCurrentText("線形")
-   self.draw_graph()
- def show_describe(self):
-  disp, t, y = self._ds_xy()
-  if t is None:
-   return
-  d = describe(y)
-  if not d:
-   self.notify("数値データがありません。", "warn")
-   return
-  f = self._fmt
-  order = [ ("件数", "count"), ("平均", "mean"), ("中央値", "median"), ("標準偏差 σ", "std"), ("分散", "var"), ("最小", "min"), ("最大", "max"), ("範囲", "range"), ("変動係数 CV", "cv"), ("歪度 skew", "skew"), ("尖度 kurtosis", "kurtosis"), ("第1四分位 Q1", "p25"), ("中央 Q2", "p50"), ("第3四分位 Q3", "p75"), ("四分位範囲 IQR", "iqr"), ]
-  self._ds_show(f"記述統計: {disp}", [(lbl, f(d.get(k))) for lbl, k in order])
- def run_normality(self):
-  disp, t, y = self._ds_xy()
-  if t is None:
-   return
-  d = normality(y)
-  if not d:
-   self.notify("正規性検定には scipy が必要です（または点数不足）。", "warn")
-   return
-  f = self._fmt
-  rows = [ ("W統計量", f(d["W"])), ("p値", f(d["p_value"])), ("5%有意で正規とみなせる", f(d["normal_5pct"])), ]
-  self._ds_show(f"正規性検定 (Shapiro-Wilk): {disp}", rows)
- def show_corr_matrix(self):
+ def _style_key(fl, col):
+  return f"{fl}\t{col}"
+ def _rebuild_style_table(self):
   items = self._selected_series_items()
-  if len(items) < 2:
-   self.notify("相関行列には2系列以上をデータタブで選択してください。", "warn")
+  new_keys = [self._style_key(fl, col) for fl, col, _ in items]
+  old_keys = [ (self.style_table.item(r, 0).data(UserRole) if self.style_table.item(r, 0) else None) for r in range(self.style_table.rowCount())]
+  if new_keys == old_keys:
    return
-  named = []
-  for fl, col, disp in items:
-   t, y = self._xy_by_disp(disp)
-   if y is not None:
-    named.append((disp, y))
-  names, mat = correlation_matrix(named, "pearson")
-  if mat is None:
-   self.notify("相関行列を計算できませんでした。", "warn")
+  i = 0
+  m = min(len(new_keys), len(old_keys))
+  while i < m and new_keys[i] == old_keys[i]:
+   i += 1
+  prev_suspend = self._suspend_redraw
+  self._suspend_redraw = True
+  vbar = self.style_table.verticalScrollBar().value()
+  self.style_table.setUpdatesEnabled(False)
+  self.style_table.setRowCount(len(items))
+  for r in range(i, len(items)):
+   fl, col, disp = items[r]
+   self._build_style_row(r, fl, col, disp)
+  self.style_table.setUpdatesEnabled(True)
+  self.style_table.verticalScrollBar().setValue(vbar)
+  self._suspend_redraw = prev_suspend
+ def _build_style_row(self, r, fl, col, disp):
+  key = self._style_key(fl, col)
+  st = self.series_styles.setdefault(key, dict(DEFAULT_STYLE))
+  name_item = QtWidgets.QTableWidgetItem(st.get("label") or disp)
+  name_item.setData(UserRole, key)
+  name_item.setFlags(name_item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+  self.style_table.setItem(r, 0, name_item)
+  btn = QtWidgets.QPushButton(st.get("color") or "自動")
+  if st.get("color"):
+   btn.setStyleSheet(f"background:{st['color']};")
+  btn.clicked.connect(lambda _=False, k=key, b=btn: self._pick_color(k, b))
+  self.style_table.setCellWidget(r, 1, btn)
+  cb = QtWidgets.QComboBox(); cb.addItems(list(LINESTYLES.keys()))
+  cur_ls = next((k2 for k2, vv in LINESTYLES.items() if vv == st["linestyle"]), "実線")
+  cb.setCurrentText(cur_ls)
+  cb.currentTextChanged.connect(lambda v, k=key: self._set_style(k, "linestyle", LINESTYLES[v]))
+  self.style_table.setCellWidget(r, 2, cb)
+  sp = QtWidgets.QDoubleSpinBox(); sp.setRange(0.2, 10); sp.setSingleStep(0.5); sp.setValue(st["linewidth"])
+  sp.valueChanged.connect(lambda v, k=key: self._set_style(k, "linewidth", v))
+  self.style_table.setCellWidget(r, 3, sp)
+  mb = QtWidgets.QComboBox(); mb.addItems(list(MARKERS.keys()))
+  cur_mk = next((k2 for k2, vv in MARKERS.items() if vv == st["marker"]), "なし")
+  mb.setCurrentText(cur_mk)
+  mb.currentTextChanged.connect(lambda v, k=key: self._set_style(k, "marker", MARKERS[v]))
+  self.style_table.setCellWidget(r, 4, mb)
+  msp = QtWidgets.QDoubleSpinBox(); msp.setRange(1, 50); msp.setSingleStep(1); msp.setDecimals(1)
+  msp.setValue(st.get("markersize", 4.0))
+  msp.setToolTip("マーカーの大きさ（マーカーを「なし」以外にすると反映）")
+  msp.valueChanged.connect(lambda v, k=key: self._set_style(k, "markersize", v))
+  self.style_table.setCellWidget(r, 5, msp)
+  axb = QtWidgets.QComboBox(); axb.addItems(list(SERIES_AXES.keys()))
+  axb.setCurrentText(next((k2 for k2, vv in SERIES_AXES.items() if vv == st.get("axis", "primary")), "主軸"))
+  axb.currentTextChanged.connect( lambda v, k=key: self._set_style(k, "axis", SERIES_AXES[v]))
+  self.style_table.setCellWidget(r, 6, axb)
+  kb = QtWidgets.QComboBox(); kb.addItems(list(SERIES_KINDS.keys()))
+  kb.setCurrentText(next((k2 for k2, vv in SERIES_KINDS.items() if vv == st.get("kind", "")), "自動"))
+  kb.currentTextChanged.connect( lambda v, k=key: self._set_style(k, "kind", SERIES_KINDS[v]))
+  self.style_table.setCellWidget(r, 7, kb)
+  cur_e = st.get("errcol")
+  eb = LazyColumnCombo( (lambda fl=fl: list(self.datasets[fl].columns) if fl in self.datasets else []), cur_e if cur_e is not None else None)
+  eb.currentTextChanged.connect( lambda v, k=key: self._set_style(k, "errcol", None if v == "なし" else v))
+  self.style_table.setCellWidget(r, 8, eb)
+ def _pick_color(self, skey, btn):
+  col = QtWidgets.QColorDialog.getColor(parent=self)
+  if col.isValid():
+   hexc = col.name()
+   self._set_style(skey, "color", hexc)
+   btn.setText(hexc); btn.setStyleSheet(f"background:{hexc};")
+ _COLOR_BUTTONS = { "bg": ("bg_color", "bg_btn", "背景色: "), "trend": ("trend_color", "trend_color_btn", "色: "), "fill": ("fill_color", "fill_color_btn", "色: "), }
+ def pick_color(self, kind):
+  attr, btn_name, prefix = self._COLOR_BUTTONS[kind]
+  col = QtWidgets.QColorDialog.getColor(parent=self)
+  if not col.isValid():
    return
-  self._show_corr_window(names, mat)
- def _show_corr_window(self, names, mat):
-  dlg = QtWidgets.QDialog(self)
-  dlg.setWindowTitle("相関行列（ピアソン）")
-  dlg.resize(min(120 + 90 * len(names), 900), min(120 + 30 * len(names), 700))
-  lay = QtWidgets.QVBoxLayout(dlg)
-  n = len(names)
-  tbl = QtWidgets.QTableWidget(n, n)
-  tbl.setHorizontalHeaderLabels(names)
-  tbl.setVerticalHeaderLabels(names)
-  for i in range(n):
-   for j in range(n):
-    v = float(mat[i, j])
-    it = QtWidgets.QTableWidgetItem(f"{v:.3f}")
-    it.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-    a = max(0.0, min(1.0, abs(v)))
-    if v >= 0:
-     it.setBackground(QtGui.QColor(255, int(255 * (1 - a)), int(255 * (1 - a))))
-    else:
-     it.setBackground(QtGui.QColor(int(255 * (1 - a)), int(255 * (1 - a)), 255))
-    tbl.setItem(i, j, it)
-  lay.addWidget(tbl)
-  btn = QtWidgets.QPushButton("閉じる")
-  btn.clicked.connect(dlg.accept)
-  lay.addWidget(btn)
-  dlg.exec()
- def run_custom_fit(self):
-  disp, t, y = self._ds_xy()
-  if t is None:
-   return
-  dlg = QtWidgets.QDialog(self)
-  dlg.setWindowTitle(f"任意関数フィット: {disp}")
-  form = QtWidgets.QFormLayout(dlg)
-  last = getattr(self, "_fit_last", {})
-  e_expr = QtWidgets.QLineEdit(last.get("expr", "a*exp(-x/b)+c"))
-  e_expr.setToolTip("変数 x とパラメータ名で書くモデル式。\n" "使える関数: sin/cos/tan/exp/log/log10/sqrt/abs など" "（数学チャンネルの数式と同じ）。")
-  e_par = QtWidgets.QLineEdit(last.get("params", "a, b, c"))
-  e_par.setToolTip("フィットするパラメータ名（カンマ区切り）")
-  e_p0 = QtWidgets.QLineEdit(last.get("p0", "1, 1, 0"))
-  e_p0.setToolTip("各パラメータの初期値（カンマ区切り・パラメータ名と同順）")
-  c_add = QtWidgets.QCheckBox("フィット曲線を新しいデータとして追加（グラフに重ねられる）")
-  c_add.setChecked(True)
-  form.addRow("モデル式 f(x) =", e_expr)
-  form.addRow("パラメータ", e_par)
-  form.addRow("初期値", e_p0)
-  form.addRow(c_add)
-  bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
-  bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
-  form.addRow(bb)
-  if not dlg.exec():
-   return
-  expr = e_expr.text().strip()
-  params = [p.strip() for p in e_par.text().split(",") if p.strip()]
-  try:
-   p0 = [float(v) for v in e_p0.text().split(",")]
-  except ValueError:
-   self.notify("初期値は数値をカンマ区切りで入力してください。", "warn")
-   return
-  if not expr or not params or len(p0) != len(params):
-   self.notify("式・パラメータ名・初期値（同数）を入力してください。", "warn")
-   return
-  self._fit_last = {"expr": expr, "params": e_par.text(), "p0": e_p0.text()}
-  try:
-   d = fit_custom(t, y, expr, params, p0)
-  except Exception as e:
-   self.notify(f"フィットできませんでした:\n{e}\n\n" "初期値を変える・式を見直すと収束することがあります。", "warn")
-   return
-  if not d:
-   self.notify("フィットに十分なデータがありません（要scipy・点数>パラメータ数+1）。", "warn")
-   return
-  f = self._fmt
-  rows = [("モデル式", f"f(x) = {expr}"), ("点数 n", f(d["n"]))]
-  for nm, v, err in d["params"]:
-   rows.append((f"{nm}", f"{v:.6g} ± {err:.3g}"))
-  rows += [("決定係数 R²", f(d["r2"])), ("RMSE (残差)", f(d["rmse"]))]
-  self._ds_show(f"任意関数フィット: {disp}", rows)
-  if c_add.isChecked():
-   import pandas as pd
-   xname = self.x_combo.currentText() or "x"
-   df = pd.DataFrame({xname: d["x"], f"fit({disp})": d["yfit"]})
-   self.register_dataset( f"FIT: {disp}", df, status=(f"フィット完了: R²={f(d['r2'])}。曲線を『{{label}}』として追加しました" "（ツリーでチェックすると重ね描きできます）。"))
-  else:
-   self._set_status(f"フィット完了: R²={f(d['r2'])}")
- def run_t_test(self):
-  disp, t, y = self._ds_xy()
-  if t is None:
-   return
-  others = [d for _fl, _c, d in self._selected_series_items() if d != disp]
-  dlg = QtWidgets.QDialog(self)
-  dlg.setWindowTitle(f"t検定: {disp}")
-  form = QtWidgets.QFormLayout(dlg)
-  kind = QtWidgets.QComboBox()
-  kind.addItems(["1標本（母平均μ0と比較）", "対応なし2標本（Welch）", "対応あり2標本"])
-  e_mu = QtWidgets.QLineEdit("0")
-  cb_b = QtWidgets.QComboBox(); cb_b.addItems(others)
-  form.addRow("種類", kind)
-  form.addRow("μ0（1標本のとき）", e_mu)
-  form.addRow("対象B（2標本のとき）", cb_b)
-  bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
-  bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
-  form.addRow(bb)
-  if not dlg.exec():
-   return
-  ki = kind.currentIndex()
-  b = None
-  if ki > 0:
-   if not cb_b.currentText():
-    self.notify("2標本の検定には対象Bの系列もデータタブで選択してください。", "warn")
-    return
-   _tb, b = self._xy_by_disp(cb_b.currentText())
-  d = t_test(y, b=b, mu=_parse_float(e_mu.text(), 0.0) or 0.0, paired=(ki == 2))
-  if not d:
-   self.notify("t検定を計算できませんでした（要scipy・点数を確認）。", "warn")
-   return
-  f = self._fmt
-  name = ["1標本", "対応なし(Welch)", "対応あり"][ki]
-  rows = [("種類", name), ("平均 A", f(d["mean_a"]))]
-  if d["mean_b"] is not None:
-   rows.append(("平均 B", f(d["mean_b"])))
-  rows += [("t統計量", f(d["t"])), ("p値", f(d["p_value"]))]
-  if d["df"] is not None:
-   rows.append(("自由度", f(d["df"])))
-  rows.append(("5%有意差あり", f(d["sig_5pct"])))
-  self._ds_show(f"t検定（{name}）: {disp}" + (f" vs {cb_b.currentText()}" if ki > 0 else ""), rows)
- def run_anova(self):
+  setattr(self, attr, col.name())
+  btn = getattr(self, btn_name)
+  btn.setText(prefix + col.name())
+  btn.setStyleSheet(f"background:{col.name()};")
+  self._request_redraw()
+ def reset_color(self, kind):
+  attr, btn_name, prefix = self._COLOR_BUTTONS[kind]
+  setattr(self, attr, "")
+  btn = getattr(self, btn_name)
+  btn.setText(prefix + "自動")
+  btn.setStyleSheet("")
+  self._request_redraw()
+ def _wire_color_button(self, kind):
+  _attr, btn_name, _prefix = self._COLOR_BUTTONS[kind]
+  btn = getattr(self, btn_name)
+  btn.clicked.connect(lambda *_a, k=kind: self.pick_color(k))
+  btn.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+  btn.customContextMenuRequested.connect(lambda *_a, k=kind: self.reset_color(k))
+  return btn
+ def _reset_bg_color(self):
+  self.reset_color("bg")
+ def _reset_trend_color(self):
+  self.reset_color("trend")
+ def _reset_fill_color(self):
+  self.reset_color("fill")
+ _STYLE_VISUAL = frozenset({"color", "linewidth", "linestyle", "marker", "markersize"})
+ def _set_style(self, skey, attr, value):
+  self.series_styles.setdefault(skey, dict(DEFAULT_STYLE))[attr] = value
+  if not self._try_style_fastpath(skey, attr, value):
+   self._request_redraw()
+ def _build_style_artist_map(self, series, ctype, decimated):
+  m = {}
+  if ctype != "折れ線" or decimated:
+   return m
   items = self._selected_series_items()
-  if len(items) < 2:
-   self.notify("分散分析には2系列以上をデータタブで選択してください。", "warn")
-   return
-  groups = []
-  for _fl, _c, disp in items:
-   _t, y = self._xy_by_disp(disp)
-   if y is not None:
-    groups.append((disp, y))
-  d = anova_oneway(groups)
-  if not d:
-   self.notify("分散分析を計算できませんでした（要scipy）。", "warn")
-   return
-  f = self._fmt
-  rows = [("F統計量", f(d["F"])), ("p値", f(d["p_value"])), ("5%有意差あり", f(d["sig_5pct"]))]
-  for name, n, mean, std in d["groups"]:
-   rows.append((f"{name}", f"n={n}, 平均={mean:.6g}, σ={std:.6g}"))
-  self._ds_show(f"一元配置ANOVA（{len(d['groups'])}群）", rows)
- def _build_tab_datasci(self):
-  outer = QtWidgets.QScrollArea(); outer.setWidgetResizable(True)
-  w = QtWidgets.QWidget(); outer.setWidget(w)
-  v = QtWidgets.QVBoxLayout(w)
-  v.addWidget(self._bold("統計解析（回帰・記述統計・相関・正規性）"))
-  info = QtWidgets.QLabel("選択中のY系列を、現在のX軸列に対して解析します。" "データタブでX軸とY系列を選んでから実行してください。")
-  info.setWordWrap(True); info.setStyleSheet("color:#555;")
-  v.addWidget(info)
-  row = QtWidgets.QHBoxLayout()
-  row.addWidget(QtWidgets.QLabel("対象:"))
-  self.ds_target = QtWidgets.QComboBox()
-  self.ds_target.setToolTip("解析するY系列。データタブでY系列を選ぶと候補に出ます")
-  row.addWidget(self.ds_target, 1)
-  v.addLayout(row)
-  b_reg = QtWidgets.QPushButton("線形回帰（Y vs X）")
-  b_reg.setToolTip("傾き・切片・R²・相関r・直線性誤差[%FS] を計算（線形性の評価）")
-  b_reg.clicked.connect(self.run_regression)
-  self.ds_fit_check = QtWidgets.QCheckBox("回帰直線を重ねる")
-  self.ds_fit_check.setToolTip("回帰実行時に近似曲線（線形）をグラフへ重ねて表示します")
-  reg_row = QtWidgets.QHBoxLayout()
-  reg_row.addWidget(b_reg); reg_row.addWidget(self.ds_fit_check); reg_row.addStretch(1)
-  v.addLayout(reg_row)
-  brow = QtWidgets.QHBoxLayout()
-  b_desc = QtWidgets.QPushButton("記述統計"); b_desc.clicked.connect(self.show_describe)
-  b_desc.setToolTip("平均/中央値/標準偏差/分散/歪度/尖度/四分位 など")
-  b_norm = QtWidgets.QPushButton("正規性検定"); b_norm.clicked.connect(self.run_normality)
-  b_norm.setToolTip("Shapiro-Wilk 検定（scipy 必要）")
-  b_corr = QtWidgets.QPushButton("相関行列"); b_corr.clicked.connect(self.show_corr_matrix)
-  b_corr.setToolTip("選択中の全Y系列どうしのピアソン相関を行列で表示")
-  brow.addWidget(b_desc); brow.addWidget(b_norm); brow.addWidget(b_corr)
-  v.addLayout(brow)
-  brow2 = QtWidgets.QHBoxLayout()
-  b_cfit = QtWidgets.QPushButton("任意関数フィット…")
-  b_cfit.setToolTip("モデル式（例: a*exp(-x/b)+c）とパラメータ初期値を指定して\n" "非線形フィット。パラメータ±標準誤差とR²を表示し、\n" "フィット曲線を新データとして重ね描きできます（scipy 必要）。")
-  b_cfit.clicked.connect(self.run_custom_fit)
-  b_tt = QtWidgets.QPushButton("t検定…")
-  b_tt.setToolTip("1標本（母平均と比較）／対応なし2標本（Welch）／対応あり2標本（scipy 必要）")
-  b_tt.clicked.connect(self.run_t_test)
-  b_an = QtWidgets.QPushButton("ANOVA")
-  b_an.setToolTip("一元配置分散分析。選択中の全Y系列を群として比較します（scipy 必要）")
-  b_an.clicked.connect(self.run_anova)
-  brow2.addWidget(b_cfit); brow2.addWidget(b_tt); brow2.addWidget(b_an)
-  v.addLayout(brow2)
-  self.ds_title = self._bold("結果")
-  v.addWidget(self.ds_title)
-  hint = QtWidgets.QLabel("右端の「表示」にチェックした項目は、その値をグラフに注記表示します。")
-  hint.setWordWrap(True); hint.setStyleSheet("color:#555;")
-  v.addWidget(hint)
-  self.ds_table = QtWidgets.QTableWidget(0, 3)
-  self.ds_table.setHorizontalHeaderLabels(["項目", "値", "表示"])
-  hh = self.ds_table.horizontalHeader()
-  hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-  hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
-  hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-  self.ds_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-  self._wire_table_export(self.ds_table, "統計解析")
-  v.addWidget(self.ds_table, 1)
-  return outer
-"""BatchMixin: GraphApp から分離した BatchMixin 群（挙動は本体と同一）。"""
+  if len(items) != len(series):
+   return m
+  for sr in series:
+   if (sr.get("kind") or "") not in ("", "line") or sr.get("yerr") is not None:
+    return m
+  from matplotlib.lines import Line2D
+  def _data_lines(axx):
+   return [ln for ln in axx.get_lines() if isinstance(ln, Line2D) and not str(ln.get_label()).startswith("_") and "近似" not in str(ln.get_label())]
+  ax = self.ax
+  ax2 = getattr(ax, "_twin_secondary", None)
+  prim = _data_lines(ax)
+  sec = _data_lines(ax2) if ax2 is not None else []
+  prim_items = [it for it, sr in zip(items, series) if sr.get("axis") != "secondary"]
+  sec_items = [it for it, sr in zip(items, series) if sr.get("axis") == "secondary"]
+  if len(prim_items) != len(prim) or len(sec_items) != len(sec):
+   return m
+  for (fl, col, _disp), ln in zip(prim_items, prim):
+   m[self._style_key(fl, col)] = ln
+  for (fl, col, _disp), ln in zip(sec_items, sec):
+   m[self._style_key(fl, col)] = ln
+  return m
+ def _try_style_fastpath(self, skey, attr, value):
+  if attr not in self._STYLE_VISUAL:
+   return False
+  if self._suspend_redraw or not self._has_drawn:
+   return False
+  if not getattr(self, "live_check", None) or not self.live_check.isChecked():
+   return False
+  if self._redraw_timer.isActive():
+   return False
+  if self.chart_combo.currentText() != "折れ線":
+   return False
+  if attr == "color" and not value:
+   return False
+  ln = self._style_artists.get(skey)
+  if ln is None or ln.axes is None:
+   return False
+  try:
+   if attr == "color":
+    ln.set_color(value)
+   elif attr == "linewidth":
+    ln.set_linewidth(float(value))
+   elif attr == "linestyle":
+    ln.set_linestyle(value)
+   elif attr == "marker":
+    ln.set_marker(value or "")
+   elif attr == "markersize":
+    ln.set_markersize(float(value))
+  except Exception:
+   return False
+  if attr == "color":
+   if self.legend_check.isChecked():
+    self._rebuild_legend_inplace()
+   self._rebuild_series_bar(self.chart_combo.currentText())
+  self.canvas.draw_idle()
+  return True
+ def _rebuild_legend_inplace(self):
+  ax = self.ax
+  handles, labels = ax.get_legend_handles_labels()
+  ax2 = getattr(ax, "_twin_secondary", None)
+  if ax2 is not None:
+   h2, l2 = ax2.get_legend_handles_labels()
+   handles = handles + h2; labels = labels + l2
+  if handles:
+   f = self._fonts()
+   ax.legend(handles, labels, loc=self.legend_loc.currentText(), fontsize=(f.get("legend") or f.get("tick", 9)))
 class BatchMixin:
  def _save_current_figure(self, target, dpi, transparent, fmt=None):
   ratio = self._aspect_ratio()
@@ -8637,7 +8642,6 @@ class BatchMixin:
    msg += f"\n\nスキップ {len(skipped)} 件: {head}" + (" ほか" if len(skipped) > 5 else "")
   self.notify(msg, "info")
   self._set_status(f"一括出力: {len(saved)} 件保存（{out_dir}）")
-"""PersistenceMixin: GraphApp から分離した PersistenceMixin 群（挙動は本体と同一）。"""
 class PersistenceMixin:
  def show_help(self):
   self._show_text_window("使い方", self._HELP_TEXT)
@@ -9023,35 +9027,10 @@ class PersistenceMixin:
   self._hist_i += 1
   self._apply_snapshot(self._hist[self._hist_i])
   self._set_status("やり直しました。")
-"""内蔵の解析タブを差し込み式で登録するモジュール。
-左側の4タブ（データ / オシロ・解析 / 高度解析 / 統計解析）を TabPlugin として
-登録する。各タブの中身を組み立てるロジックは従来どおり GraphApp の各 Mixin に
-あり、ここは「どのメソッドがどのタブか・どの表示レベルで出すか・並び順」を
-宣言するだけ（挙動は一切変えない）。
-新しい機能タブの足し方は タブ追加ガイド.md を参照。要点だけ:
-TabPlugin を継承したクラスを書いて register_tab() で登録すれば、メイン側
-（GraphApp）を触らずにタブが増える。build(app) の app は GraphApp なので
-既存の描画・解析メソッドをそのまま呼べる。
-"""
 BUILTIN_TABS = [ _DelegatingTab("data", "1. データ", 10, "基本", "_build_tab_data"), _DelegatingTab("scope", "2. オシロ/解析", 20, "標準", "_build_tab_scope"), _DelegatingTab("advanced", "3. 高度解析", 30, "全部", "_build_tab_advanced"), _DelegatingTab("datasci", "4. 統計解析", 40, "全部", "_build_tab_datasci"), ]
 for _tab in BUILTIN_TABS:
  register_tab(_tab)
-"""CSV / TSV / 波形データ グラフ・解析ツール（PySide6 / Qt）。
-使い方:
-    python graph_app.py
-機能:
-    - 複数の CSV/TSV/波形ファイルをまとめて読み込み、系列を重ねて描画
-    - 文字コード・区切りの自動判定（手動指定も可）
-    - 8種のグラフ＋系列ごとの色/線種/線幅/マーカー、軸範囲/対数軸/凡例位置
-    - Excel相当のグラフ編集：近似曲線（線形/多項式/指数/対数/移動平均＋R²）、
-      データラベル、第2軸・複合グラフ（系列ごと主/第2軸＋線/棒/面の混在）、エラーバー
-    - データのセル編集（表を直接編集→DataFrameへ反映、行/列追加・削除、CSV保存）
-    - オシロスコープ表示（time/div・V/div・位置・divグリッド）
-    - オシロ相当の解析（第1/第2…ピーク検出、各種測定、FFT）
-    - 設定の保存／読み込み（終了時自動保存・起動時復元）
-GUI は matplotlib の qt_compat 経由で実装しており、PySide6 / PyQt6（Qt6系）で動作する。
-"""
-class GraphApp(HostMixin, UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin, ScopeCursorMixin, AnalysisMixin, AdvancedMixin, DataSciMixin, BatchMixin, PersistenceMixin, QtWidgets.QMainWindow):
+class GraphApp(HostMixin, UIBuildMixin, DataIOMixin, StyleTableMixin, PlotMixin, ScopeTabMixin, AdvancedMixin, DataSciMixin, BatchMixin, PersistenceMixin, QtWidgets.QMainWindow):
  def __init__(self):
   super().__init__()
   self.datasets = {}

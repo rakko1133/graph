@@ -793,8 +793,7 @@ def _visible_controls(w):
 
 def test_tabs_do_not_depend_on_each_other():
     """タブ間の相互依存が無く、共通サービスは HostMixin に集約されていること。"""
-    import graph_app_mixins.host as host
-    hm = host.HostMixin
+    hm = graph_app.HostMixin   # HostMixin はメイン graph_app.py に統合済み
     # タブ横断で使う土台サービスは HostMixin が持つ
     for name in ("series_xy", "analysis_xy_or_warn", "_analysis_xy",
                  "_xy_by_disp", "prepare_view_axes", "_tab_hook"):

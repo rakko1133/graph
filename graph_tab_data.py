@@ -92,30 +92,6 @@ class DataIOMixin:
                     return None
         return {"path": path, "enc": enc, "delim": delim, "sheet": sheet}
 
-    def register_dataset(self, base_label, df, *, path=None, enc="-", delim="-",
-                         status=None):
-        """生成したデータを新しいデータセットとして登録する。
-
-        数学チャンネル・カーブフィットなどが作った表を
-        取り込む共通口。同名があれば「(2)」を付けて重複を避け、ファイル一覧と
-        列一覧まで更新する。使う側は「何を作ったか」だけ書けばよい。
-
-        path を省くとラベルをそのまま入れる（＝ディスク上の実体は無い印。
-        reload_current はこれを見て再読込を断る）。
-        """
-        label, i = base_label, 2
-        while label in self.datasets:
-            label = f"{base_label} ({i})"
-            i += 1
-        self.datasets[label] = df
-        self.meta[label] = {"path": path if path is not None else label,
-                            "enc": enc, "delim": delim}
-        self._add_file_item(label)
-        self._refresh_columns()
-        if status:
-            self._set_status(status.format(label=label))
-        return label
-
     def _register_loaded(self, job, result):
         """読み込み結果をデータセットへ登録する（GUIスレッドで行う部分）。"""
         path, sheet = job["path"], job.get("sheet")

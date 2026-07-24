@@ -24,7 +24,7 @@ import build_onefile                                    # noqa: E402
 ROOT = build_onefile.ROOT
 OUT = os.path.join(ROOT, "graph_simple_onefile.py")
 
-UI = "graph_app_mixins/ui_build.py"
+UI = "graph_app.py"  # ui_build はメインに統合済み
 
 # 削除する塊。(対象ファイル, 開始マーカ, 終了マーカ, 説明)
 # 開始マーカの位置から終了マーカの直前までを取り除く。
@@ -87,7 +87,7 @@ SUBS = [
      "        if tb is not None:   # Veusz風で左縦に移したツールバーも上へ戻す\n",
      "        if tb is not None:   # ツールバーは常に上へ戻す\n",
      "配置リセットのコメントの Veusz 参照", 1),
-    ("graph_app_mixins/plotting.py",
+    ("graph_app.py",
      '"""現在のグラフを独立ウィンドウとして複製する（Igor Pro風）。',
      '"""現在のグラフを独立ウィンドウとして複製する。',
      "別グラフウィンドウの説明の Igor 参照", 1),

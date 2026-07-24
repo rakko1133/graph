@@ -18,21 +18,20 @@ ORDER = [
     "analysis_common.py", "analysis_spectrum.py", "analysis_measure.py",
     "advanced.py", "mathchan.py", "datasci.py", "batch_render.py",
     "graph_app_common.py",
-    "graph_app_mixins/host.py",
-    "graph_app_mixins/ui_build.py", "graph_app_mixins/data_io.py",
-    "graph_app_mixins/style_table.py", "graph_app_mixins/plotting.py",
-    "graph_app_mixins/scope_cursor.py", "graph_app_mixins/analysis_peaks.py",
-    "graph_app_mixins/advanced_tools.py", "graph_app_mixins/datasci_tools.py",
-    "graph_app_mixins/batch.py", "graph_app_mixins/persistence.py",
-    "graph_app_tabs.py",
+    # タブ（1タブ=1ファイル）
+    "graph_tab_data.py",
+    "graph_tab_scope.py",
+    "graph_tab_advanced.py",
+    "graph_tab_datasci.py",
+    # メイン（GUIフレームワーク＋タブ登録＋GraphApp を統合した1ファイル）
     "graph_app.py",
 ]
 # 内部モジュール名（これらへの import と修飾参照を消す）
 INTERNAL = {
     "applog", "config_io", "jp_font", "data_loader", "plotter_format", "plotter_draw", "plotter",
     "analysis_common", "analysis_spectrum", "analysis_measure", "analysis",
-    "advanced", "mathchan", "datasci", "batch_render", "graph_app_common", "graph_app_mixins",
-    "graph_app_tabs",
+    "advanced", "mathchan", "datasci", "batch_render", "graph_app_common",
+    "graph_tab_data", "graph_tab_scope", "graph_tab_advanced", "graph_tab_datasci",
 }
 # 平坦化する修飾（長い名前を先に）
 QUALIFIERS = sorted(
