@@ -957,3 +957,94 @@ class DataIOMixin:
             self._set_status(f"保存しました: {path}（全{len(self.datasets[lbl])}行）")
         except Exception as e:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "保存エラー", str(e))
+
+    def _build_tab_data(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(2, 2, 2, 2)
+        note = QtWidgets.QLabel("Y系列の選択は「読み込み済みファイル」ウィンドウで行います"
+                                "（表示メニューから再表示できます）。")
+        note.setWordWrap(True); note.setStyleSheet("color:#666;")
+        v.addWidget(note)
+        # 軸の選択（X/Y/Z と 3D表示）。「何をプロットするか」をここに集約する
+        sec_axes = self._fmt_section("軸の選択（X・Z・3D）", "axes_sel", True)
+        v.addWidget(sec_axes)
+        av = QtWidgets.QVBoxLayout()
+        av.addWidget(QtWidgets.QLabel("X軸（横軸 / ラベル）"))
+        self.xleft_check = QtWidgets.QCheckBox("一番左の列をX軸にする（位置で固定）")
+        self.xleft_check.setToolTip(
+            "ONにすると各ファイルの『一番左の列』をX軸に使います（列名が違っても適用）。\n"
+            "複数ファイル／バッチ出力でX軸を固定したいときに便利。\n"
+            "OFFなら下のコンボで列名を指定します。")
+        self.xleft_check.toggled.connect(self._on_xleft_toggled)
+        av.addWidget(self.xleft_check)
+        self.x_combo = QtWidgets.QComboBox()
+        self.x_combo.setToolTip("横軸に使う列（列名で指定）。波形なら時間列を選びます。")
+        self.x_combo.currentTextChanged.connect(self._on_x_changed)
+        av.addWidget(self.x_combo)
+
+        # X↔Y 入れ替え／X軸を複数選択（散布図などの 2D xy 種別で有効）
+        xrow = QtWidgets.QHBoxLayout()
+        self.swap_xy_check = QtWidgets.QCheckBox("X↔Y 入れ替え")
+        self.swap_xy_check.setToolTip("XとYを入れ替えて描く（軸の“向き反転”0→1↔1→0 とは別）。"
+                                      "散布図・折れ線などの2D種別で有効。")
+        self.swap_xy_check.toggled.connect(self._request_redraw)
+        xrow.addWidget(self.swap_xy_check)
+        self.multix_check = QtWidgets.QCheckBox("X軸を複数選択")
+        self.multix_check.setToolTip("ONにすると下のリストでチェックした複数の列をXにし、"
+                                     "各X×各Yの組み合わせを系列として描きます。")
+        self.multix_check.setEnabled(False)
+        self.multix_check.toggled.connect(self._on_multix_toggled)
+        xrow.addWidget(self.multix_check); xrow.addStretch(1)
+        av.addLayout(xrow)
+        self.x_list = CheckListWidget()
+        self.x_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.x_list.setToolTip("『X軸を複数選択』ON時に、Xに使う列をチェックします。")
+        self.x_list.setStyleSheet("QListWidget::indicator { width:16px; height:16px; }")
+        self.x_list.setMaximumHeight(90)
+        self.x_list.itemChanged.connect(self._request_redraw)
+        self.x_list.setEnabled(False)
+        av.addWidget(self.x_list)
+
+        self.z_label = QtWidgets.QLabel("Z軸（3Dの奥行き）")
+        av.addWidget(self.z_label)
+        self.z_combo = QtWidgets.QComboBox()
+        self.z_combo.setToolTip("3Dグラフの奥行き（Z軸）に使う列。3D種別のときだけ有効になります。")
+        self.z_combo.currentTextChanged.connect(self._on_x_changed)
+        self.z_combo.setEnabled(False)
+        av.addWidget(self.z_combo)
+
+        # 3D表示はZ軸とセットの「何をプロットするか」の設定なので、ここ（軸の選択）に置く
+        self.threed_check = QtWidgets.QCheckBox("3D表示（Z軸を使う・ドラッグで回転）")
+        self.threed_check.setToolTip(
+            "散布図・折れ線・棒でONにするとZ軸を使った3D描画になります。\n"
+            "曲面は常に3Dです。3D対応でない種別では選べません（種別は書式パネルで選択）。")
+        self.threed_check.setEnabled(False)
+        self.threed_check.toggled.connect(self._on_3d_toggled)
+        av.addWidget(self.threed_check)
+        view = QtWidgets.QHBoxLayout()
+        view.addWidget(QtWidgets.QLabel("3D視点 仰角"))
+        self.elev_spin = QtWidgets.QSpinBox(); self.elev_spin.setRange(-90, 90)
+        self.elev_spin.setValue(30)
+        self.elev_spin.setToolTip("3Dグラフの仰角（上下の見おろし角）。ドラッグでも回転できます。")
+        self.elev_spin.valueChanged.connect(self._on_view_angle_changed)
+        view.addWidget(self.elev_spin)
+        view.addWidget(QtWidgets.QLabel("方位"))
+        self.azim_spin = QtWidgets.QSpinBox(); self.azim_spin.setRange(-180, 180)
+        self.azim_spin.setValue(-60)
+        self.azim_spin.setToolTip("3Dグラフの方位（左右の回転角）。ドラッグでも回転できます。")
+        self.azim_spin.valueChanged.connect(self._on_view_angle_changed)
+        view.addWidget(self.azim_spin)
+        view.addStretch(1)
+        self.elev_spin.setEnabled(False); self.azim_spin.setEnabled(False)
+        av.addLayout(view)
+        sec_axes.set_content_layout(av)
+
+        # 旧Yリストは非表示の「選択モデル」として保持（ツリー・系列バー・
+        # 設定復元・テストが (ファイル, 列) 単位でここを読む）。レイアウトには足さない。
+        self.y_list = CheckListWidget()
+        self.y_list.setVisible(False)
+        self.y_list.itemChanged.connect(self._on_y_check_changed)
+        self.y_list.itemDoubleClicked.connect(self._on_y_double_clicked)
+        v.addStretch(1)
+        return w

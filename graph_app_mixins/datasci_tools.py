@@ -310,4 +310,73 @@ class DataSciMixin:
             rows.append((f"{name}", f"n={n}, 平均={mean:.6g}, σ={std:.6g}"))
         self._ds_show(f"一元配置ANOVA（{len(d['groups'])}群）", rows)
 
-    # ---- 主成分分析（PCA） ----
+    def _build_tab_datasci(self):
+        outer = QtWidgets.QScrollArea(); outer.setWidgetResizable(True)
+        w = QtWidgets.QWidget(); outer.setWidget(w)
+        v = QtWidgets.QVBoxLayout(w)
+
+        v.addWidget(self._bold("統計解析（回帰・記述統計・相関・正規性）"))
+        info = QtWidgets.QLabel("選択中のY系列を、現在のX軸列に対して解析します。"
+                                "データタブでX軸とY系列を選んでから実行してください。")
+        info.setWordWrap(True); info.setStyleSheet("color:#555;")
+        v.addWidget(info)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("対象:"))
+        self.ds_target = QtWidgets.QComboBox()
+        self.ds_target.setToolTip("解析するY系列。データタブでY系列を選ぶと候補に出ます")
+        row.addWidget(self.ds_target, 1)
+        v.addLayout(row)
+
+        # 回帰（線形性）
+        b_reg = QtWidgets.QPushButton("線形回帰（Y vs X）")
+        b_reg.setToolTip("傾き・切片・R²・相関r・直線性誤差[%FS] を計算（線形性の評価）")
+        b_reg.clicked.connect(self.run_regression)
+        self.ds_fit_check = QtWidgets.QCheckBox("回帰直線を重ねる")
+        self.ds_fit_check.setToolTip("回帰実行時に近似曲線（線形）をグラフへ重ねて表示します")
+        reg_row = QtWidgets.QHBoxLayout()
+        reg_row.addWidget(b_reg); reg_row.addWidget(self.ds_fit_check); reg_row.addStretch(1)
+        v.addLayout(reg_row)
+
+        # 統計・正規性・相関行列
+        brow = QtWidgets.QHBoxLayout()
+        b_desc = QtWidgets.QPushButton("記述統計"); b_desc.clicked.connect(self.show_describe)
+        b_desc.setToolTip("平均/中央値/標準偏差/分散/歪度/尖度/四分位 など")
+        b_norm = QtWidgets.QPushButton("正規性検定"); b_norm.clicked.connect(self.run_normality)
+        b_norm.setToolTip("Shapiro-Wilk 検定（scipy 必要）")
+        b_corr = QtWidgets.QPushButton("相関行列"); b_corr.clicked.connect(self.show_corr_matrix)
+        b_corr.setToolTip("選択中の全Y系列どうしのピアソン相関を行列で表示")
+        brow.addWidget(b_desc); brow.addWidget(b_norm); brow.addWidget(b_corr)
+        v.addLayout(brow)
+
+        # 任意関数フィット・検定
+        brow2 = QtWidgets.QHBoxLayout()
+        b_cfit = QtWidgets.QPushButton("任意関数フィット…")
+        b_cfit.setToolTip("モデル式（例: a*exp(-x/b)+c）とパラメータ初期値を指定して\n"
+                          "非線形フィット。パラメータ±標準誤差とR²を表示し、\n"
+                          "フィット曲線を新データとして重ね描きできます（scipy 必要）。")
+        b_cfit.clicked.connect(self.run_custom_fit)
+        b_tt = QtWidgets.QPushButton("t検定…")
+        b_tt.setToolTip("1標本（母平均と比較）／対応なし2標本（Welch）／対応あり2標本（scipy 必要）")
+        b_tt.clicked.connect(self.run_t_test)
+        b_an = QtWidgets.QPushButton("ANOVA")
+        b_an.setToolTip("一元配置分散分析。選択中の全Y系列を群として比較します（scipy 必要）")
+        b_an.clicked.connect(self.run_anova)
+        brow2.addWidget(b_cfit); brow2.addWidget(b_tt); brow2.addWidget(b_an)
+        v.addLayout(brow2)
+
+        self.ds_title = self._bold("結果")
+        v.addWidget(self.ds_title)
+        hint = QtWidgets.QLabel("右端の「表示」にチェックした項目は、その値をグラフに注記表示します。")
+        hint.setWordWrap(True); hint.setStyleSheet("color:#555;")
+        v.addWidget(hint)
+        self.ds_table = QtWidgets.QTableWidget(0, 3)
+        self.ds_table.setHorizontalHeaderLabels(["項目", "値", "表示"])
+        hh = self.ds_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.ds_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._wire_table_export(self.ds_table, "統計解析")
+        v.addWidget(self.ds_table, 1)
+        return outer
