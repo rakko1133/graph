@@ -23,6 +23,7 @@ ORDER = [
     "graph_tab_scope.py",
     "graph_tab_advanced.py",
     "graph_tab_datasci.py",
+    "graph_tab_threshold.py",
     # メイン（GUIフレームワーク＋タブ登録＋GraphApp を統合した1ファイル）
     "graph_app.py",
 ]
@@ -32,6 +33,7 @@ INTERNAL = {
     "analysis_common", "analysis_spectrum", "analysis_measure", "analysis",
     "advanced", "mathchan", "datasci", "batch_render", "graph_app_common",
     "graph_tab_data", "graph_tab_scope", "graph_tab_advanced", "graph_tab_datasci",
+    "graph_tab_threshold",
 }
 # 平坦化する修飾（長い名前を先に）
 QUALIFIERS = sorted(

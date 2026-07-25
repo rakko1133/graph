@@ -25,6 +25,7 @@ from graph_tab_data import DataIOMixin        # 1. データ タブ
 from graph_tab_scope import ScopeTabMixin     # 2. オシロ/解析 タブ
 from graph_tab_advanced import AdvancedMixin  # 3. 高度解析 タブ
 from graph_tab_datasci import DataSciMixin    # 4. 統計解析 タブ
+import graph_tab_threshold                     # 5. しきい値（採用した差し込みタブ／register_tab で登録）
 
 # ============================================================
 # GUIフレームワーク（旧 graph_app_mixins の host/ui_build/plotting/

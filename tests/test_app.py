@@ -53,7 +53,7 @@ def _wave():
 # ---------------- スモーク（GUI が壊れていないか）----------------
 def test_construct():
     w = _make_app(_wave())
-    assert len(w.left_docks) == 4          # データ/オシロ/高度解析/統計解析 のドック
+    assert len(w.left_docks) >= 4          # 内蔵4タブ（＋採用した差し込みタブ）
     assert w.format_dock is not None       # 右端の書式パネル
     assert hasattr(w, "ax")
 
@@ -831,13 +831,15 @@ def test_draw_path_survives_missing_tab_hook():
 
 
 def test_builtin_tabs_are_registered_plugins():
-    """内蔵4タブがプラグインとして登録され、順序・レベルが従来どおりであること。"""
+    """内蔵4タブがプラグインとして登録され、順序・レベルが従来どおりであること。
+
+    採用した差し込みタブ（order 50〜）が後ろに増えても壊れないよう、先頭4つだけ見る。"""
     import graph_app_common as C
     tabs = C.registered_tabs()
-    assert [t.key for t in tabs] == ["data", "scope", "advanced", "datasci"]
-    assert [t.min_level for t in tabs] == ["基本", "標準", "全部", "全部"]
+    assert [t.key for t in tabs][:4] == ["data", "scope", "advanced", "datasci"]
+    assert [t.min_level for t in tabs][:4] == ["基本", "標準", "全部", "全部"]
     w = _make_app(_wave())
-    assert [d.objectName() for d in w.left_docks] == \
+    assert [d.objectName() for d in w.left_docks][:4] == \
         ["dock_data", "dock_scope", "dock_advanced", "dock_datasci"]
     # 表示レベルはプラグインの min_level から導出される（旧ハードコードと一致）
     w.set_ui_level("基本", announce=False)
@@ -845,6 +847,21 @@ def test_builtin_tabs_are_registered_plugins():
     w.set_ui_level("標準", announce=False)
     assert w._visible_dock_names() == {
         "dock_files", "dock_format", "dock_data", "dock_scope"}
+
+
+def test_threshold_tab_is_adopted_and_draws():
+    """採用した差し込みタブ graph_tab_threshold が本体に組み込まれ、しきい値線を描くこと。"""
+    import numpy as np
+    import graph_app_common as C
+    w = _make_app(_wave())
+    assert "dock_threshold" in [d.objectName() for d in w.left_docks]
+    plugin = next(p for p in C.registered_tabs() if p.key == "threshold")
+    plugin.enabled.setChecked(True)
+    plugin.thr.setText("1.5")          # 正弦(±1)の外なのでデータ線と衝突しない
+    w.draw_graph()
+    hit = [ln for ln in w.ax.get_lines()
+           if list(np.round(ln.get_ydata(), 6))[:2] == [1.5, 1.5]]
+    assert hit, "しきい値 y=1.5 の水平線が描かれていない"
 
 
 def test_new_tab_can_be_added_by_plugin():
