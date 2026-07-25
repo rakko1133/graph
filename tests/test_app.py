@@ -888,6 +888,56 @@ def test_new_tab_can_be_added_by_plugin():
         C._TAB_REGISTRY[:] = [p for p in C._TAB_REGISTRY if p.key != "probe_xyz"]
 
 
+def test_plugin_can_draw_overlay_and_persist_settings():
+    """コアを触らず、プラグインが (1) メイングラフへ描画でき (2) 設定を保存/復元できること。"""
+    import graph_app_common as C
+
+    class _OverlayTab(C.TabPlugin):
+        key, title, order, min_level = "ov_probe", "9. 注記検証", 91, "全部"
+
+        def build(self, app):
+            w = QtWidgets.QWidget()
+            self.spin = QtWidgets.QSpinBox(); self.spin.setValue(3)
+            QtWidgets.QVBoxLayout(w).addWidget(self.spin)
+            return w
+
+        def draw_overlay(self, app, ax):          # コア無改変の描画差し込み口
+            for i in range(self.spin.value()):
+                ax.axvline(i, color="magenta", linestyle=":", label="_ovprobe")
+
+        def collect_config(self, app):
+            return {"n": self.spin.value()}
+
+        def apply_config(self, app, cfg):
+            self.spin.setValue(int(cfg.get("n", 3)))
+
+    probe = _OverlayTab()
+    C.register_tab(probe)
+    try:
+        w = _make_app(_wave())
+        try:
+            probe.spin.setValue(4)
+            w.draw_graph()
+            # (1) プラグインの draw_overlay がメイン軸へ描いた（縦線4本）
+            vlines = [ln for ln in w.ax.get_lines() if ln.get_label() == "_ovprobe"]
+            assert len(vlines) == 4
+            # (2) タブ設定が config に載る（key 名前空間の下）
+            cfg = w._collect_config()
+            assert cfg["tabs"]["ov_probe"] == {"n": 4}
+        finally:
+            w.close()
+        # 別インスタンスへ config を適用するとタブ設定が復元される
+        w2 = graph_app.GraphApp()
+        try:
+            assert probe.spin.value() == 3        # build 直後の既定
+            w2._apply_config(cfg, load_files=False)
+            assert probe.spin.value() == 4        # apply_config で復元
+        finally:
+            w2.close()
+    finally:
+        C._TAB_REGISTRY[:] = [p for p in C._TAB_REGISTRY if p.key != "ov_probe"]
+
+
 def test_ui_level_hides_without_destroying():
     """表示レベルは setVisible だけで、ウィジェットも設定も失わないこと。"""
     w = _make_app(_wave())

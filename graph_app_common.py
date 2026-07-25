@@ -54,6 +54,12 @@ class TabPlugin:
     build(app) はタブの中身ウィジェットを返す。app は GraphApp インスタンスなので、
     既存の描画・解析メソッド（app.draw_graph / app.analysis_xy_or_warn 等）を
     そのまま呼べる。独自ロジックはプラグイン側に持ってもよい。
+
+    任意で次のメソッドを定義すると、コア（graph_app.py）を触らずに拡張できる:
+      draw_overlay(app, ax)     : 描画のたびに呼ばれ、メイングラフ(ax)へ注記・
+                                  目印などを重ねられる（app.draw_graph で再描画）。
+      collect_config(app)->dict : このタブの設定を保存用 dict で返す（JSON化可能に）。
+      apply_config(app, cfg)    : 保存した dict からこのタブの設定を復元する。
     """
     key = ""
     title = ""

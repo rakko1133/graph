@@ -40,6 +40,49 @@ class HostMixin:
         fn = getattr(self, name, None)
         return fn(*args) if callable(fn) else default
 
+    # ---- 差し込みタブ用の拡張口（コアを触らず、タブ側だけで拡張できる）----
+    def _draw_plugin_overlays(self):
+        """登録タブが定義した draw_overlay(app, ax) をメイングラフへ描く。
+
+        プラグインタブ（graph_tab_*.py）が draw_overlay を持てば、描画のたびに
+        ここから呼ばれ、メイン軸へ注記・目印などを重ねられる。draw_graph を
+        1行も触らずに『グラフ上へ描く』機能を足せる差し込み口。1枚が失敗しても
+        他タブや本体描画は落とさない。"""
+        for plugin in registered_tabs():
+            fn = getattr(plugin, "draw_overlay", None)
+            if callable(fn):
+                try:
+                    fn(self, self.ax)
+                except Exception:
+                    applog.get_logger().debug(
+                        "draw_overlay 失敗: %s", getattr(plugin, "key", "?"), exc_info=True)
+
+    def _collect_plugin_config(self):
+        """各登録タブの collect_config(app) を集めて {key: 設定dict} で返す。"""
+        out = {}
+        for plugin in registered_tabs():
+            fn = getattr(plugin, "collect_config", None)
+            if callable(fn):
+                try:
+                    out[plugin.key] = fn(self)
+                except Exception:
+                    applog.get_logger().debug(
+                        "collect_config 失敗: %s", getattr(plugin, "key", "?"), exc_info=True)
+        return out
+
+    def _apply_plugin_config(self, saved):
+        """保存済みの {key: 設定dict} を各登録タブの apply_config(app, cfg) へ配る。"""
+        if not isinstance(saved, dict):
+            return
+        for plugin in registered_tabs():
+            fn = getattr(plugin, "apply_config", None)
+            if callable(fn):
+                try:
+                    fn(self, saved.get(plugin.key, {}))
+                except Exception:
+                    applog.get_logger().debug(
+                        "apply_config 失敗: %s", getattr(plugin, "key", "?"), exc_info=True)
+
     def series_xy(self, fl, col, gated=False):
         """指定系列(fl,col)の (t, y) を数値配列で返す。
 
@@ -3042,6 +3085,7 @@ class PlotMixin:
                 self._apply_fill_between(ctype, series)   # 系列間の塗りつぶし（選択時）
                 self._tab_hook("_draw_ds_annotations")   # データサイエンス注記（該当タブがあれば）
                 self._tab_hook("_draw_proto_overlay", ctype)  # プロトコル解読の波形上注記
+                self._draw_plugin_overlays()   # 差し込みタブのオーバーレイ（コア無改変の拡張口）
                 # 地色が暗いときは目盛り・軸ラベル・凡例の文字色も明るくする
                 # （plot_series は地色しか塗らないので、ここで対比を確保する）
                 self._apply_figure_theme(redraw=False)
@@ -4616,6 +4660,7 @@ class PersistenceMixin:
             "styles": self.series_styles,
             "scope": self._scope_dict(),
             "npeaks": self.npeaks.value(),
+            "tabs": self._collect_plugin_config(),   # 差し込みタブの設定（各タブが collect_config で提供）
         }
 
     def _apply_config(self, cfg, load_files=True):
@@ -4748,6 +4793,7 @@ class PersistenceMixin:
         self._rebuild_style_table()
         self._sync_explorer_checks()   # blockSignals中に復元したY選択をツリーへ反映
         self._on_chart_type_change()
+        self._apply_plugin_config(cfg.get("tabs", {}))   # 差し込みタブの設定を復元
 
     def save_config_dialog(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(

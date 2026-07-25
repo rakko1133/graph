@@ -5314,6 +5314,34 @@ class HostMixin:
  def _tab_hook(self, name, *args, default=None):
   fn = getattr(self, name, None)
   return fn(*args) if callable(fn) else default
+ def _draw_plugin_overlays(self):
+  for plugin in registered_tabs():
+   fn = getattr(plugin, "draw_overlay", None)
+   if callable(fn):
+    try:
+     fn(self, self.ax)
+    except Exception:
+     get_logger().debug( "draw_overlay 失敗: %s", getattr(plugin, "key", "?"), exc_info=True)
+ def _collect_plugin_config(self):
+  out = {}
+  for plugin in registered_tabs():
+   fn = getattr(plugin, "collect_config", None)
+   if callable(fn):
+    try:
+     out[plugin.key] = fn(self)
+    except Exception:
+     get_logger().debug( "collect_config 失敗: %s", getattr(plugin, "key", "?"), exc_info=True)
+  return out
+ def _apply_plugin_config(self, saved):
+  if not isinstance(saved, dict):
+   return
+  for plugin in registered_tabs():
+   fn = getattr(plugin, "apply_config", None)
+   if callable(fn):
+    try:
+     fn(self, saved.get(plugin.key, {}))
+    except Exception:
+     get_logger().debug( "apply_config 失敗: %s", getattr(plugin, "key", "?"), exc_info=True)
  def series_xy(self, fl, col, gated=False):
   import numpy as np
   import pandas as pd
@@ -7483,6 +7511,7 @@ class PlotMixin:
     self._apply_fill_between(ctype, series)
     self._tab_hook("_draw_ds_annotations")
     self._tab_hook("_draw_proto_overlay", ctype)
+    self._draw_plugin_overlays()
     self._apply_figure_theme(redraw=False)
     try:
      self.fig.tight_layout()
@@ -8592,7 +8621,7 @@ class PersistenceMixin:
   n = f"＋表{len(extra)}シート" if extra else ""
   self._set_status(f"Excelレポートを出力しました（{eng}エンジン{n}）: {out}")
  def _collect_config(self):
-  return { "files": [self.meta[l]["path"] for l in self.datasets], "x_col": self.x_combo.currentText(), "z_col": self.z_combo.currentText() if hasattr(self, "z_combo") else "", "x_leftmost": self.xleft_check.isChecked(), "selected_y": [[fl, col] for fl, col, _ in self._selected_series_items()], "chart_type": self.chart_combo.currentText(), "threed": self.threed_check.isChecked() if hasattr(self, "threed_check") else False, "stack": self.stack_check.isChecked() if hasattr(self, "stack_check") else False, "swap_xy": self.swap_xy_check.isChecked() if hasattr(self, "swap_xy_check") else False, "multi_x": self.multix_check.isChecked() if hasattr(self, "multix_check") else False, "x_cols": ([self.x_list.item(i).data(UserRole) for i in range(self.x_list.count()) if self.x_list.item(i).checkState() == QtCore.Qt.CheckState.Checked] if hasattr(self, "x_list") else []), "view_elev": self.elev_spin.value() if hasattr(self, "elev_spin") else 30, "view_azim": self.azim_spin.value() if hasattr(self, "azim_spin") else -60, "title": self.title_edit.text(), "xlabel": self.xlabel_edit.text(), "ylabel": self.ylabel_edit.text(), "fonts": self._fonts(), "grid": self.grid_check.isChecked(), "legend": self.legend_check.isChecked(), "legend_loc": self.legend_loc.currentText(), "show_filename": self.show_filename_check.isChecked(), "show_ext": self.show_ext_check.isChecked(), "frame_width": self.frame_width.value(), "grid_width": self.grid_width.value(), "xmin": self.xmin.text(), "xmax": self.xmax.text(), "ymin": self.ymin.text(), "ymax": self.ymax.text(), "xtick": self.xtick_edit.text(), "ytick": self.ytick_edit.text(), "xunit": self.xunit_edit.text(), "yunit": self.yunit_edit.text(), "xscale": self.xscale_edit.text(), "yscale": self.yscale_edit.text(), "xlog": self.xlog.isChecked(), "ylog": self.ylog.isChecked(), "xinvert": self.xinvert_check.isChecked(), "yinvert": self.yinvert_check.isChecked(), "bins": self.bins_spin.value(), "pct": self.pct_check.isChecked(), "trend": self.trend_combo.currentText(), "trend_degree": self.trend_degree.value(), "trend_window": self.trend_window.value(), "trend_eq": self.trend_eq.isChecked(), "trend_color": getattr(self, "trend_color", ""), "fill_enabled": self.fill_check.isChecked(), "fill_a": self.fill_a.currentText(), "fill_b": self.fill_b.currentText(), "fill_color": getattr(self, "fill_color", ""), "fill_alpha": self.fill_alpha.value(), "data_labels": self.data_labels_check.isChecked(), "aspect": self.aspect_combo.currentText(), "aspect_w": self.aspect_w.value(), "aspect_h": self.aspect_h.value(), "bg_color": getattr(self, "bg_color", ""), "export_dpi": self.dpi_spin.value(), "transparent": self.transparent_check.isChecked(), "recent_files": self.recent_files, "styles": self.series_styles, "scope": self._scope_dict(), "npeaks": self.npeaks.value(), }
+  return { "files": [self.meta[l]["path"] for l in self.datasets], "x_col": self.x_combo.currentText(), "z_col": self.z_combo.currentText() if hasattr(self, "z_combo") else "", "x_leftmost": self.xleft_check.isChecked(), "selected_y": [[fl, col] for fl, col, _ in self._selected_series_items()], "chart_type": self.chart_combo.currentText(), "threed": self.threed_check.isChecked() if hasattr(self, "threed_check") else False, "stack": self.stack_check.isChecked() if hasattr(self, "stack_check") else False, "swap_xy": self.swap_xy_check.isChecked() if hasattr(self, "swap_xy_check") else False, "multi_x": self.multix_check.isChecked() if hasattr(self, "multix_check") else False, "x_cols": ([self.x_list.item(i).data(UserRole) for i in range(self.x_list.count()) if self.x_list.item(i).checkState() == QtCore.Qt.CheckState.Checked] if hasattr(self, "x_list") else []), "view_elev": self.elev_spin.value() if hasattr(self, "elev_spin") else 30, "view_azim": self.azim_spin.value() if hasattr(self, "azim_spin") else -60, "title": self.title_edit.text(), "xlabel": self.xlabel_edit.text(), "ylabel": self.ylabel_edit.text(), "fonts": self._fonts(), "grid": self.grid_check.isChecked(), "legend": self.legend_check.isChecked(), "legend_loc": self.legend_loc.currentText(), "show_filename": self.show_filename_check.isChecked(), "show_ext": self.show_ext_check.isChecked(), "frame_width": self.frame_width.value(), "grid_width": self.grid_width.value(), "xmin": self.xmin.text(), "xmax": self.xmax.text(), "ymin": self.ymin.text(), "ymax": self.ymax.text(), "xtick": self.xtick_edit.text(), "ytick": self.ytick_edit.text(), "xunit": self.xunit_edit.text(), "yunit": self.yunit_edit.text(), "xscale": self.xscale_edit.text(), "yscale": self.yscale_edit.text(), "xlog": self.xlog.isChecked(), "ylog": self.ylog.isChecked(), "xinvert": self.xinvert_check.isChecked(), "yinvert": self.yinvert_check.isChecked(), "bins": self.bins_spin.value(), "pct": self.pct_check.isChecked(), "trend": self.trend_combo.currentText(), "trend_degree": self.trend_degree.value(), "trend_window": self.trend_window.value(), "trend_eq": self.trend_eq.isChecked(), "trend_color": getattr(self, "trend_color", ""), "fill_enabled": self.fill_check.isChecked(), "fill_a": self.fill_a.currentText(), "fill_b": self.fill_b.currentText(), "fill_color": getattr(self, "fill_color", ""), "fill_alpha": self.fill_alpha.value(), "data_labels": self.data_labels_check.isChecked(), "aspect": self.aspect_combo.currentText(), "aspect_w": self.aspect_w.value(), "aspect_h": self.aspect_h.value(), "bg_color": getattr(self, "bg_color", ""), "export_dpi": self.dpi_spin.value(), "transparent": self.transparent_check.isChecked(), "recent_files": self.recent_files, "styles": self.series_styles, "scope": self._scope_dict(), "npeaks": self.npeaks.value(), "tabs": self._collect_plugin_config(), }
  def _apply_config(self, cfg, load_files=True):
   prev_suspend = self._suspend_redraw
   self._suspend_redraw = True
@@ -8716,6 +8745,7 @@ class PersistenceMixin:
   self._rebuild_style_table()
   self._sync_explorer_checks()
   self._on_chart_type_change()
+  self._apply_plugin_config(cfg.get("tabs", {}))
  def save_config_dialog(self):
   path, _ = QtWidgets.QFileDialog.getSaveFileName( self, "設定を保存", os.path.join(self.last_dir, "graph_config.json"), "JSON (*.json)")
   if not path:
