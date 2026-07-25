@@ -1,8 +1,9 @@
 # Copilot 用ひな型：このアプリに新しいタブ（機能）を1つ追加する
 
 > 使い方: 下の「プロンプト本体」を **GitHub Copilot Chat に貼り付け**、
-> `【ここに作りたい機能を書く】` を書き換えて送る。可能なら
-> `タブ追加ガイド.md` と `graph_app_common.py` を開いて（またはコンテキストに添付して）から送ると精度が上がる。
+> `【ここに作りたい機能を書く】` を書き換えて送る。**`graph_app_common.py` と `タブ追加ガイド.md` を
+> Copilot に必ず添付（ファイルを開く）** するとさらに精度が上がる（検索任せだと `.pyc` しか見つからず
+> 本文を読めないことがある）。※ ただし本プロンプトは単体で完結しており、添付できなくても動くコードは出る。
 
 ---
 
@@ -27,6 +28,9 @@
   `order`（内蔵タブは 10/20/30/40。**50以上**にする）／`min_level`（`"基本"`/`"標準"`/`"全部"`、迷ったら `"全部"`）。
 - `build(self, app)` でウィジェットを作って返す。ウィジェット参照は `self.` に持つ
   （後で `collect_config` 等から読めるように）。
+- 再描画の配線: 値が変わったら `app.draw_graph()` を呼ぶが、`QLineEdit` は
+  **`editingFinished`**（確定・フォーカス外し）で呼ぶ。`textChanged` で**1文字ごとに再描画しない**
+  （大きいデータで重くなる）。チェック/コンボ/スピンは `toggled`/`currentTextChanged`/`valueChanged` でよい。
 - **下の「使ってよいAPI」以外の app のメソッドは呼ばない**（存在しないメソッドを発明しない）。
 - `graph_app.py` の import 1行以外、**他のコアファイルは一切変更しない**。
 - 設定を保存するなら **JSON化できる値だけ**（数値・文字列・真偽・リスト・辞書）。
@@ -43,7 +47,8 @@
 - 特定系列（ファイル名, 列名）の `(t, y)` を取る: `t, y = app.series_xy(fl, col)`
 - 選択中のY系列を列挙: `for fl, col, disp in app._selected_series_items(): ...`
 - 計算結果を新しいデータとして追加: `app.register_dataset("移動平均: " + label, dataframe)`
-  （`dataframe` は pandas.DataFrame。ファイル一覧・列一覧まで自動更新される）
+  （`dataframe` は **横軸列＋値列を持つ** pandas.DataFrame。例 `pd.DataFrame({"time": t, "移動平均": y2})`。
+  ファイル一覧・列一覧まで自動更新される。numpy/pandas が要るなら自分で `import numpy as np` / `import pandas as pd`）
 - グラフを再描画: `app.draw_graph()`
 - 画面内通知（モーダルにしない）: `app.notify("文", "info")` … 第2引数は `"info"/"ok"/"warn"/"error"`
 - ステータスバーへ1行: `app._set_status("文")`
@@ -51,8 +56,13 @@
 ### 任意メソッド（定義すればコアを触らず効く）
 - `def draw_overlay(self, app, ax):` … `app.draw_graph()` のたびに呼ばれ、メイングラフ
   `ax`（matplotlib の Axes）へ重ね描きできる。状態を変えたら `app.draw_graph()` を呼ぶ。
-- `def collect_config(self, app):` … このタブの設定を dict で返す（終了時に自動保存）。
-- `def apply_config(self, app, cfg):` … 保存 dict から設定を復元（起動時に自動適用）。
+  - 描く線・帯・注記は **データ系列と紛れないよう色を明示**する（例 `color="tab:red"`、帯は `alpha=0.15`）。色サイクル任せにしない。
+  - **通常の2Dグラフのときだけ呼ばれる**（3D・FFT等の特殊表示では呼ばれない）。軸種の手判定は不要
+    （3D等でエラーが出ても本体が try/except で吸収する）。3D前提の描画は書かない。
+- `def collect_config(self, app):` … このタブの設定を dict で返す（終了時に自動保存）。JSON化できる値だけ。
+- `def apply_config(self, app, cfg):` … 保存 dict を**ウィジェットに書き戻すだけ**。復元中は
+  `blockSignals(True/False)` で信号を止める。**ここで `app.draw_graph()` は呼ばない**
+  （復元後に本体が描き直す。ここで描くと復元中に無駄な再描画＋Undo記録が走る）。
 
 ### 骨組み（この形に沿って書く）
 ```python
@@ -86,6 +96,31 @@ class MyToolTab(TabPlugin):
 register_tab(MyToolTab())
 ```
 追加する import 行（`graph_app.py` 冒頭へ）: `from graph_tab_mytool import MyToolTab`
+
+### 任意メソッドを使う場合の型（描く・設定を保存するなら、この形を真似る）
+```python
+    def build(self, app):
+        w = QtWidgets.QWidget(); lay = QtWidgets.QFormLayout(w)
+        self.thr = QtWidgets.QLineEdit()
+        self.thr.editingFinished.connect(lambda: app.draw_graph())  # ← 毎文字ではなく確定時
+        lay.addRow("しきい値", self.thr)
+        return w
+
+    def draw_overlay(self, app, ax):        # 通常2Dグラフのときだけ呼ばれる
+        try:
+            y = float(self.thr.text())
+        except ValueError:
+            return
+        ax.axhline(y, color="tab:red", linestyle="--")  # 色は明示（データと紛れない）
+
+    def collect_config(self, app):
+        return {"thr": self.thr.text()}
+
+    def apply_config(self, app, cfg):
+        self.thr.blockSignals(True)
+        self.thr.setText(str(cfg.get("thr", "")))
+        self.thr.blockSignals(False)        # ← ここで app.draw_graph() は呼ばない
+```
 
 ### 作りたい機能
 【ここに1〜3行で、作りたいタブの機能を書く。例:
