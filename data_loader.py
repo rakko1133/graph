@@ -30,15 +30,12 @@ DELIMITER_LABELS = {
 EXT_GROUPS = (
     ("CSV/TSV", (".csv", ".tsv", ".txt")),
     ("Excel", (".xlsx", ".xls", ".xlsm")),
-    ("波形/計測", (".wav", ".raw", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5")),
-    ("LTspice回路", (".asc", ".net")),
+    ("波形/計測", (".wav", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5")),
 )
-# 読み込むのではなく「実行して結果を読む」もの（回路図・ネットリスト）
-RUNNABLE_EXTS = (".asc", ".net")
 # 受け付ける全拡張子
 ACCEPT_EXTS = tuple(e for _name, exts in EXT_GROUPS for e in exts)
 # 表データとして直接開ける拡張子（フォルダ一括読み込みの対象）
-TABLE_EXTS = tuple(e for e in ACCEPT_EXTS if e not in RUNNABLE_EXTS)
+TABLE_EXTS = ACCEPT_EXTS
 
 
 def file_dialog_filter():
@@ -200,69 +197,6 @@ def _load_wav(path):
     return pd.DataFrame(cols)
 
 
-def _load_ltspice_raw(path):
-    """LTspice の .raw 波形（過渡解析）を読む。バイナリ/ASCII両対応。
-
-    ヘッダはASCIIまたはUTF-16LE（LTspice XVII）。複素数（AC解析）と
-    fastaccess形式は未対応で、その旨を案内するエラーを出す。"""
-    import numpy as np
-    with open(path, "rb") as f:
-        data = f.read()
-    enc = "utf-16-le" if (data[:2] == b"\xff\xfe" or data[1:2] == b"\x00") else "latin-1"
-    marker = body = None
-    for m in ("Binary:", "Values:"):
-        mb = (m + "\n").encode(enc)
-        i = data.find(mb)
-        if i < 0:
-            mb = (m + "\r\n").encode(enc)
-            i = data.find(mb)
-        if i >= 0:
-            marker, hdr_end, body = m, i, i + len(mb)
-            break
-    if marker is None:
-        raise ValueError("LTspiceの .raw 形式として解釈できません（Binary:/Values: が見つかりません）。")
-    header = data[:hdr_end].decode(enc, errors="replace")
-    nvars = npts = 0
-    flags = ""
-    names = []
-    in_vars = False
-    for line in header.splitlines():
-        low = line.strip()
-        if low.startswith("No. Variables:"):
-            nvars = int(low.split(":")[1])
-        elif low.startswith("No. Points:"):
-            npts = int(low.split(":")[1])
-        elif low.startswith("Flags:"):
-            flags = low.split(":", 1)[1].lower()
-        elif low.startswith("Variables:"):
-            in_vars = True
-        elif in_vars and low:
-            parts = low.split("\t") if "\t" in line else low.split()
-            if len(parts) >= 2 and parts[0].strip().isdigit():
-                names.append(parts[1].strip())
-    if not nvars or not npts or len(names) != nvars:
-        raise ValueError("LTspice .raw のヘッダを解釈できませんでした。")
-    if "complex" in flags:
-        raise ValueError("AC解析（複素数）の .raw は未対応です。過渡解析(.tran)の .raw を読み込んでください。")
-    if "fastaccess" in flags:
-        raise ValueError(".raw が fastaccess 形式です。LTspiceの設定で fastaccess を無効にして再保存してください。")
-    if marker == "Binary:":
-        if "double" in flags:   # 全変数 float64
-            arr = np.frombuffer(data[body:body + 8 * nvars * npts], dtype="<f8")
-            table = arr.reshape(npts, nvars)
-        else:                    # 時間=float64、他=float32（LTspice標準）
-            rec = np.dtype([("t", "<f8")] + [(f"v{i}", "<f4") for i in range(1, nvars)])
-            arr = np.frombuffer(data[body:body + rec.itemsize * npts], dtype=rec)
-            table = np.column_stack([arr["t"]] + [arr[f"v{i}"] for i in range(1, nvars)])
-    else:                        # ASCII (Values:)
-        text = data[body:].decode(enc, errors="replace")
-        vals = [float(tok) for tok in text.split() if _is_float(tok)]
-        # 各点は「点番号 v0 v1 ...」の並び。点番号を除いて詰め直す
-        table = np.array(vals, dtype=float).reshape(npts, nvars + 1)[:, 1:]
-    table[:, 0] = np.abs(table[:, 0])   # LTspiceは圧縮マーカーで時間が負になることがある
-    return pd.DataFrame({names[i]: table[:, i] for i in range(nvars)})
-
-
 def _is_float(tok):
     try:
         float(tok)
@@ -367,8 +301,6 @@ def load_table(path, encoding=None, delimiter=None, sheet=None):
     # --- 波形・計測形式 ---
     if ext == ".wav":
         return _normalize_columns(_load_wav(path)), "wav", ""
-    if ext == ".raw":
-        return _normalize_columns(_load_ltspice_raw(path)), "ltspice", ""
     if ext == ".tdms":
         return _normalize_columns(_load_tdms(path)), "tdms", ""
     if ext in (".mf4", ".mdf"):

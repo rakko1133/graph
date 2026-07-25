@@ -9,7 +9,6 @@
     - 8種のグラフ＋系列ごとの色/線種/線幅/マーカー、軸範囲/対数軸/凡例位置
     - Excel相当のグラフ編集：近似曲線（線形/多項式/指数/対数/移動平均＋R²）、
       データラベル、第2軸・複合グラフ（系列ごと主/第2軸＋線/棒/面の混在）、エラーバー
-    - データのセル編集（表を直接編集→DataFrameへ反映、行/列追加・削除、CSV保存）
     - オシロスコープ表示（time/div・V/div・位置・divグリッド）
     - オシロ相当の解析（第1/第2…ピーク検出、各種測定、FFT）
     - 設定の保存／読み込み（終了時自動保存・起動時復元）
@@ -302,17 +301,6 @@ class UIBuildMixin:
         self._menu_action(am, "解析実行（ピーク・測定）", self.run_analysis, "Ctrl+R",
                           tip="選択中の解析対象系列のピーク・測定値を計算")
         self._menu_action(am, "FFTスペクトル表示", self.show_fft, None)
-        # ツール
-        tm = m.addMenu("ツール(&T)")
-        self._menu_action(tm, "LTspiceシミュレーション実行(.asc)...", self.run_ltspice_asc,
-                          tip="LTspice回路をバッチ実行し、生成された .raw 波形を自動で読み込みます。"
-                              "回路(.asc)のドラッグ&ドロップでも実行できます")
-        self._menu_action(tm, "LTspiceの場所を設定...", self.set_ltspice_path,
-                          tip="LTspice実行ファイル（LTspice.exe / XVIIx64.exe）の場所を指定")
-        # ヘルプ
-        hm = m.addMenu("ヘルプ(&H)")
-        self._menu_action(hm, "使い方", self.show_help, "F1")
-        self._menu_action(hm, "バージョン情報", self.show_about, None)
 
     def show_command_palette(self):
         """コマンドパレット（Ctrl+Shift+P）: 登録済みの全メニュー操作を名前で検索して実行する。
@@ -705,9 +693,7 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
         center = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.center_splitter = center
         center.addWidget(self._build_plot_area())
-        center.addWidget(self._build_preview())
         center.setStretchFactor(0, 4)
-        center.setStretchFactor(1, 1)
         holder = QtWidgets.QWidget()
         hlay = QtWidgets.QVBoxLayout(holder)
         hlay.setContentsMargins(0, 0, 0, 0)
@@ -1520,8 +1506,6 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
         it = self._find_file_item(old)
         if it is not None:
             it.setText(new)
-        if getattr(self, "_preview_label", None) == old:
-            self._preview_label = new
         self._refresh_columns()
         # チェック状態を (旧名, 列)→(新名, 列) で引き継ぐ
         ck = QtCore.Qt.CheckState.Checked
@@ -2386,39 +2370,6 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
             return
         item.setCheckState(QtCore.Qt.CheckState.Checked if on
                            else QtCore.Qt.CheckState.Unchecked)
-
-    def _build_preview(self):
-        box = QtWidgets.QGroupBox("データ編集（選択中ファイル・先頭100行）")
-        self._preview_bar_host = box     # 設定検索の索引がここを走査する
-        lay = QtWidgets.QVBoxLayout(box); lay.setContentsMargins(4, 4, 4, 4)
-        self._preview_label = None
-        self._preview_loading = False
-        bar = QtWidgets.QHBoxLayout()
-        self.edit_check = QtWidgets.QCheckBox("編集可")
-        self.edit_check.setToolTip("セルをダブルクリックで編集。値はその場でDataFrameに反映され、グラフにも反映されます。")
-        self.edit_check.toggled.connect(self._on_edit_toggle)
-        bar.addWidget(self.edit_check)
-        for text, slot, tip in [
-                ("行追加", self._row_add, "末尾に空行を追加"),
-                ("行削除", self._row_del, "選択した行を削除"),
-                ("列追加", self._col_add, "新しい数値列を追加"),
-                ("編集を戻す", self._data_undo, "データ編集（セル・行・列）を1つ戻す"),
-                ("やり直す", self._data_redo, "戻したデータ編集をやり直す"),
-                ("CSV保存", self._save_csv, "編集後のデータをCSV/TSVに書き出し")]:
-            b = QtWidgets.QPushButton(text); b.setToolTip(tip)
-            b.clicked.connect(slot); bar.addWidget(b)
-        bar.addStretch(1)
-        lay.addLayout(bar)
-        self.table = QtWidgets.QTableWidget()
-        self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        self.table.itemChanged.connect(self._on_cell_edited)
-        # 行選択⇔グラフの点のリンク（JMP風）。グラフの点クリックでも行が選ばれる
-        self.table.setToolTip("行を選択するとグラフ上の対応する点がリングで強調されます。\n"
-                              "逆にグラフの点（単純な折れ線）をクリックするとこの表の行が選ばれます。")
-        self.table.itemSelectionChanged.connect(self._on_preview_selection_changed)
-        lay.addWidget(self.table)
-        return box
 
     def _build_statusbar(self):
         self.status = self.statusBar()
@@ -3325,72 +3276,6 @@ class PlotMixin:
                 yit.setCheckState(QtCore.Qt.CheckState.Unchecked
                                   if yit.checkState() == ck else ck)
             return
-        # データ線のクリック（リンク選択）
-        skey = getattr(self, "_line_pick_map", {}).get(event.artist)
-        if skey is None:
-            return
-        if (self._tab_hook("_scope_active", default=False) or getattr(self.toolbar, "mode", "")
-                or self._cursor_cid is not None
-                or (getattr(self, "gate_btn", None) and self.gate_btn.isChecked())):
-            return   # ドラッグ操作系のモード中は誤選択を避ける
-        ind = getattr(event, "ind", None)
-        if ind is None or not len(ind):
-            return
-        row = int(ind[0])
-        fl = skey.split("\t", 1)[0]
-        it = self._find_file_item(fl)
-        if it is not None and self.file_list.currentItem() is not it:
-            self.file_list.setCurrentRow(self.file_list.row(it))   # プレビューを切替
-        if row < self.table.rowCount():
-            self.table.selectRow(row)   # → itemSelectionChanged でリング強調も付く
-            cell = self.table.item(row, 0)
-            if cell is not None:
-                self.table.scrollToItem(cell)
-            self._set_status(f"グラフの点 → データ編集表の行 {row} を選択（{fl}）")
-        else:
-            self._set_status(f"クリックした点は行 {row}"
-                             f"（プレビューは先頭{PREVIEW_ROWS}行のみ表示）")
-
-    def _on_preview_selection_changed(self):
-        """プレビュー表の行選択をグラフ上のリング強調へ反映する（JMP風リンク選択）。"""
-        if (getattr(self, "_preview_loading", False)
-                or not getattr(self, "_has_drawn", False)
-                or self._is_3d() or getattr(self, "_stacked", False)):
-            return
-        ctype = self.chart_combo.currentText()
-        if (ctype not in ("折れ線", "散布図")
-                or (getattr(self, "swap_xy_check", None)
-                    and self.swap_xy_check.isChecked())):
-            return
-        for a in getattr(self, "_link_artists", None) or []:
-            try:
-                a.remove()
-            except Exception:
-                applog.get_logger().debug("_on_preview_selection_changed: 無視した例外", exc_info=True)
-        self._link_artists = []
-        lbl = getattr(self, "_preview_label", None)
-        rows = sorted({i.row() for i in self.table.selectedIndexes()})
-        if lbl and lbl in self.datasets and rows:
-            import pandas as pd
-            df = self.datasets[lbl]
-            rows = [r for r in rows if r < len(df)][:500]   # 強調は最大500点
-            xspec, yspec = self.xscale_edit.text(), self.yscale_edit.text()
-            xraw = pd.to_numeric(pd.Series(self._x_values(df)),
-                                 errors="coerce").to_numpy(dtype=float)
-            for fl, col, _d in self._selected_series_items():
-                if fl != lbl or col not in df.columns:
-                    continue
-                st = self.series_styles.get(self._style_key(fl, col)) or {}
-                if st.get("axis") == "secondary":
-                    continue   # 第2軸は座標系が異なるためスキップ
-                y = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
-                xv = mathchan.axis_scale(xraw[rows], xspec)
-                yv = mathchan.axis_scale(y[rows], yspec)
-                art, = self.ax.plot(xv, yv, "o", ms=11, mfc="none", mec="#e6194b",
-                                    mew=1.8, ls="none", zorder=26, label="_link_sel")
-                self._link_artists.append(art)
-        self.canvas.draw_idle()
-
     def _apply_tick_spacing(self, ctype, scope):
         """目盛り間隔（メモリ間隔）の手動指定を適用する。
         空欄や非対応（オシロdiv表示中・対数軸・カテゴリ軸・円・3D）では何もしない。"""
@@ -4470,63 +4355,6 @@ class BatchMixin:
         self._set_status(f"一括出力: {len(saved)} 件保存（{out_dir}）")
 
 class PersistenceMixin:
-    def show_help(self):
-        # 使い方は読み込む文章なので、通知バーではなくスクロールできる窓で出す。
-        self._show_text_window("使い方", self._HELP_TEXT)
-
-    def _show_text_window(self, title, text):
-        """長い文章を読むための独立ウィンドウ（選択・コピー可・スクロール可）。"""
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle(title)
-        dlg.resize(760, 560)
-        lay = QtWidgets.QVBoxLayout(dlg)
-        view = QtWidgets.QPlainTextEdit(text)
-        view.setReadOnly(True)
-        view.setAccessibleName(title)
-        lay.addWidget(view)
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
-        btns.rejected.connect(dlg.reject)
-        btns.accepted.connect(dlg.accept)
-        lay.addWidget(btns)
-        self._text_window = dlg     # テストから参照できるように保持
-        dlg.exec()
-        return dlg
-
-    _HELP_TEXT = ("【基本の流れ】\n"
-                    "1. 『データ』パネルで「ファイル追加」（ドラッグ&ドロップ可）\n"
-                    "2. ツリーでファイルを展開し、描きたい列（Y軸）にチェック（行クリックでON/OFF・\n"
-                    "   ダブルクリック=その列だけ表示・右クリックでメニュー）。X軸の列は下のコンボで選択\n"
-                    "3. 「グラフを描画」(F5)。『リアルタイム更新』ONなら設定変更が即反映\n"
-                    "4. 右端の『グラフ書式調整』パネルで種別・色・軸範囲・系列スタイルなどを編集\n"
-                    "   （項目は見出しクリックで開閉できます。開閉状態・ウィンドウ配置は次回起動時に復元）\n"
-                    "※ パネルの切り離し（別ウィンドウ化）は3通り:\n"
-                    "   ①タブをダブルクリック ②タブを外へドラッグ ③表示メニュー「別ウィンドウで表示」\n"
-                    "   切り離したウィンドウはWindowsのスナップ対応（画面端へドラッグ／Win+矢印／\n"
-                    "   最大化ボタンにマウスでレイアウト選択）。元に戻す: タイトルバーをダブルクリック、\n"
-                    "   メインウィンドウの左右端へドロップ、または表示メニューのチェックを外す。\n"
-                    "   ✕で閉じたパネルは表示メニューで再表示、「パネル配置をリセット」で初期配置へ\n"
-                    "5. 波形は『オシロ/解析』パネルで「解析実行」「FFT表示」「オシロスコープ表示」\n\n"
-                    "【グラフ上の操作】ホバー=近傍点の値を右下に表示／ホイール=ズーム"
-                    "（Shift+ホイール=X方向のみ）／ダブルクリック=全体表示／凡例クリック=系列ON/OFF\n"
-                    "【区間測定】『オシロ/解析』の「区間測定」ONでドラッグした区間だけを測定\n"
-                    "【結果の持ち出し】各結果表を右クリック→コピー/CSV保存。"
-                    "「ファイル→Excelレポート出力」でグラフ+表を1つのExcelブックに\n"
-                    "【その他】Ctrl+Shift+P=コマンドパレット（全操作を検索実行）／"
-                    "「ファイル→ファイルの変更を監視」=更新されたCSVを自動再読込／\n"
-                    "　書式パネル「系列ごとに段を分ける」=サブプロット表示／"
-                    "データ編集バーの「編集を戻す/やり直す」\n"
-                    "【出力】右端パネルの画像出力、またはメニュー「ファイル」から保存／コピー\n"
-                    "【グラフ種別と列】棒/円は1ファイル、折れ線/散布図は複数ファイル重ね描き可\n"
-                    "【設定が見つからないとき】Ctrl+F＝設定を検索（パネルを横断して該当項目へ移動）\n"
-                    "【見逃したメッセージ】ステータスバー右の「履歴」ボタンで過去の通知を確認")
-
-    def show_about(self):
-        QtWidgets.QMessageBox.about(
-            self, "バージョン情報",
-            "CSV / TSV / 波形 グラフ・解析ツール\n"
-            "PySide6 + matplotlib 製\n"
-            f"日本語フォント: {self.font_name or '未検出'}")
-
     # ------------------------------------------------------------ UI状態（QSettings）
     # ウィンドウ位置・分割位置・書式セクションの開閉といった「見た目の使い勝手」だけを
     # OS のユーザー設定に保存する。グラフ設定（config JSON）とは独立で、混ざらない。

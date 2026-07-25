@@ -152,10 +152,9 @@ def setup_japanese_font(preferred=None):
 """
 _DELIMITERS = [",", "\t", ";", "|"]
 DELIMITER_LABELS = { ",": "カンマ ( , )", "\t": "タブ ( \\t )", ";": "セミコロン ( ; )", "|": "パイプ ( | )", }
-EXT_GROUPS = ( ("CSV/TSV", (".csv", ".tsv", ".txt")), ("Excel", (".xlsx", ".xls", ".xlsm")), ("波形/計測", (".wav", ".raw", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5")), ("LTspice回路", (".asc", ".net")), )
-RUNNABLE_EXTS = (".asc", ".net")
+EXT_GROUPS = ( ("CSV/TSV", (".csv", ".tsv", ".txt")), ("Excel", (".xlsx", ".xls", ".xlsm")), ("波形/計測", (".wav", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5")), )
 ACCEPT_EXTS = tuple(e for _name, exts in EXT_GROUPS for e in exts)
-TABLE_EXTS = tuple(e for e in ACCEPT_EXTS if e not in RUNNABLE_EXTS)
+TABLE_EXTS = ACCEPT_EXTS
 def file_dialog_filter():
  def pat(exts):
   return " ".join("*" + e for e in exts)
@@ -270,62 +269,6 @@ def _load_wav(path):
  for i in range(ch):
   cols[f"ch{i + 1}"] = a[:, i]
  return pd.DataFrame(cols)
-def _load_ltspice_raw(path):
- import numpy as np
- with open(path, "rb") as f:
-  data = f.read()
- enc = "utf-16-le" if (data[:2] == b"\xff\xfe" or data[1:2] == b"\x00") else "latin-1"
- marker = body = None
- for m in ("Binary:", "Values:"):
-  mb = (m + "\n").encode(enc)
-  i = data.find(mb)
-  if i < 0:
-   mb = (m + "\r\n").encode(enc)
-   i = data.find(mb)
-  if i >= 0:
-   marker, hdr_end, body = m, i, i + len(mb)
-   break
- if marker is None:
-  raise ValueError("LTspiceの .raw 形式として解釈できません（Binary:/Values: が見つかりません）。")
- header = data[:hdr_end].decode(enc, errors="replace")
- nvars = npts = 0
- flags = ""
- names = []
- in_vars = False
- for line in header.splitlines():
-  low = line.strip()
-  if low.startswith("No. Variables:"):
-   nvars = int(low.split(":")[1])
-  elif low.startswith("No. Points:"):
-   npts = int(low.split(":")[1])
-  elif low.startswith("Flags:"):
-   flags = low.split(":", 1)[1].lower()
-  elif low.startswith("Variables:"):
-   in_vars = True
-  elif in_vars and low:
-   parts = low.split("\t") if "\t" in line else low.split()
-   if len(parts) >= 2 and parts[0].strip().isdigit():
-    names.append(parts[1].strip())
- if not nvars or not npts or len(names) != nvars:
-  raise ValueError("LTspice .raw のヘッダを解釈できませんでした。")
- if "complex" in flags:
-  raise ValueError("AC解析（複素数）の .raw は未対応です。過渡解析(.tran)の .raw を読み込んでください。")
- if "fastaccess" in flags:
-  raise ValueError(".raw が fastaccess 形式です。LTspiceの設定で fastaccess を無効にして再保存してください。")
- if marker == "Binary:":
-  if "double" in flags:
-   arr = np.frombuffer(data[body:body + 8 * nvars * npts], dtype="<f8")
-   table = arr.reshape(npts, nvars)
-  else:
-   rec = np.dtype([("t", "<f8")] + [(f"v{i}", "<f4") for i in range(1, nvars)])
-   arr = np.frombuffer(data[body:body + rec.itemsize * npts], dtype=rec)
-   table = np.column_stack([arr["t"]] + [arr[f"v{i}"] for i in range(1, nvars)])
- else:
-  text = data[body:].decode(enc, errors="replace")
-  vals = [float(tok) for tok in text.split() if _is_float(tok)]
-  table = np.array(vals, dtype=float).reshape(npts, nvars + 1)[:, 1:]
- table[:, 0] = np.abs(table[:, 0])
- return pd.DataFrame({names[i]: table[:, i] for i in range(nvars)})
 def _is_float(tok):
  try:
   float(tok)
@@ -408,8 +351,6 @@ def load_table(path, encoding=None, delimiter=None, sheet=None):
   return _normalize_columns(df), "excel", "excel"
  if ext == ".wav":
   return _normalize_columns(_load_wav(path)), "wav", ""
- if ext == ".raw":
-  return _normalize_columns(_load_ltspice_raw(path)), "ltspice", ""
  if ext == ".tdms":
   return _normalize_columns(_load_tdms(path)), "tdms", ""
  if ext in (".mf4", ".mdf"):
@@ -3059,9 +3000,6 @@ class DataIOMixin:
   self._set_status(f"{label} を読み込み（{len(df)}行 × {len(df.columns)}列, {used_enc}）")
   return label
  def _load_file(self, path):
-  if os.path.splitext(path)[1].lower() in RUNNABLE_EXTS:
-   self.run_ltspice_asc(path)
-   return
   job = self._load_job(path)
   if job is None:
    return
@@ -3082,9 +3020,7 @@ class DataIOMixin:
   self._register_loaded(job, result)
  def _load_files_async(self, paths, on_finished=None):
   paths = list(paths)
-  for p in [p for p in paths if os.path.splitext(p)[1].lower() in RUNNABLE_EXTS]:
-   self.run_ltspice_asc(p)
-  targets = [p for p in paths if os.path.splitext(p)[1].lower() not in RUNNABLE_EXTS]
+  targets = list(paths)
   jobs = []
   for p in targets:
    job = self._load_job(p)
@@ -3201,68 +3137,6 @@ class DataIOMixin:
     return
   self.last_dir = d
   self._load_files_async( files, on_finished=lambda labels: self.notify( f"フォルダを読み込みました: {os.path.basename(d)}" f"（{len(labels)}/{len(files)} ファイル）", "ok"))
- _LTSPICE_CANDIDATES = ( r"C:\Program Files\ADI\LTspice\LTspice.exe", r"C:\Program Files\LTC\LTspiceXVII\XVIIx64.exe", r"C:\Program Files (x86)\LTC\LTspiceIV\scad3.exe", )
- def _ltspice_exe(self):
-  p = self._ui_settings().value("ltspice/exe")
-  if p and os.path.isfile(str(p)):
-   return str(p)
-  cands = list(self._LTSPICE_CANDIDATES) + [ os.path.expanduser(r"~\AppData\Local\Programs\ADI\LTspice\LTspice.exe")]
-  for c in cands:
-   if os.path.isfile(c):
-    return c
-  try:
-   from spicelib.simulators.ltspice_simulator import LTspice
-   for c in LTspice.spice_exe:
-    if os.path.isfile(str(c)):
-     return str(c)
-  except Exception:
-   get_logger().debug("_ltspice_exe: 無視した例外", exc_info=True)
-  import shutil
-  return shutil.which("LTspice") or shutil.which("XVIIx64")
- def set_ltspice_path(self):
-  path, _ = QtWidgets.QFileDialog.getOpenFileName( self, "LTspice実行ファイルの場所", r"C:\Program Files", "LTspice (*.exe)")
-  if path:
-   self._ui_settings().setValue("ltspice/exe", path)
-   self._set_status(f"LTspiceの場所を設定しました: {path}")
- def run_ltspice_asc(self, path=None):
-  if getattr(self, "_lt_proc", None) is not None \
-                and self._lt_proc.state() != QtCore.QProcess.ProcessState.NotRunning:
-   self._set_status("LTspiceシミュレーションを実行中です。完了までお待ちください。")
-   return
-  if not path:
-   path, _ = QtWidgets.QFileDialog.getOpenFileName( self, "LTspice回路を実行", self.last_dir, "LTspice回路/ネットリスト (*.asc *.net)")
-   if not path:
-    return
-  exe = self._ltspice_exe()
-  if not exe:
-   ret = QtWidgets.QMessageBox.question( self, "LTspiceが見つかりません", "LTspice の実行ファイルが見つかりませんでした。\n場所を指定しますか？")
-   if ret == QtWidgets.QMessageBox.StandardButton.Yes:
-    self.set_ltspice_path()
-    exe = self._ltspice_exe()
-   if not exe:
-    return
-  self.last_dir = os.path.dirname(path)
-  raw = os.path.splitext(path)[0] + ".raw"
-  proc = QtCore.QProcess(self)
-  self._lt_proc = proc
-  proc.finished.connect( lambda code, _st, p=path, r=raw: self._on_ltspice_finished(code, p, r))
-  proc.start(exe, ["-b", path])
-  if not proc.waitForStarted(5000):
-   self._lt_proc = None
-   QtWidgets.QMessageBox.critical(self, "LTspice", f"起動できませんでした: {exe}")
-   return
-  self._set_status(f"LTspiceシミュレーション実行中… {os.path.basename(path)}" "（完了すると自動で波形を読み込みます）")
- def _on_ltspice_finished(self, code, asc_path, raw_path):
-  self._lt_proc = None
-  if not os.path.isfile(raw_path):
-   self.notify(f"シミュレーションは終了しましたが .raw が見つかりません（終了コード {code}）。\n" f"回路にエラーがないか LTspice で確認してください:\n{asc_path}", "warn")
-   return
-  self._load_file(raw_path)
-  self._refresh_columns()
-  if self._has_drawn:
-   self.draw_graph()
-  note = ("（ファイル監視ONなので、LTspice側で再実行すると自動更新されます）" if self._watch_enabled() else "（メニュー『ファイル→ファイルの変更を監視』をONにすると、" "LTspice側の再実行で自動更新されます）")
-  self._set_status(f"LTspice完了: {os.path.basename(raw_path)} を読み込みました {note}")
  def _watch_enabled(self):
   return bool(getattr(self, "_watch_action", None) and self._watch_action.isChecked())
  def toggle_file_watch(self, on):
@@ -3333,8 +3207,6 @@ class DataIOMixin:
    return False
   self.datasets[label] = df
   self.meta[label] = {"path": path, "enc": used_enc, "delim": used_delim, "sheet": meta.get("sheet")}
-  if getattr(self, "_preview_label", None) == label:
-   self._populate_preview(df, label=label)
   return True
  def _find_file_item(self, label):
   for i in range(self.file_list.count()):
@@ -3416,10 +3288,6 @@ class DataIOMixin:
   if self.datasets:
    self.file_list.setCurrentRow(0)
   else:
-   self._preview_label = None
-   self.table.clearContents()
-   self.table.setRowCount(0)
-   self.table.setColumnCount(0)
    self._draw_placeholder()
  def reload_current(self):
   it = self.file_list.currentItem()
@@ -3448,7 +3316,6 @@ class DataIOMixin:
  def _on_file_selected(self, _row):
   it = self.file_list.currentItem()
   if it and it.text() in self.datasets:
-   self._populate_preview(self.datasets[it.text()], label=it.text())
    meta = self.meta[it.text()]
    self.enc_combo.setCurrentText(meta["enc"]) if self.enc_combo.findText(meta["enc"]) >= 0 else None
  def _refresh_columns(self):
@@ -3513,209 +3380,6 @@ class DataIOMixin:
     fl, col = it.data(UserRole)
     out.append((fl, col, it.text()))
   return out
- def _populate_preview(self, df, label=None):
-  import pandas as pd
-  self._preview_loading = True
-  try:
-   head = df.head(PREVIEW_ROWS)
-   cols = list(df.columns)
-   self.table.clear()
-   self.table.setColumnCount(len(cols))
-   self.table.setRowCount(len(head))
-   self.table.setHorizontalHeaderLabels([str(c) for c in cols])
-   nan_bg = QtGui.QBrush(QtGui.QColor("#ffe4e1"))
-   for r in range(len(head)):
-    for c in range(len(cols)):
-     v = head.iat[r, c]
-     missing = pd.isna(v)
-     it = QtWidgets.QTableWidgetItem("" if missing else str(v))
-     if missing:
-      it.setBackground(nan_bg)
-      it.setToolTip("欠損値（NaN）")
-     self.table.setItem(r, c, it)
-   for c, col in enumerate(cols):
-    s = df[col]
-    n_nan = int(s.isna().sum())
-    tip = [f"列: {col}", f"型: {s.dtype}", f"全 {len(s):,} 行"]
-    if n_nan:
-     tip.append(f"⚠ 欠損: {n_nan:,} 行（{n_nan / max(len(s), 1):.1%}）")
-    if pd.api.types.is_numeric_dtype(s):
-     v = s.dropna()
-     if len(v):
-      tip.append(f"範囲: {v.min():.6g} 〜 {v.max():.6g}")
-    hi = QtWidgets.QTableWidgetItem(("⚠ " if n_nan else "") + str(col))
-    hi.setToolTip("\n".join(tip))
-    self.table.setHorizontalHeaderItem(c, hi)
-   self.table.resizeColumnsToContents()
-   if label is not None:
-    self._preview_label = label
-  finally:
-   self._preview_loading = False
- def _on_edit_toggle(self, on):
-  ET = QtWidgets.QAbstractItemView.EditTrigger
-  self.table.setEditTriggers( (ET.DoubleClicked | ET.EditKeyPressed | ET.AnyKeyPressed) if on else ET.NoEditTriggers)
- def _on_cell_edited(self, item):
-  if self._preview_loading or not getattr(self, "_preview_label", None):
-   return
-  import pandas as pd
-  df = self.datasets.get(self._preview_label)
-  if df is None:
-   return
-  r, c = item.row(), item.column()
-  if r >= len(df) or c >= df.shape[1]:
-   return
-  col = df.columns[c]
-  text = item.text()
-  if pd.api.types.is_numeric_dtype(df[col]):
-   val = pd.to_numeric(text, errors="coerce")
-  else:
-   val = text
-  old = df.iat[r, c]
-  df.iat[r, c] = val
-  self._data_record({"kind": "cell", "label": self._preview_label, "row": r, "col": c, "old": old, "new": val})
-  self._set_status(f"編集: {self._preview_label} 行{r}「{col}」= {text}")
-  self._request_redraw()
- def _edit_target(self):
-  lbl = getattr(self, "_preview_label", None)
-  if not lbl or lbl not in self.datasets:
-   self.notify("左の一覧でファイルを選択してください。", "warn")
-   return None
-  return lbl
- def _row_add(self):
-  import numpy as np
-  lbl = self._edit_target()
-  if not lbl:
-   return
-  df = self.datasets[lbl]
-  df.loc[len(df)] = [np.nan] * df.shape[1]
-  df.reset_index(drop=True, inplace=True)
-  self._data_record({"kind": "row_add", "label": lbl})
-  self._populate_preview(df, label=lbl)
-  if len(df) > PREVIEW_ROWS:
-   self._set_status(f"行を追加（全{len(df)}行。表示は先頭{PREVIEW_ROWS}行）")
-  self._request_redraw()
- def _row_del(self):
-  lbl = self._edit_target()
-  if not lbl:
-   return
-  rows = sorted({i.row() for i in self.table.selectedIndexes()})
-  if not rows:
-   self._set_status("削除する行を選択してください。")
-   return
-  df = self.datasets[lbl]
-  self._data_record({"kind": "row_del", "label": lbl, "rows": rows, "data": df.iloc[rows].copy()})
-  df.drop(df.index[rows], inplace=True)
-  df.reset_index(drop=True, inplace=True)
-  self._populate_preview(df, label=lbl)
-  self._request_redraw()
- def _col_add(self):
-  lbl = self._edit_target()
-  if not lbl:
-   return
-  name, ok = QtWidgets.QInputDialog.getText(self, "列追加", "新しい列名:")
-  name = (name or "").strip()
-  if not ok or not name:
-   return
-  df = self.datasets[lbl]
-  if name in df.columns:
-   self.notify("同名の列が既にあります。", "warn")
-   return
-  df[name] = 0.0
-  self._data_record({"kind": "col_add", "label": lbl, "name": name})
-  self._populate_preview(df, label=lbl)
-  self._refresh_columns()
-  self._set_status(f"列「{name}」を追加（値0.0で初期化）")
- def _data_record(self, op):
-  if not hasattr(self, "_data_hist"):
-   self._data_hist, self._data_hist_i = [], -1
-  del self._data_hist[self._data_hist_i + 1:]
-  self._data_hist.append(op)
-  if len(self._data_hist) > 100:
-   self._data_hist.pop(0)
-  self._data_hist_i = len(self._data_hist) - 1
- def _data_undo(self):
-  hist = getattr(self, "_data_hist", None)
-  if not hist or self._data_hist_i < 0:
-   self._set_status("戻せるデータ編集はありません。")
-   return
-  op = hist[self._data_hist_i]
-  if self._data_apply(op, forward=False):
-   self._data_hist_i -= 1
-   self._set_status(f"データ編集を戻しました（{self._data_op_name(op)}）。")
- def _data_redo(self):
-  hist = getattr(self, "_data_hist", None)
-  if not hist or self._data_hist_i >= len(hist) - 1:
-   self._set_status("やり直せるデータ編集はありません。")
-   return
-  op = hist[self._data_hist_i + 1]
-  if self._data_apply(op, forward=True):
-   self._data_hist_i += 1
-   self._set_status(f"データ編集をやり直しました（{self._data_op_name(op)}）。")
- @staticmethod
- def _data_op_name(op):
-  return {"cell": "セル編集", "row_add": "行追加", "row_del": "行削除", "col_add": "列追加"}.get(op["kind"], op["kind"])
- def _data_apply(self, op, forward):
-  import pandas as pd
-  label = op["label"]
-  df = self.datasets.get(label)
-  if df is None:
-   self._set_status(f"対象ファイル「{label}」は読み込まれていません。")
-   return False
-  kind = op["kind"]
-  if kind == "cell":
-   r, c = op["row"], op["col"]
-   if r >= len(df) or c >= df.shape[1]:
-    return False
-   df.iat[r, c] = op["new"] if forward else op["old"]
-  elif kind == "row_add":
-   if forward:
-    import numpy as np
-    df.loc[len(df)] = [np.nan] * df.shape[1]
-    df.reset_index(drop=True, inplace=True)
-   else:
-    if not len(df):
-     return False
-    df.drop(df.index[-1], inplace=True)
-    df.reset_index(drop=True, inplace=True)
-  elif kind == "row_del":
-   if forward:
-    df.drop(df.index[op["rows"]], inplace=True)
-    df.reset_index(drop=True, inplace=True)
-   else:
-    parts, prev = [], 0
-    for j, r in enumerate(op["rows"]):
-     cut = r - j
-     parts.append(df.iloc[prev:cut])
-     parts.append(op["data"].iloc[[j]])
-     prev = cut
-    parts.append(df.iloc[prev:])
-    self.datasets[label] = pd.concat(parts, ignore_index=True)
-  elif kind == "col_add":
-   if forward:
-    self.datasets[label][op["name"]] = 0.0
-   else:
-    self.datasets[label].drop(columns=[op["name"]], inplace=True, errors="ignore")
-  df2 = self.datasets[label]
-  if getattr(self, "_preview_label", None) == label:
-   self._populate_preview(df2, label=label)
-  if kind == "col_add":
-   self._refresh_columns()
-  self._request_redraw()
-  return True
- def _save_csv(self):
-  lbl = self._edit_target()
-  if not lbl:
-   return
-  default = lbl if lbl.lower().endswith((".csv", ".tsv")) else lbl + ".csv"
-  path, _ = QtWidgets.QFileDialog.getSaveFileName( self, "CSV/TSVとして保存", default, "CSV (*.csv);;TSV (*.tsv);;全てのファイル (*.*)")
-  if not path:
-   return
-  try:
-   sep = "\t" if path.lower().endswith(".tsv") else ","
-   self.datasets[lbl].to_csv(path, index=False, sep=sep, encoding="utf-8-sig")
-   self._set_status(f"保存しました: {path}（全{len(self.datasets[lbl])}行）")
-  except Exception as e:
-   QtWidgets.QMessageBox.critical(self, "保存エラー", str(e))
  def _build_tab_data(self):
   w = QtWidgets.QWidget()
   v = QtWidgets.QVBoxLayout(w)
@@ -5531,12 +5195,6 @@ class UIBuildMixin:
   am = m.addMenu("解析(&A)")
   self._menu_action(am, "解析実行（ピーク・測定）", self.run_analysis, "Ctrl+R", tip="選択中の解析対象系列のピーク・測定値を計算")
   self._menu_action(am, "FFTスペクトル表示", self.show_fft, None)
-  tm = m.addMenu("ツール(&T)")
-  self._menu_action(tm, "LTspiceシミュレーション実行(.asc)...", self.run_ltspice_asc, tip="LTspice回路をバッチ実行し、生成された .raw 波形を自動で読み込みます。" "回路(.asc)のドラッグ&ドロップでも実行できます")
-  self._menu_action(tm, "LTspiceの場所を設定...", self.set_ltspice_path, tip="LTspice実行ファイル（LTspice.exe / XVIIx64.exe）の場所を指定")
-  hm = m.addMenu("ヘルプ(&H)")
-  self._menu_action(hm, "使い方", self.show_help, "F1")
-  self._menu_action(hm, "バージョン情報", self.show_about, None)
  def show_command_palette(self):
   acts = list(getattr(self, "_all_actions", []))
   dlg = QtWidgets.QDialog(self)
@@ -5796,9 +5454,7 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
   center = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
   self.center_splitter = center
   center.addWidget(self._build_plot_area())
-  center.addWidget(self._build_preview())
   center.setStretchFactor(0, 4)
-  center.setStretchFactor(1, 1)
   holder = QtWidgets.QWidget()
   hlay = QtWidgets.QVBoxLayout(holder)
   hlay.setContentsMargins(0, 0, 0, 0)
@@ -6417,8 +6073,6 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
   it = self._find_file_item(old)
   if it is not None:
    it.setText(new)
-  if getattr(self, "_preview_label", None) == old:
-   self._preview_label = new
   self._refresh_columns()
   ck = QtCore.Qt.CheckState.Checked
   un = QtCore.Qt.CheckState.Unchecked
@@ -7084,30 +6738,6 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
   if getattr(self, "_series_bar_building", False):
    return
   item.setCheckState(QtCore.Qt.CheckState.Checked if on else QtCore.Qt.CheckState.Unchecked)
- def _build_preview(self):
-  box = QtWidgets.QGroupBox("データ編集（選択中ファイル・先頭100行）")
-  self._preview_bar_host = box
-  lay = QtWidgets.QVBoxLayout(box); lay.setContentsMargins(4, 4, 4, 4)
-  self._preview_label = None
-  self._preview_loading = False
-  bar = QtWidgets.QHBoxLayout()
-  self.edit_check = QtWidgets.QCheckBox("編集可")
-  self.edit_check.setToolTip("セルをダブルクリックで編集。値はその場でDataFrameに反映され、グラフにも反映されます。")
-  self.edit_check.toggled.connect(self._on_edit_toggle)
-  bar.addWidget(self.edit_check)
-  for text, slot, tip in [ ("行追加", self._row_add, "末尾に空行を追加"), ("行削除", self._row_del, "選択した行を削除"), ("列追加", self._col_add, "新しい数値列を追加"), ("編集を戻す", self._data_undo, "データ編集（セル・行・列）を1つ戻す"), ("やり直す", self._data_redo, "戻したデータ編集をやり直す"), ("CSV保存", self._save_csv, "編集後のデータをCSV/TSVに書き出し")]:
-   b = QtWidgets.QPushButton(text); b.setToolTip(tip)
-   b.clicked.connect(slot); bar.addWidget(b)
-  bar.addStretch(1)
-  lay.addLayout(bar)
-  self.table = QtWidgets.QTableWidget()
-  self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-  self.table.setAlternatingRowColors(True)
-  self.table.itemChanged.connect(self._on_cell_edited)
-  self.table.setToolTip("行を選択するとグラフ上の対応する点がリングで強調されます。\n" "逆にグラフの点（単純な折れ線）をクリックするとこの表の行が選ばれます。")
-  self.table.itemSelectionChanged.connect(self._on_preview_selection_changed)
-  lay.addWidget(self.table)
-  return box
  def _build_statusbar(self):
   self.status = self.statusBar()
   self._hover_label = QtWidgets.QLabel("")
@@ -7732,59 +7362,6 @@ class PlotMixin:
     ck = QtCore.Qt.CheckState.Checked
     yit.setCheckState(QtCore.Qt.CheckState.Unchecked if yit.checkState() == ck else ck)
    return
-  skey = getattr(self, "_line_pick_map", {}).get(event.artist)
-  if skey is None:
-   return
-  if (self._tab_hook("_scope_active", default=False) or getattr(self.toolbar, "mode", "") or self._cursor_cid is not None or (getattr(self, "gate_btn", None) and self.gate_btn.isChecked())):
-   return
-  ind = getattr(event, "ind", None)
-  if ind is None or not len(ind):
-   return
-  row = int(ind[0])
-  fl = skey.split("\t", 1)[0]
-  it = self._find_file_item(fl)
-  if it is not None and self.file_list.currentItem() is not it:
-   self.file_list.setCurrentRow(self.file_list.row(it))
-  if row < self.table.rowCount():
-   self.table.selectRow(row)
-   cell = self.table.item(row, 0)
-   if cell is not None:
-    self.table.scrollToItem(cell)
-   self._set_status(f"グラフの点 → データ編集表の行 {row} を選択（{fl}）")
-  else:
-   self._set_status(f"クリックした点は行 {row}" f"（プレビューは先頭{PREVIEW_ROWS}行のみ表示）")
- def _on_preview_selection_changed(self):
-  if (getattr(self, "_preview_loading", False) or not getattr(self, "_has_drawn", False) or self._is_3d() or getattr(self, "_stacked", False)):
-   return
-  ctype = self.chart_combo.currentText()
-  if (ctype not in ("折れ線", "散布図") or (getattr(self, "swap_xy_check", None) and self.swap_xy_check.isChecked())):
-   return
-  for a in getattr(self, "_link_artists", None) or []:
-   try:
-    a.remove()
-   except Exception:
-    get_logger().debug("_on_preview_selection_changed: 無視した例外", exc_info=True)
-  self._link_artists = []
-  lbl = getattr(self, "_preview_label", None)
-  rows = sorted({i.row() for i in self.table.selectedIndexes()})
-  if lbl and lbl in self.datasets and rows:
-   import pandas as pd
-   df = self.datasets[lbl]
-   rows = [r for r in rows if r < len(df)][:500]
-   xspec, yspec = self.xscale_edit.text(), self.yscale_edit.text()
-   xraw = pd.to_numeric(pd.Series(self._x_values(df)), errors="coerce").to_numpy(dtype=float)
-   for fl, col, _d in self._selected_series_items():
-    if fl != lbl or col not in df.columns:
-     continue
-    st = self.series_styles.get(self._style_key(fl, col)) or {}
-    if st.get("axis") == "secondary":
-     continue
-    y = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
-    xv = axis_scale(xraw[rows], xspec)
-    yv = axis_scale(y[rows], yspec)
-    art, = self.ax.plot(xv, yv, "o", ms=11, mfc="none", mec="#e6194b", mew=1.8, ls="none", zorder=26, label="_link_sel")
-    self._link_artists.append(art)
-  self.canvas.draw_idle()
  def _apply_tick_spacing(self, ctype, scope):
   if ctype == "円" or self._is_3d():
    return
@@ -8595,27 +8172,6 @@ class BatchMixin:
   self.notify(msg, "info")
   self._set_status(f"一括出力: {len(saved)} 件保存（{out_dir}）")
 class PersistenceMixin:
- def show_help(self):
-  self._show_text_window("使い方", self._HELP_TEXT)
- def _show_text_window(self, title, text):
-  dlg = QtWidgets.QDialog(self)
-  dlg.setWindowTitle(title)
-  dlg.resize(760, 560)
-  lay = QtWidgets.QVBoxLayout(dlg)
-  view = QtWidgets.QPlainTextEdit(text)
-  view.setReadOnly(True)
-  view.setAccessibleName(title)
-  lay.addWidget(view)
-  btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
-  btns.rejected.connect(dlg.reject)
-  btns.accepted.connect(dlg.accept)
-  lay.addWidget(btns)
-  self._text_window = dlg
-  dlg.exec()
-  return dlg
- _HELP_TEXT = ("【基本の流れ】\n" "1. 『データ』パネルで「ファイル追加」（ドラッグ&ドロップ可）\n" "2. ツリーでファイルを展開し、描きたい列（Y軸）にチェック（行クリックでON/OFF・\n" "   ダブルクリック=その列だけ表示・右クリックでメニュー）。X軸の列は下のコンボで選択\n" "3. 「グラフを描画」(F5)。『リアルタイム更新』ONなら設定変更が即反映\n" "4. 右端の『グラフ書式調整』パネルで種別・色・軸範囲・系列スタイルなどを編集\n" "   （項目は見出しクリックで開閉できます。開閉状態・ウィンドウ配置は次回起動時に復元）\n" "※ パネルの切り離し（別ウィンドウ化）は3通り:\n" "   ①タブをダブルクリック ②タブを外へドラッグ ③表示メニュー「別ウィンドウで表示」\n" "   切り離したウィンドウはWindowsのスナップ対応（画面端へドラッグ／Win+矢印／\n" "   最大化ボタンにマウスでレイアウト選択）。元に戻す: タイトルバーをダブルクリック、\n" "   メインウィンドウの左右端へドロップ、または表示メニューのチェックを外す。\n" "   ✕で閉じたパネルは表示メニューで再表示、「パネル配置をリセット」で初期配置へ\n" "5. 波形は『オシロ/解析』パネルで「解析実行」「FFT表示」「オシロスコープ表示」\n\n" "【グラフ上の操作】ホバー=近傍点の値を右下に表示／ホイール=ズーム" "（Shift+ホイール=X方向のみ）／ダブルクリック=全体表示／凡例クリック=系列ON/OFF\n" "【区間測定】『オシロ/解析』の「区間測定」ONでドラッグした区間だけを測定\n" "【結果の持ち出し】各結果表を右クリック→コピー/CSV保存。" "「ファイル→Excelレポート出力」でグラフ+表を1つのExcelブックに\n" "【その他】Ctrl+Shift+P=コマンドパレット（全操作を検索実行）／" "「ファイル→ファイルの変更を監視」=更新されたCSVを自動再読込／\n" "　書式パネル「系列ごとに段を分ける」=サブプロット表示／" "データ編集バーの「編集を戻す/やり直す」\n" "【出力】右端パネルの画像出力、またはメニュー「ファイル」から保存／コピー\n" "【グラフ種別と列】棒/円は1ファイル、折れ線/散布図は複数ファイル重ね描き可\n" "【設定が見つからないとき】Ctrl+F＝設定を検索（パネルを横断して該当項目へ移動）\n" "【見逃したメッセージ】ステータスバー右の「履歴」ボタンで過去の通知を確認")
- def show_about(self):
-  QtWidgets.QMessageBox.about( self, "バージョン情報", "CSV / TSV / 波形 グラフ・解析ツール\n" "PySide6 + matplotlib 製\n" f"日本語フォント: {self.font_name or '未検出'}")
  def _ui_settings(self):
   return QtCore.QSettings("graph-tool", "GraphApp")
  def _restore_ui_state(self):

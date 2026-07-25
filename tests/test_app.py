@@ -382,19 +382,10 @@ def test_new_ux_features():
     w.draw_graph()
     assert not getattr(w, "_stacked", False)
     assert len(w.ax.get_lines()) >= 2            # 単一軸に戻って重ね描き
-    # データ編集の Undo / Redo
-    lbl = w._preview_label
-    n0 = len(w.datasets[lbl])
-    w._row_add()
-    assert len(w.datasets[lbl]) == n0 + 1
-    w._data_undo()
-    assert len(w.datasets[lbl]) == n0
-    w._data_redo()
-    assert len(w.datasets[lbl]) == n0 + 1
 
 
 def test_new_loaders():
-    """WAV / LTspice raw / Excelシート指定の読み込み。"""
+    """WAV / Excelシート指定の読み込み。"""
     import struct
     import tempfile
     import wave as wavmod
@@ -408,18 +399,6 @@ def test_new_loaders():
     df, enc, _ = data_loader.load_table(wp)
     assert enc == "wav" and len(df) == 4 and str(df.columns[0]).startswith("時間")
     assert abs(df.iloc[1, 1] - 100) < 1e-9
-    # LTspice .raw（バイナリ・time=f64/値=f32）
-    rp = os.path.join(d, "t_load.raw")
-    hdr = ("Title: * test\nDate: x\nPlotname: Transient Analysis\nFlags: real\n"
-           "No. Variables: 2\nNo. Points: 3\nVariables:\n"
-           "\t0\ttime\ttime\n\t1\tV(out)\tvoltage\nBinary:\n")
-    body = b"".join(struct.pack("<d", i * 1e-3) + struct.pack("<f", float(v))
-                    for i, v in enumerate([1.0, 2.0, 3.0]))
-    with open(rp, "wb") as fh:
-        fh.write(hdr.encode("ascii") + body)
-    df3, enc3, _ = data_loader.load_table(rp)
-    assert enc3 == "ltspice" and df3.shape == (3, 2)
-    assert abs(df3.iloc[2, 1] - 3.0) < 1e-6 and abs(df3.iloc[2, 0] - 2e-3) < 1e-12
     # Excel（シート指定）
     xp = os.path.join(d, "t_load.xlsx")
     with pd.ExcelWriter(xp) as w:
@@ -519,7 +498,7 @@ def test_waterfall_smoke():
 
 
 def test_gui_interactions():
-    """全系列ホバー値・D&D系列追加・解読オーバーレイ・リンク選択の回帰。"""
+    """全系列ホバー値・D&D系列追加・解読オーバーレイの回帰。"""
     ck, un = QtCore.Qt.CheckState.Checked, QtCore.Qt.CheckState.Unchecked
     w = _make_app(_wave())
     w.draw_graph()
@@ -546,38 +525,18 @@ def test_gui_interactions():
     assert len(w.ax.texts) >= n_before + 2
     w.proto_overlay_check.setChecked(False)
     w.draw_graph()
-    # 4) リンク選択: 表の行選択 → リング強調 ／ 線ピック → 行選択
-    w.table.selectRow(3)
-    assert len(w._link_artists) == 2   # チェック中の2系列ぶんのリング
-    assert w._line_pick_map            # 単純折れ線なのでピック配線がある
-
-    class _PickEv:
-        artist = next(iter(w._line_pick_map))
-        ind = [7]
-    w.table.clearSelection()
-    w._on_legend_pick(_PickEv())
-    sel = {i.row() for i in w.table.selectedIndexes()}
-    assert sel == {7}
 
 
-def test_layout_presets_and_ltspice_plumbing():
-    """レイアウトプリセットの切替と、LTspice連携の配管（実行はしない）。"""
+def test_layout_presets_plumbing():
+    """レイアウトプリセットの切替。"""
     w = _make_app(_wave())
     w.resize(1280, 800)
     w._apply_layout_preset("graph")
     assert all(d.isHidden() for d in [*w.left_docks, w.format_dock])
-    assert w.center_splitter.sizes()[1] == 0
     w._apply_layout_preset("analysis")
     assert not w.left_docks[1].isHidden() and w.left_docks[0].isHidden()
     w._apply_layout_preset("standard")
     assert all(not d.isHidden() for d in [*w.left_docks, w.format_dock])
-    # .asc/.net は読み込みではなくシミュレーション実行へディスパッチされる
-    called = []
-    w.run_ltspice_asc = lambda p=None: called.append(p)
-    w._load_file(r"C:\tmp\x.asc")
-    w._load_file(r"C:\tmp\y.net")
-    assert called == [r"C:\tmp\x.asc", r"C:\tmp\y.net"]
-    w._ltspice_exe()   # exe探索がどの環境でも例外なく動く
 
 
 def test_folder_tree_and_graph_windows():
@@ -1121,9 +1080,7 @@ def test_extension_list_has_one_source():
     filt = data_loader.file_dialog_filter()
     for ext in data_loader.ACCEPT_EXTS:
         assert "*" + ext in filt, f"{ext} がファイルダイアログのフィルタに無い"
-    assert "*.net" in filt                      # 以前ここだけ抜けていた
-    assert set(data_loader.TABLE_EXTS) == set(data_loader.ACCEPT_EXTS) - set(
-        data_loader.RUNNABLE_EXTS)
+    assert set(data_loader.TABLE_EXTS) == set(data_loader.ACCEPT_EXTS)
 
 
 def test_dark_background_check_is_shared():

@@ -39,7 +39,7 @@ FEATURES = (
     "show_cycle_stats", "show_param_stats", "show_trend", "show_series_picker",
     "create_math_channel", "create_math_expr", "export_excel_report",
     "batch_export", "open_graph_window", "show_command_palette",
-    "show_message_log", "run_ltspice_asc",
+    "show_message_log",
 )
 
 
