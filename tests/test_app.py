@@ -149,6 +149,7 @@ def test_3d_via_checkbox_and_axis_swap():
     set_chart("散布図", True); w.draw_graph()
     w.analysis_target.setCurrentText("電圧"); w.show_fft()
     assert getattr(w.ax, "name", None) != "3d"
+    w.fft_btn.setChecked(False)   # 持続FFTを解除し、以降は時間ドメイン描画へ戻す
 
     # 3D棒は複数系列でも凡例が出る（bar3d に label を渡している）
     set_chart("棒", True); w.legend_check.setChecked(True); w.draw_graph()
@@ -219,6 +220,22 @@ def test_oscilloscope_and_fft():
     w.analysis_target.setCurrentText("電圧")
     w.show_fft()
     w.run_analysis()
+
+
+def test_fft_mode_is_persistent_frequency_domain():
+    """FFT表示ONで全体が周波数ドメインへ切り替わり、再描画しても持続すること（単位変換のよう）。"""
+    w = _make_app(_wave())
+    w.chart_combo.setCurrentText("折れ線"); w.draw_graph()
+    assert "周波数" not in w.ax.get_xlabel()          # 時間ドメイン
+    # ON → 周波数ドメインへ全体切替（トグルが draw_graph を呼ぶ）
+    w.fft_btn.setChecked(True)
+    assert w._fft_mode_on() and "周波数" in w.ax.get_xlabel()
+    # 再描画（設定変更を模す）してもFFTのまま＝持続
+    w.draw_graph()
+    assert "周波数" in w.ax.get_xlabel()
+    # OFF → 時間ドメインへ戻る
+    w.fft_btn.setChecked(False)
+    assert "周波数" not in w.ax.get_xlabel()
 
 
 def test_axis_invert_and_power_notation():
@@ -594,17 +611,8 @@ def test_folder_tree_and_graph_windows():
     assert ("v1.csv", "v1") in {it.data(graph_app.UserRole)
                                 for it in (w.y_list.item(i) for i in range(w.y_list.count()))
                                 if it.checkState() == QtCore.Qt.CheckState.Checked}
-    # レイアウトプリセット4種（配置＋外観が両方変わる）→標準復帰
+    # レイアウトプリセット「標準」→ 既定配置へ戻る（◯◯風スキンは廃止済み）
     w.resize(1280, 800)
-    w._apply_layout_preset("labplot")   # データ+統計がタブ化・プレビュー表示
-    assert (w.left_docks[3] in w.tabifiedDockWidgets(w.left_docks[0])
-            or w.left_docks[0] in w.tabifiedDockWidgets(w.left_docks[3]))
-    w._apply_layout_preset("veusz")     # ツールバーが左縦に移動
-    assert w.toolBarArea(w.main_toolbar) == QtCore.Qt.ToolBarArea.LeftToolBarArea
-    w._apply_layout_preset("kst")       # ファイルツリーがフロート小窓
-    assert w.files_dock.isFloating() and w.format_dock.isHidden()
-    w._apply_layout_preset("igor")      # 3枚カスケードフロート
-    assert all(d.isFloating() for d in (w.files_dock, w.left_docks[1], w.format_dock))
     w._apply_layout_preset("standard")
     assert all(not d.isHidden() and not d.isFloating()
                for d in [*w.left_docks, w.format_dock])
@@ -628,13 +636,10 @@ def test_folder_tree_and_graph_windows():
     w.files_dock.resize(260, 320)
     app.processEvents()
     assert abs(w.files_dock.width() - 260) <= 10
-    # UIスタイル単体切替: QSS・ツールバー・ツリー字下げが変わり、機能は生きている
-    w._apply_ui_style("veusz")
-    assert w.main_toolbar.iconSize().width() == 16 and w.explorer.indentation() == 14
+    # UIスタイルは標準のみ（着せ替えテーマは廃止）。基準QSS（ボタン高さ統一）が入る
+    w._apply_ui_style("standard")
     w.draw_graph()
     assert len(w.ax.get_lines()) >= 1
-    w._apply_ui_style("standard")
-    # 標準でも基準QSS（ボタン高さ統一）が入り、ツールバーは既定に戻る
     assert "min-height" in w.styleSheet() and w.main_toolbar.iconSize().width() == 24
 
 
@@ -1139,33 +1144,29 @@ def test_theme_tokens_follow_palette():
     assert graph_app.is_dark_theme(QtGui.QPalette(QtGui.QColor("#202020")))
     assert not graph_app.is_dark_theme(QtGui.QPalette(QtGui.QColor("#ffffff")))
     assert light["bg"] != dark["bg"] and light["fg"] != dark["fg"]
-    # 展開後のQSSにトークンが残っていない（$bg のまま出力されない）
+    # render_qss は $トークン（$fg/$bg）を実値へ展開し、$ を残さない
+    expanded = graph_app.render_qss("QLabel { color: $fg; background: $bg; }")
+    assert "$" not in expanded and "color:" in expanded
+    # スタイル適用とパレット変更イベントで例外が出ない（標準QSSにトークンは無い）
     w = _make_app(_wave())
-    w._apply_ui_style("labplot")
-    assert "$" not in w.styleSheet() and "color:" in w.styleSheet()
     w._apply_ui_style("standard")
+    assert "$" not in w.styleSheet()
     # パレット変更イベントでスタイルを作り直す（例外を出さない）
     w._on_palette_changed(QtCore.QEvent.Type.PaletteChange)
 
 
 def test_ui_style_survives_event_loop():
-    """選んだ外観がイベントループを回しても巻き戻らないこと。
+    """標準スタイルがイベントループやパレット変更で巻き戻らないこと。
 
     setStyleSheet はその場で PaletteChange を起こす。テーマ追従が
-    「1つ前のスタイル名」を捕まえて後から再適用すると、選んだ外観が
-    静かに戻ってしまう（実際にそうなっていた）。"""
+    「1つ前のスタイル名」を捕まえて後から再適用すると外観が静かに戻る
+    バグがあった（◯◯風スキンは廃止したが、この不変条件は標準で担保する）。"""
     w = _make_app(_wave())
     app = QtWidgets.QApplication.instance()
-    for name in ("labplot", "veusz", "kst", "igor", "standard"):
-        w._apply_layout_preset(name)
-        app.processEvents()
-        app.processEvents()
-        assert w._ui_style_name == name, f"{name} を選んだのに {w._ui_style_name} に戻った"
-    for name in ("igor", "veusz", "standard"):
-        w._set_ui_style(name)
-        app.processEvents()
-        app.processEvents()
-        assert w._ui_style_name == name
+    w._apply_ui_style("standard")
+    app.processEvents()
+    app.processEvents()
+    assert w._ui_style_name == "standard"
     # OS のテーマ変更で呼ばれる経路は、今のスタイルを保つ
     w._on_palette_changed(QtCore.QEvent.Type.PaletteChange)
     app.processEvents()

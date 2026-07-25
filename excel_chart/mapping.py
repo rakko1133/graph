@@ -136,12 +136,10 @@ XL = {
     "line":            4,      # xlLine
     "line_markers":    65,     # xlLineMarkers
     "xy_lines":        74,     # xlXYScatterLines（数値Xの折れ線に最適）
-    "xy_lines_nomark": 75,     # xlXYScatterLinesNoMarkers
     "xy_scatter":      -4169,  # xlXYScatter（散布図・マーカーのみ）
     "column":          51,     # xlColumnClustered
     "column_stacked":  52,     # xlColumnStacked
     "bar":             57,     # xlBarClustered（横棒）
-    "bar_stacked":     58,     # xlBarStacked
     "pie":             5,      # xlPie
 }
 

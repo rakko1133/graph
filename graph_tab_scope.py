@@ -378,7 +378,6 @@ class ScopeTabMixin:
         if now - getattr(self, "_hover_t", 0.0) < 0.05:   # 20Hzに間引き（負荷対策）
             return
         self._hover_t = now
-        import numpy as np
         vals = self._hover_values(ax, float(event.xdata))
         # ステータスバー右には従来どおり「最近傍1点」を出す
         best = None
@@ -585,8 +584,11 @@ class ScopeTabMixin:
         b_all = QtWidgets.QPushButton("全系列を解析…")
         b_all.setToolTip("選択中の全系列のピーク・測定を別ウィンドウに一覧表示（CSV保存可）")
         b_all.clicked.connect(self.analyze_all_series)
-        b_fft = QtWidgets.QPushButton("FFT表示"); b_fft.clicked.connect(self.show_fft)
-        b_fft.setToolTip("FFTスペクトル表示：選択中の全系列のFFTを1枚に重ね描き（系列ごとに色分け）")
+        b_fft = QtWidgets.QPushButton("FFT表示"); b_fft.setCheckable(True)
+        b_fft.setToolTip("ONで全系列を周波数ドメイン（FFTスペクトル）へ切替。単位変換のように、"
+                         "ONの間は再描画してもFFT表示が続きます（もう一度押すと時間ドメインへ）。")
+        b_fft.toggled.connect(self._on_fft_toggled)
+        self.fft_btn = b_fft
         b_cur = QtWidgets.QPushButton("カーソル測定"); b_cur.setCheckable(True)
         b_cur.setToolTip("グラフを2回クリックして Δt・ΔV・1/Δt を測ります")
         b_cur.toggled.connect(self.toggle_cursors)
@@ -738,13 +740,33 @@ class ScopeTabMixin:
         if self.datasets:   # 特殊表示(スペクトログラム等)直後でも通常グラフへ再描画して反映
             self.draw_graph()
 
+    def _fft_mode_on(self):
+        """FFT表示（周波数ドメイン）が持続ONか。draw_graph から参照される。"""
+        return bool(getattr(self, "fft_btn", None) and self.fft_btn.isChecked())
+
+    def _on_fft_toggled(self, on):
+        """FFT表示トグル。ONで全系列を周波数ドメインへ切り替える持続表示にする。"""
+        if on and getattr(self, "scope_check", None) and self.scope_check.isChecked():
+            self.scope_check.setChecked(False)   # オシロ(時間)とFFT(周波数)は併用しない
+        self._set_status("FFT表示: ON（周波数ドメイン）" if on
+                         else "FFT表示: OFF（時間ドメインへ戻す）")
+        if self.datasets:
+            self.draw_graph()
+
     def show_fft(self):
-        """選択中の全系列のFFTスペクトルを1枚に重ね描き（系列ごとに色分け・凡例）。"""
-        items = self._selected_series_items()
-        if not items:
-            self.notify("解析する系列を選択してください。", "warn")
-            return
+        """FFT表示（周波数ドメイン）をONにする。メニュー/コマンドパレット/後方互換用。"""
+        if getattr(self, "fft_btn", None) and not self.fft_btn.isChecked():
+            self.fft_btn.setChecked(True)     # toggled 経由で draw_graph
+        else:
+            self.draw_graph()
+
+    def _draw_fft_view(self):
+        """選択中の全系列をFFTスペクトルにして self.ax へ描く（draw_graph の FFTモードから呼ぶ）。
+
+        各系列の時間ドメイン (t, y) を FFT し、横軸=周波数[Hz]・縦軸=振幅の1枚へ重ね描きする。
+        グラフ種別（棒/円など）やオシロ表示には依存せず、常に周波数スペクトルを描く。"""
         import numpy as np
+        items = self._selected_series_items()
         win = self.fft_window.currentText() if hasattr(self, "fft_window") else "hann"
         use_db = hasattr(self, "fft_db") and self.fft_db.isChecked()
         ylab = "振幅 [dBV]" if use_db else "振幅"
@@ -761,27 +783,28 @@ class ScopeTabMixin:
             disp_amp = analysis.to_db(amp) if use_db else amp
             series.append({"label": f"FFT: {disp}", "x": freqs, "y": disp_amp,
                            "style": {"color": color, "linewidth": 1.0}})
-            for p in analysis.find_spectral_peaks(t, np.asarray(y, float), n=self.npeaks.value()):
-                yv = analysis.to_db(np.array([p["amplitude"]]))[0] if use_db else p["amplitude"]
-                markers.append({"x": p["frequency"], "y": yv,
-                                "text": f"{p['frequency']:.0f}Hz", "color": color})
+            for pk in analysis.find_spectral_peaks(t, np.asarray(y, float), n=self.npeaks.value()):
+                yv = analysis.to_db(np.array([pk["amplitude"]]))[0] if use_db else pk["amplitude"]
+                markers.append({"x": pk["frequency"], "y": yv,
+                                "text": f"{pk['frequency']:.0f}Hz", "color": color})
             drawn += 1
         if drawn == 0:
-            self.notify("FFT を計算できませんでした。", "warn")
+            self.ax.set_xlabel("周波数 [Hz]"); self.ax.set_ylabel(ylab)
+            self.canvas.draw()
+            self.notify("FFT を計算できる系列がありません（点数が少ない可能性）。", "warn")
             return
-        self._ensure_axes_projection(False)   # 3D表示中でも2D軸に戻して描く
-        self._reset_figure_axes()
         plotter.plot_series(
             self.ax, series, "折れ線",
-            title=f"FFTスペクトル（{win}窓・{drawn}系列）", xlabel="周波数 [Hz]", ylabel=ylab,
+            title=f"FFTスペクトル（{win}窓・{drawn}系列）",
+            xlabel="周波数 [Hz]", ylabel=ylab,
             grid=True, legend=(drawn > 1), markers=markers, fonts=self._fonts())
         self._apply_aspect()   # 縦横比の設定をFFT表示にも適用（自動なら解除）
+        self._apply_figure_theme(redraw=False)   # ダークテーマ等をFFT表示にも反映
         try:
             self.fig.tight_layout()
         except Exception:
-            applog.get_logger().debug("show_fft: 無視した例外", exc_info=True)
+            applog.get_logger().debug("_draw_fft_view: 無視した例外", exc_info=True)
         self.canvas.draw()
-        self._set_status(f"FFT表示: {drawn}系列を重ね描き")
 
     # -------------------------------------------------- 全系列の一括解析（別ウィンドウ・CSV保存）
     def analyze_all_series(self):

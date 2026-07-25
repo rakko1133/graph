@@ -129,18 +129,7 @@ def correlation_matrix(named_series, method="pearson"):
     M = M[:, mask]
     if M.shape[1] < 2:
         return names, None
-    try:
-        if method == "spearman":
-            from scipy import stats
-            mat, _ = stats.spearmanr(M, axis=1)
-            mat = np.atleast_2d(np.asarray(mat, dtype=float))
-            if mat.shape != (len(arrs), len(arrs)):   # 2系列時は scalar を 2x2 へ
-                r = float(mat.ravel()[0])             # scipy が返した Spearman 値を使う
-                mat = np.array([[1.0, r], [r, 1.0]])  # （np.corrcoef は Pearson なので不可）
-        else:
-            mat = np.corrcoef(M)
-    except Exception:
-        mat = np.corrcoef(M)
+    mat = np.corrcoef(M)
     return names, np.asarray(mat, dtype=float)
 
 

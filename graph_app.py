@@ -349,83 +349,8 @@ QPushButton { padding: 4px 10px; min-height: 22px; }
 QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
 """,
             "tb_style": "beside", "tb_icon": 24, "indent": 20},
-        "labplot": {   # KDE Breeze調: ゆったり・角丸・青アクセント
-            "qss": """
-QWidget { font-size: 10pt; }
-QPushButton { background:$button; color:$fg; border:1px solid $border;
-              border-radius:3px; padding:5px 12px; }
-QPushButton:hover { border-color:$accent; }
-QPushButton:pressed, QPushButton:checked { background:$accent_soft; border-color:$accent; }
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    border:1px solid $border; border-radius:3px; padding:3px 6px;
-    background:$base; color:$fg; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
-    border-color:$accent; }
-QTreeWidget, QListWidget, QTableWidget { border:1px solid $border_soft; border-radius:3px; }
-QTreeWidget::item { min-height:24px; }
-QTabBar::tab { padding:6px 14px; }
-QToolBar { spacing:4px; padding:3px; }
-QToolButton { padding:4px; border-radius:3px; }
-QToolButton:hover { background:$accent_soft; }
-QDockWidget::title { background:$title_bg; color:$fg; padding:5px; }
-""",
-            "tb_style": "beside", "tb_icon": 22, "indent": 20},
-        "veusz": {     # 実用主義コンパクト: 小さく詰めて情報密度を上げる
-            "qss": """
-QWidget { font-size: 8pt; }
-QPushButton { padding:2px 8px; min-height:18px; }
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { padding:1px 3px; min-height:18px; }
-QTreeWidget::item { min-height:18px; }
-QTabBar::tab { padding:3px 8px; }
-QToolBar { spacing:1px; padding:1px; }
-QToolButton { padding:2px; }
-QDockWidget::title { padding:2px; }
-""",
-            "tb_style": "icon", "tb_icon": 16, "indent": 14},
-        "kst": {       # ミニマル: 枠・装飾を減らしプロットに集中
-            "qss": """
-QWidget { font-size: 9pt; }
-QToolBar { border:0; spacing:2px; padding:2px; background:transparent; }
-QDockWidget::title { background:transparent; color:$fg; padding:3px; }
-QPushButton { padding:3px 10px; border:1px solid $border_soft; border-radius:2px;
-              background:$button; color:$fg; }
-QPushButton:checked { background:$accent_soft; }
-QTreeWidget, QListWidget, QTableWidget { border:1px solid $border_soft; }
-QTreeWidget::item { min-height:20px; }
-QTabBar::tab { padding:4px 10px; }
-""",
-            "tb_style": "icon", "tb_icon": 18, "indent": 16},
-        "igor": {      # クラシック高密度: 小さな立体ボタン・詰めた余白
-            "qss": """
-QWidget { font-size: 8pt; }
-QMainWindow, QDockWidget, QTabWidget::pane { background-color:$bg; }
-QPushButton { background:$button; color:$fg;
-              border:1px solid $border; border-radius:2px; padding:2px 9px;
-              min-height:18px; }
-QPushButton:pressed, QPushButton:checked { background:$accent_soft; }
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    background:$base; color:$fg; border:1px solid $border; padding:1px 3px; }
-QTreeWidget, QListWidget, QTableWidget { background:$base; color:$fg;
-    border:1px solid $border; }
-QTreeWidget::item { min-height:18px; }
-QDockWidget::title { background:$title_bg; color:$fg;
-    border:1px solid $border_soft; padding:3px; }
-QTabBar::tab { padding:3px 10px; background:$title_bg; color:$fg;
-    border:1px solid $border_soft; }
-QTabBar::tab:selected { background:$bg; }
-QToolBar { background:$title_bg; spacing:1px; }
-""",
-            "tb_style": "icon", "tb_icon": 20, "indent": 14},
     }
 
-    _UI_STYLE_NAMES = {"standard": "標準", "labplot": "LabPlot風", "veusz": "Veusz風",
-                       "kst": "KST2風", "igor": "Igor Pro風"}
-
-    def _set_ui_style(self, name):
-        """メニューからのUIスタイル切替（ステータス案内つき）。"""
-        self._apply_ui_style(name)
-        self._set_status(f"外観: {self._UI_STYLE_NAMES.get(name, name)}"
-                         "（配置も合わせるなら 表示→見た目 の上段を選んでください）")
 
     def _apply_ui_style(self, name):
         """UIスタイル（外観テーマ）を適用する。ウィジェット・機能は変えない。
@@ -434,6 +359,9 @@ QToolBar { background:$title_bg; spacing:1px; }
         （_on_palette_changed）が走る。**採用した名前を先に記録**しておかないと、
         追従側が「1つ前のスタイル」を読んで再適用し、選んだ外観が巻き戻る。"""
         style = self._UI_STYLES.get(name)
+        if style is None:                 # 旧テーマ名の保存値は標準へ丸める
+            name = "standard"
+            style = self._UI_STYLES.get(name)
         if style is None:
             return
         self._ui_style_name = name          # ← setStyleSheet より前に確定させる
@@ -793,7 +721,7 @@ QToolBar { background:$title_bg; spacing:1px; }
         # 見た目のプリセット。以前は「レイアウト」と「UIスタイル（外観のみ）」の
         # 2メニューに分かれていて、片方だけ変えると中途半端な画面になっていた。
         # 既定は配置＋外観をまとめて適用し、外観だけの切替は下位メニューに置く。
-        lay_menu = vm.addMenu("見た目（配置＋外観）")
+        lay_menu = vm.addMenu("画面の配置")
         self._menu_action(lay_menu, "標準（3ペイン）", lambda: self._apply_layout_preset("standard"),
                           tip="左パネル＋中央グラフ＋右書式の標準配置・標準の外観に戻す")
         self._menu_action(lay_menu, "グラフ集中（Saleae風）",
@@ -805,33 +733,6 @@ QToolBar { background:$title_bg; spacing:1px; }
         self._menu_action(lay_menu, "データ整備",
                           lambda: self._apply_layout_preset("data"),
                           tip="データパネル＋大きなデータ編集表（読み込み・クレンジング向け）")
-        lay_menu.addSeparator()
-        self._menu_action(lay_menu, "LabPlot風",
-                          lambda: self._apply_layout_preset("labplot"),
-                          tip="左にプロジェクトツリー＋統計解析タブ・右にプロパティ・下にスプレッドシート、"
-                              "外観はBreeze調（LabPlotの標準画面）")
-        self._menu_action(lay_menu, "Veusz風",
-                          lambda: self._apply_layout_preset("veusz"),
-                          tip="ツールバーを左縦に移し、左にデータツリー（上）＋書式（下）の縦積み、"
-                              "右は大きなグラフ。外観はコンパクト（Veuszの編集画面）")
-        self._menu_action(lay_menu, "KST2風",
-                          lambda: self._apply_layout_preset("kst"),
-                          tip="プロットを全画面にし、データはフロートの小窓（データマネージャ風）。"
-                              "外観はミニマル（KST2のライブ監視画面）")
-        self._menu_action(lay_menu, "Igor Pro風",
-                          lambda: self._apply_layout_preset("igor"),
-                          tip="データ・オシロ解析・書式の3枚をカスケードのフロートウィンドウにし、"
-                              "メインはグラフ専用。外観はクラシック高密度（IgorのMDI風）")
-        # 配置は保ったまま、ボタンの大きさ・余白・密度だけ変えたい人向け（下位扱い）
-        lay_menu.addSeparator()
-        style_menu = lay_menu.addMenu("配置は変えずに外観だけ")
-        for key, label, tip in (
-                ("standard", "標準", "既定の外観に戻す（配置はそのまま）"),
-                ("labplot", "LabPlot風（ゆったり）", "大きめボタン・角丸・広い余白"),
-                ("veusz", "Veusz風（コンパクト）", "小さいフォントと詰めた余白"),
-                ("kst", "KST2風（ミニマル）", "枠線・装飾を減らした薄いクローム"),
-                ("igor", "Igor Pro風（高密度）", "小さな立体ボタン・詰めた行間")):
-            self._menu_action(style_menu, label, lambda k=key: self._set_ui_style(k), tip=tip)
         vm.addSeparator()
         self._menu_action(vm, "メッセージ履歴…", self.show_message_log,
                           tip="これまでのメッセージ・警告・エラーを一覧で見る")
@@ -997,13 +898,10 @@ QToolBar { background:$title_bg; spacing:1px; }
         total = max(sum(self.center_splitter.sizes()), 400)
         for d in [self.files_dock, *self.left_docks, self.format_dock]:
             d.setFloating(False)
-        # ツールバーは既定の上配置へ戻す（Veusz風だけが左縦に移す）
+        # ツールバーは既定の上配置へ戻す
         tb = getattr(self, "main_toolbar", None)
         if tb is not None:
             self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, tb)
-        # 「◯◯風」プリセットは配置だけでなく外観（ボタンの大きさ・密度・配色）も適用する
-        if name in self._UI_STYLES:
-            self._apply_ui_style(name)
         if name == "standard":
             self._reset_panel_layout()
             self.center_splitter.setSizes([int(total * 0.8), int(total * 0.2)])
@@ -1031,67 +929,6 @@ QToolBar { background:$title_bg; spacing:1px; }
             self.resizeDocks([self.files_dock], [380], QtCore.Qt.Orientation.Horizontal)
             self.center_splitter.setSizes([int(total * 0.45), int(total * 0.55)])
             self._set_status("レイアウト: データ整備（ファイルツリー＋データ編集表）")
-        elif name == "labplot":
-            # LabPlot: 左=ファイルツリー＋軸＋統計のタブ、右=プロパティ、
-            # 下=スプレッドシート（データ表）という4区画のワークベンチ配置
-            for d in (self.left_docks[1], self.left_docks[2]):
-                d.hide()
-            files, data, ds = self.files_dock, self.left_docks[0], self.left_docks[3]
-            for d in (files, data, ds):
-                d.show()
-                self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, d)
-            self.tabifyDockWidget(files, data)   # ファイル/軸/統計をタブで切替
-            self.tabifyDockWidget(data, ds)
-            files.raise_()
-            self.format_dock.show()
-            self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.format_dock)
-            self.resizeDocks([files], [330], QtCore.Qt.Orientation.Horizontal)
-            self.resizeDocks([self.format_dock], [390], QtCore.Qt.Orientation.Horizontal)
-            self.center_splitter.setSizes([int(total * 0.75), int(total * 0.25)])
-            self._set_status("レイアウト: LabPlot風（ファイル+軸+統計タブ／グラフ＋スプレッドシート／プロパティ）")
-        elif name == "veusz":
-            # Veusz: ツールバーは左縦、左列にファイルツリー(上)＋書式(下)の縦積み
-            if tb is not None:
-                self.addToolBar(QtCore.Qt.ToolBarArea.LeftToolBarArea, tb)
-            for d in self.left_docks:
-                d.hide()
-            files = self.files_dock
-            files.show()
-            self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, files)
-            self.format_dock.show()
-            self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.format_dock)
-            self.splitDockWidget(files, self.format_dock, QtCore.Qt.Orientation.Vertical)
-            self.resizeDocks([files, self.format_dock], [370, 370],
-                             QtCore.Qt.Orientation.Horizontal)
-            self.center_splitter.setSizes([total, 0])
-            self._set_status("レイアウト: Veusz風（左縦ツールバー＋編集パネル縦積み＋大きなグラフ）")
-        elif name == "kst":
-            # KST2: プロット全画面＋データマネージャ風のフロート小窓（=ファイルツリー）
-            for d in [*self.left_docks, self.format_dock]:
-                d.hide()
-            files = self.files_dock
-            files.show()
-            files.setFloating(True)
-            files.resize(300, 430)
-            files.move(self.x() + max(self.width() - 340, 80), self.y() + 110)
-            self.center_splitter.setSizes([total, 0])
-            self._set_status("レイアウト: KST2風（プロット全画面＋データマネージャの小窓）")
-        elif name == "igor":
-            # Igor Pro: ファイル・オシロ解析・書式の3枚をカスケードのツールウィンドウに
-            for d in (self.left_docks[0], self.left_docks[2], self.left_docks[3]):
-                d.hide()
-            casc = [(self.files_dock, (340, 480)),
-                    (self.left_docks[1], (360, 460)),
-                    (self.format_dock, (400, 540))]
-            for i, (d, size) in enumerate(casc):
-                d.show()
-                d.setFloating(True)
-                d.resize(*size)
-                d.move(self.x() + 50 + i * 48, self.y() + 100 + i * 42)
-            self.center_splitter.setSizes([total, 0])
-            self._set_status("レイアウト: Igor Pro風（データ/オシロ/書式をカスケードのウィンドウに。"
-                             "『新しいグラフウィンドウ』(Ctrl+G)と組み合わせるとMDI風になります）")
-
     def _reset_panel_layout(self):
         """ドッキングパネルの配置・表示状態を初期状態に戻す。"""
         if getattr(self, "_default_window_state", None) is not None:
@@ -1102,7 +939,7 @@ QToolBar { background:$title_bg; spacing:1px; }
         # 読み込み済みファイルの既定は「独立ウィンドウ」（restoreStateがフロートへ戻す）
         self.files_dock.setVisible(True)
         tb = getattr(self, "main_toolbar", None)
-        if tb is not None:   # Veusz風で左縦に移したツールバーも上へ戻す
+        if tb is not None:   # ツールバーは常に上へ戻す
             self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, tb)
             tb.show()
         self.left_docks[0].raise_()
@@ -1760,8 +1597,6 @@ QToolBar { background:$title_bg; spacing:1px; }
 
         コントロール自身に文字が無い（コンボや入力欄）ときは、直前に置かれた
         QLabel を名前として使う。画面での読み取り方と同じ順序で拾う。"""
-        controls = (QtWidgets.QAbstractButton, QtWidgets.QComboBox,
-                    QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox)
         # 見出しラベル（_bold）に出会ったら、そこから下を新しいセクションとして扱う。
         # オシロ/高度解析/統計解析タブは CollapsibleBox ではなく太字ラベルで
         # 区切られているため、これが無いと索引がセクション名なしになる。
@@ -2867,7 +2702,6 @@ class PlotMixin:
         self._request_redraw()
 
     def _build_series(self, chart_type):
-        info = plotter.CHART_INFO[chart_type]
         items = self._selected_series_items()
         if not items:
             raise ValueError("Y軸（値）の系列を選択してください。")
@@ -3135,6 +2969,17 @@ class PlotMixin:
         self._cursors = []; self._cursor_drag = None; self._cursor_text = None
         self._link_artists = []   # リンク選択のリング強調も軸クリアで消える
         try:
+            # FFT表示ON: 時間→周波数ドメインへ全系列を切り替える持続表示。
+            # 単位変換と同じく、ONの間は再描画してもこの表示が続く（時間ドメインは描かない）。
+            if self._tab_hook("_fft_mode_on", default=False):
+                self._ensure_axes_projection(False)   # FFTは2D（3D選択中でも2Dへ戻す）
+                self._reset_figure_axes()
+                self._tab_hook("_draw_fft_view")
+                self._rebuild_series_bar(ctype)
+                self._plotted_artists = [(ln.get_label(), ln) for ln in self.ax.get_lines()]
+                self._has_drawn = True
+                self._snapshot()
+                return
             series, categories = self._build_series(ctype)
             swap_on = (getattr(self, "swap_xy_check", None) and self.swap_xy_check.isChecked()
                        and ctype in plotter._SWAP_TYPES)
@@ -3234,7 +3079,7 @@ class PlotMixin:
             QtWidgets.QMessageBox.critical(self, "描画エラー", str(e))
 
     def open_graph_window(self):
-        """現在のグラフを独立ウィンドウとして複製する（Igor Pro風）。
+        """現在のグラフを独立ウィンドウとして複製する。
 
         何枚でも開けるので、選択・書式を変えながら複数のグラフを並べて比較できる。
         各ウィンドウは自分のズームツールバーを持ち、「現在の設定で更新」で
@@ -3807,7 +3652,6 @@ class StyleTableMixin:
         """『X軸を複数選択』チェックと複数Xリストの有効状態を種別・設定から決める。"""
         if not hasattr(self, "multix_check"):
             return
-        info = plotter.CHART_INFO.get(self.chart_combo.currentText(), {})
         # 複数Xが効くのは 2D の xy 種別かつ『一番左の列』OFF・3D以外
         ok = (self.chart_combo.currentText() in plotter._SWAP_TYPES
               and not self._use_leftmost_x() and not self._want_3d())
@@ -3970,11 +3814,6 @@ class StyleTableMixin:
         menu.addAction("すべて表示", lambda: (self._check_all_y(True), self._maybe_draw()))
         menu.addAction("すべて非表示", lambda: (self._check_all_y(False), self._maybe_draw()))
         return menu
-
-    def _y_list_menu(self, pos):
-        """Yリスト右クリックの表示メニュー。"""
-        item = self.y_list.itemAt(pos)
-        self._series_menu(item).exec(self.y_list.viewport().mapToGlobal(pos))
 
     def _solo_series(self, item):
         """指定系列だけ表示（他をすべて非表示）。"""

@@ -6,7 +6,7 @@ from analysis_common import (sampling_rate, find_signal_peaks, _trapz,
                              _zero_crossing_period, _edge_time,
                              histogram_top_base, _mid_crossings,
                              crossing_times, mid_level)
-from analysis_spectrum import dominant_frequency, find_spectral_peaks
+from analysis_spectrum import dominant_frequency
 
 
 def measurements(t, y):
@@ -82,9 +82,8 @@ def measurements(t, y):
     add("サンプル数", float(y.size), "点")
     add("サンプリング周波数", sampling_rate(t), "Hz")
 
-    # --- 追加測定（中央値/リプル/スルーレート/サイクル統計/ヒストグラム由来）---
+    # --- 追加測定（中央値/スルーレート/サイクル統計/ヒストグラム由来）---
     add("中央値 Median", float(np.nanmedian(y)) if has else None, "V")
-    add("リプル(AC RMS)", float(np.nanstd(y)) if has else None, "V")
     sr = slew_rate(t, y)
     add("スルーレート(立上り最大)", sr.get("rise"), "V/s")
     add("スルーレート(立下り最大)", sr.get("fall"), "V/s")
@@ -301,10 +300,8 @@ def phase_delay(t, y1, y2):
 
 
 def analyze(t, y, n_peaks=5, smooth=0):
-    """ピーク・測定・FFT をまとめて返す便利関数。smooth で平滑化してピーク検出。"""
+    """ピーク・測定をまとめて返す便利関数。smooth で平滑化してピーク検出。"""
     return {
         "peaks": find_signal_peaks(y, t=t, n=n_peaks, smooth=smooth),
-        "troughs": find_signal_peaks(y, t=t, n=n_peaks, mode="min", smooth=smooth),
         "measurements": measurements(t, y),
-        "spectral_peaks": find_spectral_peaks(t, y, n=n_peaks),
     }

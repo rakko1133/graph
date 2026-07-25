@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """SI接頭辞つき数値フォーマット（format_eng / parse_eng / eng_125_sequence）。"""
-import numpy as np
 
 
 def _eng(x):

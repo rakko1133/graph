@@ -386,7 +386,6 @@ def plot_series(
 
 def build_series_from_df(df, chart_type, x_col, y_cols):
     """単一 DataFrame から系列リストと categories を作る（後方互換・簡易用途）。"""
-    info = CHART_INFO[chart_type]
     y_cols = list(y_cols or [])
     categories = None
     series = []

@@ -13,8 +13,8 @@ import matplotlib
 import matplotlib.font_manager as fm
 import csv
 import pandas as pd
-import numpy as np
 import warnings
+import numpy as np
 import warnings
 import pandas as pd
 import importlib.util as _ilu
@@ -1183,7 +1183,6 @@ def plot_series( ax, series, chart_type, *, categories=None, bins=10, title="", 
    ax.invert_yaxis()
  return ax
 def build_series_from_df(df, chart_type, x_col, y_cols):
- info = CHART_INFO[chart_type]
  y_cols = list(y_cols or [])
  categories = None
  series = []
@@ -1614,7 +1613,6 @@ def measurements(t, y):
  add("サンプル数", float(y.size), "点")
  add("サンプリング周波数", sampling_rate(t), "Hz")
  add("中央値 Median", float(np.nanmedian(y)) if has else None, "V")
- add("リプル(AC RMS)", float(np.nanstd(y)) if has else None, "V")
  sr = slew_rate(t, y)
  add("スルーレート(立上り最大)", sr.get("rise"), "V/s")
  add("スルーレート(立下り最大)", sr.get("fall"), "V/s")
@@ -1792,7 +1790,7 @@ def phase_delay(t, y1, y2):
   phase = ((phase + 180.0) % 360.0) - 180.0
  return float(delay), (float(phase) if phase is not None else None)
 def analyze(t, y, n_peaks=5, smooth=0):
- return { "peaks": find_signal_peaks(y, t=t, n=n_peaks, smooth=smooth), "troughs": find_signal_peaks(y, t=t, n=n_peaks, mode="min", smooth=smooth), "measurements": measurements(t, y), "spectral_peaks": find_spectral_peaks(t, y, n=n_peaks), }
+ return { "peaks": find_signal_peaks(y, t=t, n=n_peaks, smooth=smooth), "measurements": measurements(t, y), }
 """高度解析：マスク/リミット合否、アイダイアグラム、ジッタ、シリアルプロトコル解読。
 ハイエンドオシロ相当の解析機能を後処理で提供する。プロトコル解読は
 UART（1線）、I2C（SCL/SDA）、SPI（SCK/MOSI[/CS]）、
@@ -2530,18 +2528,7 @@ def correlation_matrix(named_series, method="pearson"):
  M = M[:, mask]
  if M.shape[1] < 2:
   return names, None
- try:
-  if method == "spearman":
-   from scipy import stats
-   mat, _ = stats.spearmanr(M, axis=1)
-   mat = np.atleast_2d(np.asarray(mat, dtype=float))
-   if mat.shape != (len(arrs), len(arrs)):
-    r = float(mat.ravel()[0])
-    mat = np.array([[1.0, r], [r, 1.0]])
-  else:
-   mat = np.corrcoef(M)
- except Exception:
-  mat = np.corrcoef(M)
+ mat = np.corrcoef(M)
  return names, np.asarray(mat, dtype=float)
 def normality(y):
  y = _clean(y)
@@ -4082,7 +4069,6 @@ class ScopeTabMixin:
   if now - getattr(self, "_hover_t", 0.0) < 0.05:
    return
   self._hover_t = now
-  import numpy as np
   vals = self._hover_values(ax, float(event.xdata))
   best = None
   for label, _c, x, y in vals:
@@ -4259,8 +4245,10 @@ class ScopeTabMixin:
   b_all = QtWidgets.QPushButton("全系列を解析…")
   b_all.setToolTip("選択中の全系列のピーク・測定を別ウィンドウに一覧表示（CSV保存可）")
   b_all.clicked.connect(self.analyze_all_series)
-  b_fft = QtWidgets.QPushButton("FFT表示"); b_fft.clicked.connect(self.show_fft)
-  b_fft.setToolTip("FFTスペクトル表示：選択中の全系列のFFTを1枚に重ね描き（系列ごとに色分け）")
+  b_fft = QtWidgets.QPushButton("FFT表示"); b_fft.setCheckable(True)
+  b_fft.setToolTip("ONで全系列を周波数ドメイン（FFTスペクトル）へ切替。単位変換のように、" "ONの間は再描画してもFFT表示が続きます（もう一度押すと時間ドメインへ）。")
+  b_fft.toggled.connect(self._on_fft_toggled)
+  self.fft_btn = b_fft
   b_cur = QtWidgets.QPushButton("カーソル測定"); b_cur.setCheckable(True)
   b_cur.setToolTip("グラフを2回クリックして Δt・ΔV・1/Δt を測ります")
   b_cur.toggled.connect(self.toggle_cursors)
@@ -4383,12 +4371,22 @@ class ScopeTabMixin:
   self._meas_annotations = anns
   if self.datasets:
    self.draw_graph()
+ def _fft_mode_on(self):
+  return bool(getattr(self, "fft_btn", None) and self.fft_btn.isChecked())
+ def _on_fft_toggled(self, on):
+  if on and getattr(self, "scope_check", None) and self.scope_check.isChecked():
+   self.scope_check.setChecked(False)
+  self._set_status("FFT表示: ON（周波数ドメイン）" if on else "FFT表示: OFF（時間ドメインへ戻す）")
+  if self.datasets:
+   self.draw_graph()
  def show_fft(self):
-  items = self._selected_series_items()
-  if not items:
-   self.notify("解析する系列を選択してください。", "warn")
-   return
+  if getattr(self, "fft_btn", None) and not self.fft_btn.isChecked():
+   self.fft_btn.setChecked(True)
+  else:
+   self.draw_graph()
+ def _draw_fft_view(self):
   import numpy as np
+  items = self._selected_series_items()
   win = self.fft_window.currentText() if hasattr(self, "fft_window") else "hann"
   use_db = hasattr(self, "fft_db") and self.fft_db.isChecked()
   ylab = "振幅 [dBV]" if use_db else "振幅"
@@ -4404,23 +4402,23 @@ class ScopeTabMixin:
                 or f"C{idx % 10}"
    disp_amp = to_db(amp) if use_db else amp
    series.append({"label": f"FFT: {disp}", "x": freqs, "y": disp_amp, "style": {"color": color, "linewidth": 1.0}})
-   for p in find_spectral_peaks(t, np.asarray(y, float), n=self.npeaks.value()):
-    yv = to_db(np.array([p["amplitude"]]))[0] if use_db else p["amplitude"]
-    markers.append({"x": p["frequency"], "y": yv, "text": f"{p['frequency']:.0f}Hz", "color": color})
+   for pk in find_spectral_peaks(t, np.asarray(y, float), n=self.npeaks.value()):
+    yv = to_db(np.array([pk["amplitude"]]))[0] if use_db else pk["amplitude"]
+    markers.append({"x": pk["frequency"], "y": yv, "text": f"{pk['frequency']:.0f}Hz", "color": color})
    drawn += 1
   if drawn == 0:
-   self.notify("FFT を計算できませんでした。", "warn")
+   self.ax.set_xlabel("周波数 [Hz]"); self.ax.set_ylabel(ylab)
+   self.canvas.draw()
+   self.notify("FFT を計算できる系列がありません（点数が少ない可能性）。", "warn")
    return
-  self._ensure_axes_projection(False)
-  self._reset_figure_axes()
   plot_series( self.ax, series, "折れ線", title=f"FFTスペクトル（{win}窓・{drawn}系列）", xlabel="周波数 [Hz]", ylabel=ylab, grid=True, legend=(drawn > 1), markers=markers, fonts=self._fonts())
   self._apply_aspect()
+  self._apply_figure_theme(redraw=False)
   try:
    self.fig.tight_layout()
   except Exception:
-   get_logger().debug("show_fft: 無視した例外", exc_info=True)
+   get_logger().debug("_draw_fft_view: 無視した例外", exc_info=True)
   self.canvas.draw()
-  self._set_status(f"FFT表示: {drawn}系列を重ね描き")
  def analyze_all_series(self):
   items = self._selected_series_items()
   if not items:
@@ -5519,80 +5517,12 @@ QPushButton { padding: 4px 10px; min-height: 22px; }
 QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 22px; }
 """,
  "tb_style": "beside", "tb_icon": 24, "indent": 20},
- "labplot": {
- "qss": """
-QWidget { font-size: 10pt; }
-QPushButton { background:$button; color:$fg; border:1px solid $border;
-              border-radius:3px; padding:5px 12px; }
-QPushButton:hover { border-color:$accent; }
-QPushButton:pressed, QPushButton:checked { background:$accent_soft; border-color:$accent; }
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    border:1px solid $border; border-radius:3px; padding:3px 6px;
-    background:$base; color:$fg; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
-    border-color:$accent; }
-QTreeWidget, QListWidget, QTableWidget { border:1px solid $border_soft; border-radius:3px; }
-QTreeWidget::item { min-height:24px; }
-QTabBar::tab { padding:6px 14px; }
-QToolBar { spacing:4px; padding:3px; }
-QToolButton { padding:4px; border-radius:3px; }
-QToolButton:hover { background:$accent_soft; }
-QDockWidget::title { background:$title_bg; color:$fg; padding:5px; }
-""",
- "tb_style": "beside", "tb_icon": 22, "indent": 20},
- "veusz": {
- "qss": """
-QWidget { font-size: 8pt; }
-QPushButton { padding:2px 8px; min-height:18px; }
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { padding:1px 3px; min-height:18px; }
-QTreeWidget::item { min-height:18px; }
-QTabBar::tab { padding:3px 8px; }
-QToolBar { spacing:1px; padding:1px; }
-QToolButton { padding:2px; }
-QDockWidget::title { padding:2px; }
-""",
- "tb_style": "icon", "tb_icon": 16, "indent": 14},
- "kst": {
- "qss": """
-QWidget { font-size: 9pt; }
-QToolBar { border:0; spacing:2px; padding:2px; background:transparent; }
-QDockWidget::title { background:transparent; color:$fg; padding:3px; }
-QPushButton { padding:3px 10px; border:1px solid $border_soft; border-radius:2px;
-              background:$button; color:$fg; }
-QPushButton:checked { background:$accent_soft; }
-QTreeWidget, QListWidget, QTableWidget { border:1px solid $border_soft; }
-QTreeWidget::item { min-height:20px; }
-QTabBar::tab { padding:4px 10px; }
-""",
- "tb_style": "icon", "tb_icon": 18, "indent": 16},
- "igor": {
- "qss": """
-QWidget { font-size: 8pt; }
-QMainWindow, QDockWidget, QTabWidget::pane { background-color:$bg; }
-QPushButton { background:$button; color:$fg;
-              border:1px solid $border; border-radius:2px; padding:2px 9px;
-              min-height:18px; }
-QPushButton:pressed, QPushButton:checked { background:$accent_soft; }
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    background:$base; color:$fg; border:1px solid $border; padding:1px 3px; }
-QTreeWidget, QListWidget, QTableWidget { background:$base; color:$fg;
-    border:1px solid $border; }
-QTreeWidget::item { min-height:18px; }
-QDockWidget::title { background:$title_bg; color:$fg;
-    border:1px solid $border_soft; padding:3px; }
-QTabBar::tab { padding:3px 10px; background:$title_bg; color:$fg;
-    border:1px solid $border_soft; }
-QTabBar::tab:selected { background:$bg; }
-QToolBar { background:$title_bg; spacing:1px; }
-""",
- "tb_style": "icon", "tb_icon": 20, "indent": 14},
  }
- _UI_STYLE_NAMES = {"standard": "標準", "labplot": "LabPlot風", "veusz": "Veusz風", "kst": "KST2風", "igor": "Igor Pro風"}
- def _set_ui_style(self, name):
-  self._apply_ui_style(name)
-  self._set_status(f"外観: {self._UI_STYLE_NAMES.get(name, name)}" "（配置も合わせるなら 表示→見た目 の上段を選んでください）")
  def _apply_ui_style(self, name):
   style = self._UI_STYLES.get(name)
+  if style is None:
+   name = "standard"
+   style = self._UI_STYLES.get(name)
   if style is None:
    return
   self._ui_style_name = name
@@ -5831,20 +5761,11 @@ QToolBar { background:$title_bg; spacing:1px; }
    float_menu.addAction(a)
    self._palette_register("表示", f"{d.windowTitle()} を別ウィンドウで表示", a)
    self._float_actions[d.objectName()] = a
-  lay_menu = vm.addMenu("見た目（配置＋外観）")
+  lay_menu = vm.addMenu("画面の配置")
   self._menu_action(lay_menu, "標準（3ペイン）", lambda: self._apply_layout_preset("standard"), tip="左パネル＋中央グラフ＋右書式の標準配置・標準の外観に戻す")
   self._menu_action(lay_menu, "グラフ集中（Saleae風）", lambda: self._apply_layout_preset("graph"), tip="パネルを全部たたみ、グラフをほぼ全画面に（波形をじっくり見る）")
   self._menu_action(lay_menu, "解析中心（オシロ）", lambda: self._apply_layout_preset("analysis"), tip="オシロ/解析パネル＋大きなグラフ＋データ表（測定作業向け）")
   self._menu_action(lay_menu, "データ整備", lambda: self._apply_layout_preset("data"), tip="データパネル＋大きなデータ編集表（読み込み・クレンジング向け）")
-  lay_menu.addSeparator()
-  self._menu_action(lay_menu, "LabPlot風", lambda: self._apply_layout_preset("labplot"), tip="左にプロジェクトツリー＋統計解析タブ・右にプロパティ・下にスプレッドシート、" "外観はBreeze調（LabPlotの標準画面）")
-  self._menu_action(lay_menu, "Veusz風", lambda: self._apply_layout_preset("veusz"), tip="ツールバーを左縦に移し、左にデータツリー（上）＋書式（下）の縦積み、" "右は大きなグラフ。外観はコンパクト（Veuszの編集画面）")
-  self._menu_action(lay_menu, "KST2風", lambda: self._apply_layout_preset("kst"), tip="プロットを全画面にし、データはフロートの小窓（データマネージャ風）。" "外観はミニマル（KST2のライブ監視画面）")
-  self._menu_action(lay_menu, "Igor Pro風", lambda: self._apply_layout_preset("igor"), tip="データ・オシロ解析・書式の3枚をカスケードのフロートウィンドウにし、" "メインはグラフ専用。外観はクラシック高密度（IgorのMDI風）")
-  lay_menu.addSeparator()
-  style_menu = lay_menu.addMenu("配置は変えずに外観だけ")
-  for key, label, tip in ( ("standard", "標準", "既定の外観に戻す（配置はそのまま）"), ("labplot", "LabPlot風（ゆったり）", "大きめボタン・角丸・広い余白"), ("veusz", "Veusz風（コンパクト）", "小さいフォントと詰めた余白"), ("kst", "KST2風（ミニマル）", "枠線・装飾を減らした薄いクローム"), ("igor", "Igor Pro風（高密度）", "小さな立体ボタン・詰めた行間")):
-   self._menu_action(style_menu, label, lambda k=key: self._set_ui_style(k), tip=tip)
   vm.addSeparator()
   self._menu_action(vm, "メッセージ履歴…", self.show_message_log, tip="これまでのメッセージ・警告・エラーを一覧で見る")
   self._menu_action(vm, "パネル配置をリセット", self._reset_panel_layout, tip="パネルのドッキング配置・表示状態を初期状態に戻す")
@@ -5955,8 +5876,6 @@ QToolBar { background:$title_bg; spacing:1px; }
   tb = getattr(self, "main_toolbar", None)
   if tb is not None:
    self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, tb)
-  if name in self._UI_STYLES:
-   self._apply_ui_style(name)
   if name == "standard":
    self._reset_panel_layout()
    self.center_splitter.setSizes([int(total * 0.8), int(total * 0.2)])
@@ -5983,57 +5902,6 @@ QToolBar { background:$title_bg; spacing:1px; }
    self.resizeDocks([self.files_dock], [380], QtCore.Qt.Orientation.Horizontal)
    self.center_splitter.setSizes([int(total * 0.45), int(total * 0.55)])
    self._set_status("レイアウト: データ整備（ファイルツリー＋データ編集表）")
-  elif name == "labplot":
-   for d in (self.left_docks[1], self.left_docks[2]):
-    d.hide()
-   files, data, ds = self.files_dock, self.left_docks[0], self.left_docks[3]
-   for d in (files, data, ds):
-    d.show()
-    self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, d)
-   self.tabifyDockWidget(files, data)
-   self.tabifyDockWidget(data, ds)
-   files.raise_()
-   self.format_dock.show()
-   self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.format_dock)
-   self.resizeDocks([files], [330], QtCore.Qt.Orientation.Horizontal)
-   self.resizeDocks([self.format_dock], [390], QtCore.Qt.Orientation.Horizontal)
-   self.center_splitter.setSizes([int(total * 0.75), int(total * 0.25)])
-   self._set_status("レイアウト: LabPlot風（ファイル+軸+統計タブ／グラフ＋スプレッドシート／プロパティ）")
-  elif name == "veusz":
-   if tb is not None:
-    self.addToolBar(QtCore.Qt.ToolBarArea.LeftToolBarArea, tb)
-   for d in self.left_docks:
-    d.hide()
-   files = self.files_dock
-   files.show()
-   self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, files)
-   self.format_dock.show()
-   self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.format_dock)
-   self.splitDockWidget(files, self.format_dock, QtCore.Qt.Orientation.Vertical)
-   self.resizeDocks([files, self.format_dock], [370, 370], QtCore.Qt.Orientation.Horizontal)
-   self.center_splitter.setSizes([total, 0])
-   self._set_status("レイアウト: Veusz風（左縦ツールバー＋編集パネル縦積み＋大きなグラフ）")
-  elif name == "kst":
-   for d in [*self.left_docks, self.format_dock]:
-    d.hide()
-   files = self.files_dock
-   files.show()
-   files.setFloating(True)
-   files.resize(300, 430)
-   files.move(self.x() + max(self.width() - 340, 80), self.y() + 110)
-   self.center_splitter.setSizes([total, 0])
-   self._set_status("レイアウト: KST2風（プロット全画面＋データマネージャの小窓）")
-  elif name == "igor":
-   for d in (self.left_docks[0], self.left_docks[2], self.left_docks[3]):
-    d.hide()
-   casc = [(self.files_dock, (340, 480)), (self.left_docks[1], (360, 460)), (self.format_dock, (400, 540))]
-   for i, (d, size) in enumerate(casc):
-    d.show()
-    d.setFloating(True)
-    d.resize(*size)
-    d.move(self.x() + 50 + i * 48, self.y() + 100 + i * 42)
-   self.center_splitter.setSizes([total, 0])
-   self._set_status("レイアウト: Igor Pro風（データ/オシロ/書式をカスケードのウィンドウに。" "『新しいグラフウィンドウ』(Ctrl+G)と組み合わせるとMDI風になります）")
  def _reset_panel_layout(self):
   if getattr(self, "_default_window_state", None) is not None:
    self.restoreState(self._default_window_state)
@@ -6552,7 +6420,6 @@ QToolBar { background:$title_bg; spacing:1px; }
    self.setting_search.setCompleter(comp)
   return self._setting_index
  def _index_layout(self, layout, dock, section, last_label):
-  controls = (QtWidgets.QAbstractButton, QtWidgets.QComboBox, QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox)
   for i in range(layout.count()):
    item = layout.itemAt(i)
    sub = item.layout()
@@ -7397,7 +7264,6 @@ class PlotMixin:
   self._update_x_multi_enabled()
   self._request_redraw()
  def _build_series(self, chart_type):
-  info = CHART_INFO[chart_type]
   items = self._selected_series_items()
   if not items:
    raise ValueError("Y軸（値）の系列を選択してください。")
@@ -7572,6 +7438,15 @@ class PlotMixin:
   self._cursors = []; self._cursor_drag = None; self._cursor_text = None
   self._link_artists = []
   try:
+   if self._tab_hook("_fft_mode_on", default=False):
+    self._ensure_axes_projection(False)
+    self._reset_figure_axes()
+    self._tab_hook("_draw_fft_view")
+    self._rebuild_series_bar(ctype)
+    self._plotted_artists = [(ln.get_label(), ln) for ln in self.ax.get_lines()]
+    self._has_drawn = True
+    self._snapshot()
+    return
    series, categories = self._build_series(ctype)
    swap_on = (getattr(self, "swap_xy_check", None) and self.swap_xy_check.isChecked() and ctype in _SWAP_TYPES)
    yn, xn = ("X", "Y") if swap_on else ("Y", "X")
@@ -8056,7 +7931,6 @@ class StyleTableMixin:
  def _update_x_multi_enabled(self):
   if not hasattr(self, "multix_check"):
    return
-  info = CHART_INFO.get(self.chart_combo.currentText(), {})
   ok = (self.chart_combo.currentText() in _SWAP_TYPES and not self._use_leftmost_x() and not self._want_3d())
   if not ok and self.multix_check.isChecked():
    self.multix_check.blockSignals(True)
@@ -8173,9 +8047,6 @@ class StyleTableMixin:
   menu.addAction("すべて表示", lambda: (self._check_all_y(True), self._maybe_draw()))
   menu.addAction("すべて非表示", lambda: (self._check_all_y(False), self._maybe_draw()))
   return menu
- def _y_list_menu(self, pos):
-  item = self.y_list.itemAt(pos)
-  self._series_menu(item).exec(self.y_list.viewport().mapToGlobal(pos))
  def _solo_series(self, item):
   self._set_all_checks(lambda it: it is item)
   self._maybe_draw()
@@ -9110,7 +8981,7 @@ def main():
 if __name__ == "__main__":
  main()
 _PACKAGE_NAMES = {'excel_chart': ['excel_chart.mapping', 'excel_chart.spec', 'excel_chart.com_engine', 'excel_chart.openpyxl_engine', 'excel_chart.export', 'excel_chart']}
-_PACKAGE_BLOB = "c-rlKZF3YylJN6+enoFzY-~3SjU)s1Dt0bT7TD%i7#_rWy&>x+S~ERTo0;jk?$JxHA0jj(n->F%jg7I5Zx<UI3ozgpc8vkUhx;ct8cBTeUwAUJs=BM+W=5F3*o!y?NZs|4m6es1m6?@Qt*UCxY&NP+vue*MJC*f|U#x%f)#mj-ciKO6+K)Qz&pRtOy33y{|8@MlvTvzmRkiVh2RbYForYC!_)Aq?f!t2(Zl`std;4Mc(I=aqu6CB&x%G>mb#H#yX@AyPx!75`{?mh#*htfIjfwp)@0&dGhlzcY(B6Tu!@u2k7@zj;dtvN%6Gw`a_0xk>oz|JPA0KsE#}x^|^}n{Dp&T>`0M#9;qVB+74*d7v|33{^o_%&^m#TDH*E_9i2&H|#vkZ0q1FCge58)r{h0<9$OPxF3X<zBAe9&os-C4QTS-F7V3FVuem3Mh|>+Z&*`<tuZby^>F+NYs+Kmw)Py3=XhR$h623|d?5zH_G2`cSdz^EHKGw|?Qy`h~9%h2@qY7O#{$c<|K&6Hx8e`UfYvH!pTiUIaWhAH9zaEVp0$-G0cs0R`9YE_Y9!SbO*%NXphl>eZVYci!Ll_VnWqJ_GO@4?jm@tE!qqvKIG_O}?ZQls9q;`~ZDM@vk<V2l6;oyR7PYp2M=VU64~Yy}2;MU>Uo4#$Klx<c)H0&mcJ8le1oS>K5c`_&2ZMZ;`|5#Bz@1*tmzNVli#UuHjuH0KAUS1ONx&J_o5K+bvbYbPv<1Xa7ELx?%diVLGDNbZxUfE7jPGIS9XOn>D8%Qlp%ev4k0b)gEkrDM;Rq$-joAMs?l`QVm{s7z>vr;%t*Myr$^}ISXmH9?O-jiee#`7Hg(^)N(cUM<1nHuGO4(>wM-IvsRO5D~=0v%twi(PYq2IJi&rb1LW|ugd%c@R<-Mv*YvAa6kx!U1T!d<kFaDC#isx=f@0O0wd&<!!}08<?bNlZQ{q7333w0_sH-yoOx2C5vj`N@sf1mDWDs0VO;zl=B1%#bk-}g}NWx$bJsVVSI*mx(`9`C6-91A=-Kte-_A2_!a4wp#dn8KB|MtGCGwKueTy3g@^;@l~a<5far9KxMrt4Y7IcrHPIaNn6H-M`<O@)#Ypim%Dng_J-nl7(tz@yy=$>13{Z=2qt-JH|Ze^T`j5LKKS9-S6tt5#j}bfr*Go{5%HRpWKXu4|<^Wt%dhRDdGz2z~VQSlwR~ls#eHrt60<_)~G6nzSk!gtMpEwT9z1m8OFvh*ZGVSu*cmfG_^wBxy8hU2GtaL>r3}DuNBq)a-gw^QMMIN2c@2@E$#{u!ND(UD1SHqkC8a>oITn6|*{T?Q`9%@xj3b+>6kKnOQe7xbEx>^er*+f}WUddjutW=-s?Bn^zDH6qgyxRsNr%%__h7jq;q1k2ClP$jb=1?(FQ$%+tq-v-U5CMqU;FRppn2;j0tjx`_giFR}b*S3b<)!ro&g_UsnRnqMTr8CHCDS1hYocd#y$cvh<Al}uFOL_HK$zvj8n$N5@aMrHSKB&!HBsC3lAwN}|Z!n0;fH;TQo``Iu{u7X+5@vMez#cScR`RYV*eC)`+7Y`o(0}yB!-(MM<_}xBu8NruBhxfw@7vxRu8$bB+UY0=lljCC(`--^0jG<<N(p64B_##hyCij0p;R-ay^-FiV56*!yw|4jD#*NdU|8AUnsEp5nyqIiQCDaZB6?EgTZ+2Rbpj4-I6%{v7^*~iT<WJgVYY!>CH#+UMtnu;`uC%sSJ1gIH+IR6cWu)qc_`GtWv+@8m`1LPOKVH6!ZFO4j;lK9z?q@3-7tWA|d6Dpd=WCrd<X#tj0VNmI<MYZev=7?-Ev0OinmYrao%U_)JD3QqyX!ZvY+gOrJ@WxVTW;l0H{KbnKTscf{Bfs!1{H7_{dSw{%o3$Q3I6iR;}a(tV(aGslXGND1SEcVY2&X~yKk+a>OG=7UIxf-<1E@nLb1qL&C?9S&=qA=8K2k>$aLD@A>J#euw(60sBX7bH&$<TPksSSZd|&v{--b2&z$Jq`Z$DSHW~n}Ua@DjQe{>jRhU7eFy;Kr+M|H(f7x8U300MUojmw53?|}GwMtE1Tj~Dz8Q{)L5inmi-d`nkon&~~1O~5~o@WKpJ4nha72B$oS;3~?u<Ns;%!KVV^U6UI)@C&qv7AEDKvD<h3DdmQKvjYyunc(0qFrvzLCUZpra2QCSP08-0b>6VtL-v|AjzyY=1i(GgtJaE=b&k|d+RS7-+vsmv2pp1c%^r+Xg1nEJpR)MBGsT$?H~C2D83ReU&L3kD}=Sc8VEBPyu0}5;B)uVrOhwT<EzKAPVv`&!`IDo-@s7d>s~c4uW;&r60{{O^q&`%;Q6Nqr}23^M-ZP4z-9cUvBO7-NB(e#Iy|MWzYSLI8AKn-tzS7$e^#&ar;Tf8VZyK7eY?{-FETG&>E2!GUiyx3K7O2fymB6A)5=L9RW7U3xqk_GAxFQJNz1h@52p%SIO=B28bz&z-hAY|@RjL10hdfc`ZORMtS|vTP!&{9cBnxHvBjuTsXAs8<)yKkvKTi66;vq^StP6goI-i#lI;b>8?FsyeOBwJT`$J~S*}YxNJTk8j6iHKT9oj$2=gTDPdGAEVyT!7os=Y^?kLT!sgTrIhGwD$tG+p3Z5AtLsp+_Wp$Y}rs@}Al5*>MSRddFw#uELsM9%_IQ3lEs({h;tKdQ_)P8Cv*xbv2jUPS#^R3H_eGG|>orOHyxu1f@<!HSSzsb((qEa3Np;P->DRCQ(p%w9079<P_4ykyrGEVr3fAu|UVg;CN=$!(O<>de@6C=5C(GCO14*c90H+z{vKIm@1%Ylb<`42hh7A<nE>%{iycPyszLvM!aXAlHcz^K8DtYsk5Uh%ng}ky4T}kCWCbFtLszKs;~Tc68BnXFb_Cp|WJ!&;ytpZyXD9sWN1;ztKE48&JZ9h5}hEKshj381hj|!9!}GqM$`qBt2Hhm~X%kSsFu$%y@vMv-V?!2?+z%VqkSGoReCDGT4Oz^+N#6BdR(la{&_)l}JPu03)oz*Gs4oNX8&5Ts!k9CiNt!Kxh_-Ei}0%TVwMmMfH@bOnwG!@%0xPQZoyqu#Gh&E!24wziBO@G!ELq7i>jHW#~A{<RBkkvan#1Iw;Cs;{|m+ZruR)YZAAIk9<xP_{?C#USNMDzV0*0WR;C3R%I4vk>b>=ez9W1c#``uWp+SG))STj-3CrfOo(cvq=ibJRW1VMu%t9ixWfTT#O4P<m^x~Bjj9bGUTY##=rpa4k{^K0h@+P8X*#(<USm#>qtkuoWy7>xf)Q_(W24y~$hf9iFIgIv%_~}!)X3(1qiX58V%E##e!xufUX19YDKn<twCj9137Thf4RFG`Q$t|k)5Gv|9Fbro&;UlPa6qW#N)??RLH>X(Ke@!IsBcuN$6jl`0f-+{pN8-WW<0Ju3}Pte|5yI}qsX5~5m^|Ci5;eqvK}nRG3ZQS(Y6M1c2Iq(h_1_;gU(b1R1iziq&z|sS%V}|3}jU7MY2f23~{8_G~zI&Gc3s7c}cE)hPl3+8$%_ck`^Sf7s*Jg%M{ZB>R4gdSt1liWmHeCfvRjFRsqwn4d$GV)<PXO)(R$Nw1K*Bp;(`<Ny7n2DwHF&H<4#9sc{&75{55e_(>Rk8VuBbV_0JnU`^U6fl3zfqeY?+nI;?u%2Kl``Kgus-jyWHI#yB2$*K&BcdQbmWEDnzynrs_pfIMO3>%{91AoE_dY}f(d$1r2T^m-yinN5GzKV)40Mq5A8jBgsHq6C@GYJ23Sqls3krmhD%WcKrmSaYB!;jVtwiLL%o3<>7s;o#-kU<Hy<$(;>w3eFTUI)JQ_b)?1Ng=>GdGg}tnOURjiK<N8Q(KV@6H1BimyrIG-FjpXfgD^sIG_lGt$|g=9bL?YZq;Xl!V9Ej@Kg<yJZ_XT)h?|;L}x(|gh^!9m4(P2M9S_*V&5e~2~Ur2prmbM#CwmPWAu>9u277P@E7g+Gb2AeI8~sCg6^#|-M3cP?wwyhcd66*G8U{5c!NdELi_y2`+r$K`A!g^kn7(1OHk^(LM^tw-2ChJ-P0GCpEeq|Kt+wQ1}LT_6R7~zu2WdV-A?;Ua`&F>tb9fe;2Y>dK6j0~W|<4L(*iJ8I<2cL9%ALsROKe3j{gAr)69p<e5IY%ZA7*81JvlAyS=&cBhUaA*^Sj(ot68Wr@n>X-OsOgS{L8}p`q9L2KjLB=Qi)(-MIZ`_tLjJMS#jlL<(x$ez<<&Yskjub7wd21HSh+zWQo}C!P3o?cwRQAJ1<5c#FUaXExICBL;$o<r+2g4*aI*jdpJHYHRKO-$s?+gG%Boddha?fL(GO&#5#yk+&;+1flo@sHsakJ1ZY{R#wpGyz*72{lnVbv(VAN4Sx%XiG%+IwS}=BVz^poHs1UcUHRv~?tZpH<hw2A!}>>U78ug~{G0U)K=@1OTVHN1x;Ch{y3&33L8tXy_ryIKl`nJaAO30MGkCeK9G(aDxyHB?S>o|>i;5w?0PTs1u5nzj>nk{b(6F^c4R^o!91vSS{Z{wK_c&3|iOtbse{d&qzG+uQs^jH?X$&fZr@+4k_h%cTM>SBd(X$PC2Xe&&lLw10j7?0U7kh{VoVj4yu&z|0caboFXp=?-MyBYYa<0-al$;vqS(1^#q$S8rP|r}%Xm)vNn1l2}XImW}F^748=Fn29EB~wvg%i4-S6nhW7HUpet1CN{;k+`kN003EmgZb-&u-ufu%xyto{Tt`+prALMw?ctHS^36z`e~pb2}9qkcd$bp;*Vaq*#aA2Jo9@yaLi3sD%5D0TE-;Fqctb$FOK4KtrZnN@FiLt~HKjjl(ZKkKGmZ1R&9gl)Aqs?-}}3Ns5Y+ddj*Ws_ccXPonjMbcg3YV!MGpVk9z~704Ap%t~Hy=9|Ta*_<P%zyj-kfz*#Y@F7fSSW}SI$|4a~HrFhAbC%WgWZyvqP0q-I?Tk{@w(3n}Xi7>&7IWpr*|cF*lBa0YOi8R5Ob7^>gEFK0=q->^BrQI|^~7!{w7OTTO1QSbw1rtg6OgULf+9dz$20KBFlRjctBEW<C|I^#sT{na*&8c|Ha;sF_6};)%%c{hc^c0|(%N3L=o~GOt{&9oz$w=YVMl<uR?S(6H;hV8h#WasASo;~H9Q>&Z85##Qq`+Loyf?eZb_g(A{bbJi3M~?2-T#Z>>fc}1q9M4b`K{RgJO@MI8h&z*m}t<%~{62x;O7ydu=3hX--oUORuUw6`m2x2}Wj;0<iw4FE;)LOYaS_cwD4_NLs#^+rjEXE9!TAH;OM#7jXY}xur&15b6Y9;KhP<8kU^R>u34qGH3~{%Lt+MCh#Rtq1f<&mv44fuFxv;J*<Hnm+!2<bCwpj+e)mFUrrnxADb9EbZGC`k+EOC_SzAv)_Co;0M7aDska}0^m!U{6a6JQN5%)A_PSI8hoWlwV^y$xyvVLVWH=WwsDst`z2hDQXh%I`47Bu6^e<xd#Tm+HQbQY-bB&i_#^7SJ7tE!wpLN$+M8Qq+s)(kPwg{T75L_Vya!p{#nR&Ykh7P_)islJcSb_6w(Oj~;qKW1-S=G!5%c@0f8l2Lwz@d@@#*HQmK<*+l0LPlA#e9QSqUS`Ku?j4;g(yX$rN$lLU|o*^6NEzh0#VYZMxRM~6A{g%^;BoBNU*&%bZ5HEze>JQte__<%v7DyQFN%HKUAX?dkTg9w6aan2-*&XL5hKzPWq)h<FHwuwKRAbx2jbSgA#|qqz~Q^5H$#i2wT?;G8>RTF<D|aW71r(#zH9wrZR}37idHal0?$wI^$Kxvox$ZK8KiiY%NPzMgk}oZ*^EG{2rDM<NN<RZ_CDW@3=8qh6B$5$QFXZw4W?a=Yff)59lGEvnMU&(>cp5TQ0f3kuM~kE%J>iR)r1C0#cR=bEiO&rD!-)$T`d4(Z-Q30ZV~Z=R8FtxWEc8U?B!l4=vFlhAI|#9a_LL7#421=z``QfIee9VPROBM~f2AydJW}Twqg&MFW<N?g7}unZ$tg*aT%FW-7|Eu|6c{64Vm@?}aIQn!E<eZxl`fTKS@OcYvIz77<4-DEbBLCz~Wehey~X2?+pG5cF(phSN*eBT!Q24Cm`QV=$R<VoWs^1Zo!NJrIjaa;dPS=m6y!%#Vs9ki8POVMObzYF<jx!=Y#1A<T(;hvM)J#&g0?Gzf@H_fZUXMSX*TKURd&h^p`?=`zt+t<XdQW6E0Mit{$+mWSV#&xzD<Jc^;~O-9JUilj;{si_{3;ZSEMkRw6Y?L6y!IB_I8WHjQdw3Fna@dC)EwutR)SL~o0+Y2n@Rst?UQHtSCo0mEq@+eIAz&wPNfjAD$)=-ZJ$EFN{FgFq3a7%-%I$YV)B91Uz>DD)$*0-J3c~uYCp@-a*Y$9ep4&->mavYCx#o+GRL=8SqaRADdses0Kz^0%y%0|;E5{c~+x&bZJfW3lRaxAxGsi7lszGgsMbyL%gnq}5CUHRvNGGsg_nG{Sc2wx$9wmm2>1e|adhSCyYvep~ErZcp#=)fRRt&stG32@;m&4yvAXnR3-aTKJH7Vg%FV3OYYlR5|xN+T{1KLj?NL1_+%RP0QWbC#MhJ*yb9q!wHKOGvsH+XkG&EVD3zF42_(#;X%ka;WljyzZ6rS+#fwbD{<d=F6yr5zO%#@u0t+?FB*3aVQuXm{Ai0pylG3Gg=?8t34Skjl3*=Ji@FjFA{b>Eu38_{gPwuNy9F<*r33`UgColAreve_+UMhYMHKOCaVpnlnmnC2WK;>HjB;gN5UTDXVN01Yn0xh^zUO1G8Ayyk?oi@{g}9&YcLgUa?Wg6WW`aS<%qTe)KaXAdvNSOO;U2;@n;qpr{`o_6#yCpfq^fPcNAU?7Em$Hf~E0fk}f%2y%MtwqrO*2-4E6$7}dsJt7@Ukn@4uq<t6M}TzR2@0*dB^Rh6w)35_LGV>v9QrOF(~;KxH&khURiqF$<YO8^oYF4PxU;X$L=dYu#me6&FX&{#{Rd^qHJhE8(dFc^s5`la8Spgt$47uiVl1(k?GXiEXLqC`p!<blR}Fop55wa8K>%M+>uE&|eTBRQ`KvoCcl{OqytrLhQx9)~s69WI)CHE53t=OV#LePmxmqi<%nlQ76d<21F75T^iugw399o+nInl3f^-!z7=G^H2vwWDIJ)=sNQ#K2TzX$7_BLQo@17sHnjoq8uY3vVZ9Bim<pO76+OrNll9D_^E6x?WcG`Sz+bzDC^cI&=zOFQ{(a8{GG+yLP|+7AA!b+(bd^rB!u{q>7n;?g4L6P(`7zPfRZ7E)qysXbI#%+R7C4dbJmK(8^A+FoH7uXjfTf6Xpao}TsoEL8PYL7+O5L^(iv&b2#+)~LV7}dz;n21l0Q^**@_b=NE8H<qNoVCpcqx{qf9<hA<__0UCML)M-RqKY7<KZBpT>2ON!E|hXE!6kBHsdXP2?3lwsaa;|04~P3~a!D%^X^@(HDrBnL?C<)bdlK52YO#|ZW=Bi#$Pf<v4mJHm`_xSkcXqYttRN)ek!B}U|j|8Yl-j{i$TB~V313kop4QTfFUl0A?HRdv*qZCvct0V*K&aBD|pb^u7fpmUYGMv~HkSG50#^)Ma`U9ceFYIa?Fb_91S=IiAETZ}%{bv+SkH2}v&8$@oICD_C>nfwy1^*q>dy=o0GSShmg=g89mJ@k?zD@C(K|5eY`jJXz*3ZbaDwP|kFNb%2D**Hu+<7`aiCuQ{$)%Db2q;1saO;_7%yKMC>fYGzRUaHQQEqp{ptAICo?CR707<Hn+`jS@;fWqssrIe@XPa=2ZwW`;aUP_b#Q!ap6j$r7p*bOCKqhR8wCK@D<Cc~w<%89wg5w`6fmftF$_qKF+S9@(*N+LMgUzih1fl@UF#L`GB6$ixgOiATO!jrw{r}v`WN0>4V6S@m4fvRwlJ`7^mIkVBIlK-G;X;e>aB!FxS9>dhCGb<ihkglFf;B~-!-Em)Z?J_AEkwM1D=z*7v2qhQHYAPk^Xnj92`YB{2fIZ2`N~Dv~??FbY$EoCpWb{Ka`XL$pI2i-Ho)#G~NTlv-sa9300j~Fy^`$<85Exu~sy-b*Wtt)ZOFc(Llt~|#82GI&LA~ZWi9LCok)C;Ffkt?N2A77F4`^D9R)tDuuS5vZ04Z(P=4+GKMi8Ke_4FtpbEzL7_?-gCTzaw@NH7T)H}u(X2e(q-y)n*g=q!v}Wbx!J9=3p-o^`0|G!MFEGE!(F$n$1^D7+pc+iRVgpyH9q#~>ty3_l^AvQ#l3#vy+Bk)*Q5uSJpo;hB?xdWW&x;XM~pcpkLF!l@{d_hSD5?w=l<q$}arEfMip?u|R|D~J5%oKuH49)rBIW|j_4?xa}b&dUAq{qcZfXq1ApFi2Yfq%bak8QyhwJGcJHR~x6U;ngJHuRgwXoJC_}#Be;u9HY1}2rRgZqkH`9#<_>xdsjtB^0l>l7bp<C&4P-@4<6Xb!pzU)f+#Txe_o~AQkEaDtYXBMxDD^d<4?X7vCCKK-jM4QHFio4Pop~lPqM7_bMHWT7I)Tt=iN^0U3Pn4S}ZfWv@aS&x!UUnk|2_vZZ#ZLf|Fo)OQNvL@%hSm{7ptOJj85dNCBk=?;uGS%0QvDd#Agn&URMb19ZA)K7g*~x+nkk_@j456%n@%^eH*D8CZ!hf}bG+Xl;IeqWjKCjGF)MKHX>XKBFqT)nxtq@4KI@(tR?wHy^#b_Ta(B$3V^->!-fyw2uG1qPO=Q_+9bPzQe^sM=(5K<k_Jo4dE7(DkX$FJEnJ_U|m8#n6tbWBAo9D!!9Km&@&EK6#It{#HC0_K@_nq!vp+GFpCx}p2T$iXh7o=25-f~t@vrJjKD3ncV5g6)?(pKLA+LpRiIW7axz+LF*xWeB93xtQB|QIFj{F!E5+iY<c+0R>(kL4vdH#b$l2(3WPOso-001qdZ`-7BApxKp!iA)Mq+6W*fb@Y>PaI$MYLzhwali)N^8+r&1hID4hIjKjK_@%3bNo!=%(O7!!r|6-tpkYzi;fz|M(!X^zg2f=`>IXPuS;wumB#>-p`BR=?A5E&<?Xv*i5UFh++6e793jWf}6f(t)>_bb|y(iqoTf%$Y+3+?aGLLY()KU4Gfawd$txH)H4(a{fVH0%acbAE)@Iv@?Lz#d=o{}LkfLRRPge!V_Oa|#F|rfS@U$f#V92Pj~b@q-;HE2Mh|J8#vWX<i%Z_>);JU4&zmlPI%JEq!&b#|t$NAo9W*7OCmgr|!TIf7OQ=l<7irHJB(Y)%EVSsUx0HQQacUfL1B7We7OZNzKtZA}O9ULy(+X(OBcd1aba|Pecvl6Gkr<FLkRuxK5n7A5bW%(@{>rmE7rY`}ErThNh9roD=w!MA7*O2ZfpXTYLwk!@C27I--Ac{i6@#rPoMVE00KCC01(mYAPY@}r={<`Z-kh`eiiyW60)YbP^{>NsW(9A^b&8C<>0aFdT)t8)ixdObcgs>wa<iCSTI`^W!Q9d;$}AZV$k+(u%+y#t+yf%Bs6f|!Q*d98=s*FeI`4syhq4hC>laZNHtQ@{Zk49_@X%1oO$BLc#8aN1KVvS@)J*u>pLn)!btV>RU%p6}&ax<gbjAcL)%NDJSTIRn=EN~f(K-_gE?+(7U`{%-u33w$AZbwpiHKO**AJ3|+iPfFFGE{M*#%C{k|N$xT0<*7M2W_rAT2S(E{JMDL`@Xp2hz4mKhb`$9BPB8$4_(3*&;tDdHJdEaUUKga!}j~(&UeJLlYI)9ct;?4d;4{V@(Tv!Tk@ZXFUfm8Ge<*Fx&F7LXwEB>7flxGQNx}KY4y9YNjf)<N_)`TVr@FG<{K4_hGAu8YJ^r>fqx2SAe11K`qPyy_%fyWr}x=-eif{er7h?FbdS1J^`P-$h5Wj!h+d&z#78M(;)CUleq-+X2tB?cH+_W;Hjwa<AG4WkfNocp`HUoKhkwUrKE)%-K0wyN_qb*das;kNwkZeA_)dLqXxI{q#~@N48x>SiUso=M-QiDL<jD}Z3A#zNS#QWw3otf9$Ab8$Xwcw+dR7^okhwGnu%;jVgWx=eI!=h@7WQl1m5G~kwZ(x>$-AV+BTKo2v=y&%}|=_+ll(J(8Offc+6P-xmC{uB6%LrIbCn`lbxaY7&RK_c>HL?gtTVVo2R~H<Be;<<+wcjih4)y>=G_^mqN9=U{<9&DSOMBh14TP%yE_GKq$LTgFFbKza`wLWK9Q$RQY09rF$Cc4FiS&m&-aD_`EEMb%8R8b0}xJuIX!2LwLdYurb8lmsWX}-H+Qaf*~nF?~9b7VKaGlRT=)`UR@w1b8>4`YHD=H@HDJQ>}7a#T32>*uf!a1pH;2W8F9Sh&K6fca0f*x>Y(6|#nEB;dQJh!CP>WR#X{qNd-llg-q(BiJ$ix0L&<p_ZLj}b#<GNQQGi1+MsaO{6PZXDbu1&5>dhFPIGki(Vx)SVeU+pXTtJXv5k{@Sz~JM?p4s?4hGvosimM^C5x|B`&!y_6bJ9A?)dPGKm1VW9&)S>NGG)-ieUy-`D!F~M(E+R}PE=WHvKM|iX0BH>7OT9JB6+1KD^@5?Jo|woUVVJ|e)ry0HlUeahoo-XTW{XRROf81Hi)ie0-A-7rW7u_=AvDnr2t^rFL(&1k>xgp;>$ib6GWr)PtrsJ(ihD-i!z3S^aoew14i_dTXKYYWam{}>m-1LBQe_`Wx_RJrZ(p6l39)67Jl?5IuB<X)R;kE?7|Rj>GL~s{vw}TBKUX67}*_(iPn{EinR5tOEw^n!O!lbj3E_As?Y<eiS#kCbhI0;*WAk*2*SEW7^zot9KtzNI--hQ2E7bEKG6}@>JE}entYyLi}ouks(XMV1sXe35cwKh*oOG#TL2JJNu`6oNFn-AU$kGGvkRQ5H7GiRSM~a+dg8Ug14nV|J^3eWE0vU4Y&AgDOt$P9oc)B}S;VD0G1Jo}8<dg!u%r%4q9{YuW=kNC&UXsrUd))iPv%w_KpyoP)|5d3a49Hi!6+2~kp6cYq%FA5d$`WSAxm+6kLG&BUT3Y9e49Eeuuk6pi^s_EzKbBcK+0QH5n&)QQ%y;^gwc@0>oPw)n24}r!GY;6r6(gtTHI%LH1{AnM88<(emX|F#*$%`Mu26M33}8soHf!K#>}D;fi((Y?G%u`0$bBTQe=2gJ4vzuu=F#r^wY5P2f)(L#L`d0l0He(zq3&4d3J_=cqoNA(qZ^pfFVA1(;pSox9d%lPdap59021niBvW~|A_$7XNCH1N|GCm3skbBP@(a%k*LMv?ZZmiz!B4_$~#8rKECnc`qy{X?|q<*9oj#t1lRs<Ucb5d@Bw|-I*k9sH#tW1aqI5-+kXx}ejUccc2C^vzI}-<^pzlXT8{uI{O+`Fi!We*PrE+HJ1dvzLwd9>IT(k9(Wdg3soB@zf;)M~Ctull1pZUQc=0j&Sak3)yPe%L_qr!fblPukp19sUeW82u^X{#WS#)8fmDU+C8axV@eJYT`X6f$VcPU2p8|uYfKq}Wg`{CM;?>&C&EU1d?hRE*aI}~qvieE^~gF@kL<Id&vPwsSDH?aHd<&CdDUH|aC^cdXsdG<x`SO97mYU=sDqE2y4BYcHJ7K=zNfvsxQXKnl*Qm_=U1h(K<bp2-0wHi**sZ$u42yL4K!#ORmG8T|oq%V{di$Rc8!%3-yz`{>{Vi_K81AU~DvaZeR+I3KWn%YpFDzFt22eH_s@LB09)bws-UQR2qLuejV@(2dj+ajzrv<D#-Gve*Wcj(HMJ~K1pM%L8ZSjB<CCBBW1SFh4H_}Cq+{6W>zFUBext_8?aV1Eo*)L)^G4C;Kdvg5fOo{e8pP)m(pKQn?4luDmN1o2njF&u9t<18}Tz3lTmmGH*crnjJ`gqLI>T=Et)7P}1K3h+O#FitI~4GQ;HF`?v?K|&YcVXJ2b6E|&8@G@~#Y0h!j9r}3iIG8Ze`*yKsl*7n}cWMKf!r<)0?lqrhvCDjWUdAikw440QGqxDU9Eyo;NCD++Tbmu};BnSgS<`!f5(z;!xL8OB!MZ`w%4F|0lUQb47aLv+?ONfTAnesR2#x>N@-_bY(r@?up*TJ<HaWR(vUvF5!6SJk^IG7v=)7!Jh~UURh>mFS?y?{?=Ile^%D*Eg#;Krk<%3PeZJE1pf@{tBCVq%BcC~gQFh3K{5=X%2e>1;~w+*o^M!t4eu5bYs`?Lk?9ZWg2*j{kyqEDKkl7Pc95$iFz!{?)3;>Te7iH~Tp5B^N~6bkOM*Qsee{%J5j7J|c06@=f9&{Q85=I%0ndbfM>B0CnuKE}It|BJP|Z?mt}Ca+kgg9YKj(xAP*V68MF-y+0gb7;K!=vvPBEL)V)Z0T75m9cC#<2OfH6!6qXut;)+W<E|!S(ziZnKae2k9!Cv<A3{~2am9!{Gz9L=)_r!s0LvSc={v>T}XabwmvJ*MLsC>-8#mt?B(ZA#OR0b;uAAB2%)5dH0j(Ve{@fv9W)y}MX1nQ1~KXeT@OgyXMlOv1;=fXJ$eiuEe}baAMNF24UZDUPYy|QJbKT0P^Ek6JN!IKpD(_U7QX(;b$%dBoHxQFchYgB)lR$3j~ivQ7T75Y`xJTj<#DF#Z@hoMyK;^jJ3Yir^6I1>Jy+SGwYZ3Do!Pi{k98#kT(doo#ZroW#U7Wj`ss1)!NCO%tOsfpRfyJGfE%5xI}?5>1`j&6!Qdi$?NX=x-l*~hhj~od8N0eZ@>5Z}C$E8Z7o4vI&`_BKaEPdWOpSUmS)e|-+y{%>Pxj|k1)5TR^+pKb*sqj+z3SPMRIJg|mS*%QKe4J1ue^(+x_oBi)DJ*f8tv2UnI9%yK1-j(>GzSNwI4s>hcZX_cj=?&InVSv&&j?NAFeOdq5oRGDt$@g%jB1n*55k|Ed#eEzRa|8fAeaKmEOq@=HeMnY$UdHU?cpTtN7wPJCzGyS!-)|&*I5J{00$yItiTy7pdzj^d*MCpuUVvtlht|`ROX1>by=y^_%M-{2+PzrJ)e2Xj1HQ<uM_R>2q!dm?yA?EEQDzN}FGpQWu6%|6dqUr!&QAmc|yYWO!<c)-gSo<{&xUX@elR#atm#Z;k9*kxf<UO!94%Vlare*k`7cf1Nz|at_5})|v&AHn|EjbxZcl@I%Lp_t10E!y%EEKGV+2@sB8Fjzc~LiM*ts=88qIN{Sd5F_mK<gb}Ubh=lF&58JEBCa_$x5i)y&W}x;oG=-=B!HA&d)FETo7*ccpA1%IDi2"
+_PACKAGE_BLOB = "c-rlKZF3YylJN6+enoFzY-~3SjU)s1Dt0bT7TD%i7#_rWy&>x+S~ERTo0;jk?$JxHA0jj(n->F%jg7I5Zx<UI3ozgpc8vkUhx;ct8cBTeUwAUJs=BM+W=5F3*o!y?NZs|4m6es1m6?@Qt*UCxY&NP+vue*MJC*f|U#x%f)#mj-ciKO6+K)Qz&pRtOy33y{|8@MlvTvzmRkiVh2RbYForYC!_)Aq?f!t2(Zl`std;4Mc(I=aqu6CB&x%G>mb#H#yX@AyPx!75`{?mh#*htfIjfwp)@0&dGhlzcY(B6Tu!@u2k7@zj;dtvN%6Gw`a_0xk>oz|JPA0KsE#}x^|^}n{Dp&T>`0M#9;qVB+74*d7v|33{^o_%&^m#TDH*E_9i2&H|#vkZ0q1FCge58)r{h0<9$OPxF3X<zBAe9&os-C4QTS-F7V3FVuem3Mh|>+Z&*`<tuZby^>F+NYs+Kmw)Py3=XhR$h623|d?5zH_G2`cSdz^EHKGw|?Qy`h~9%h2@qY7O#{$c<|K&6Hx8e`UfYvH!pTiUIaWhAH9zaEVp0$-G0cs0R`9YE_Y9!SbO*%NXphl>eZVYci!Ll_VnWqJ_GO@4?jm@tE!qqvKIG_O}?ZQls9q;`~ZDM@vk<V2l6;oyR7PYp2M=VU64~Yy}2;MU>Uo4#$Klx<c)H0&mcJ8le1oS>K5c`_&2ZMZ;`|5#Bz@1*tmzNVli#UuHjuH0KAUS1ONx&J_o5K+bvbYbPv<1Xa7ELx?%diVLGDNbZxUfE7jPGIS9XOn>D8%Qlp%ev4k0b)gEkrDM;Rq$-joAMs?l`QVm{s7z>vr;%t*Myr$^}ISXmH9?O-jiee#`7Hg(^)N(cUM<1nHuGO4(>wM-IvsRO5D~=0v%twi(PYq2IJi&rb1LW|ugd%c@R<-Mv*YvAa6kx!U1T!d<kFaDC#isx=f@0O0wd&<!!}08<?bNlZQ{q7333w0_sH-yoOx2C5vj`N@sf1mDWDs0VO;zl=B1%#bk-}g}NWx$bJsVVSI*mx(`9`C6-91A=-Kte-_A2_!a4wp#dn8KB|MtGCGwKueTy3g@^;@l~a<5far9KxMrt4Y7IcrHPIaNn6H-M`<O@)#Ypim%Dng_J-nl7(tz@yy=$>13{Z=2qt-JH|Ze^T`j5LKKS9-S6tt5#j}bfr*Go{5%HRpWKXu4|<^Wt%dhRDdGz2z~VQSlwR~ls#eHrt60<_)~G6nzSk!gtMpEwT9z1m8OFvh*ZGVSu*cmfG_^wBxy8hU2GtaL>r3}DuNBq)a-gw^QMMIN2c@2@E$#{u!ND(UD1SHqkC8a>oITn6|*{T?Q`9%@xj3b+>6kKnOQe7xbEx>^er*+f}WUddjutW=-s?Bn^zDH6qgyxRsNr%%__h7jq;q1k2ClP$jb=1?(FQ$%+tq-v-U5CMqU;FRppn2;j0tjx`_giFR}b*S3b<)!ro&g_UsnRnqMTr8CHCDSD59MOw`jvCd#8<^IYi2e623Gw|h8}RfK6$I%?s9s_Y)&Su>^^MN!%PEYE7#Ry+$Az*i@V<6}qmy?F5OAE2wl`2Nb+#P9aO%Lu+4I=mm&svvK2-}u3o_p$`apBx{X*jL1*VhnW*l#_D$!54YrGr9i*s#Bo*tzWv^eQ*xcvbDQ6H*TB;O?KnlLuGspX8vTuDxsbiD3cq1eY4Yg1f@EytEhs3(gsT3A%D^?TYE@-z0qm6W!;shaP_mj+FALo)4q$pDI-<O!{?O~os|cmi?4rq`tkB*Y^&3H5C65#cRyR%xNwGa#fyXoJYVayA@{oI3#hB0=$==Gp?%QPZz*NF)Z7^W?X+)W-$B`L-Ce(VW%KH}?wJn|+Hxz0TJFwZC4u_T<BvP-GpI_-=(pQk`;{mK>g<<S9-lbL5L-V7n4BZCARzI>OB;W^+I?#UmFN-W@iIVu8|T9|5^qJuPo8ENhOQ{1%J{^7K&I3F4)I<&g&k|3LdChYy0Lnzd-4lta^upS^*?>Fe&$5?*2f_vv(W%(^@=^Kl`6CPsKQJWg{j$R)*c0P|I6m;O{l8;>*T?gVK5Pgs#R+8+DiAw&j5F3RDdC}@%}0)-Xx97CNO^0^gJt&!$DGBsn}Mv%nCOBhFzZ(WhQK|nO6>y*fp!Uhz%4@a*`h~PnZs^21*YkfsW5p7VUC#4pN2<G0oZJ$3j?!ivs(PSZ$Xv1W9JKF=tYhA)IxRVFpdB-CKXz`2ORdjg8B9#4EjnZL-n+;qjk75UB>0YX89BNAZ<-`69lOg&_2P)<Bra;N8VX2cNr_E^U5!9$!6{b&9|K8@_Iy`v!&rU-zncd970alb|hOq5r(71kXP`IE~NSIfD3X050P%jU7HxJo1M_)Zr<0{cW&U&mj6xZvD!6`m=hSKW$t)3lo0r?%SQ#d69YHO84$c_tJNS^YP=<<CXI`n^sN=sd8DJ&izZk3px6&Oj@pOc{o+r5>Pj5)+p*9^yVYyg|AF=3Akhm(x(C8V66!FfvTXQu|o|qh%H8yO4Tu&C@+oOl*PCqsGv%T$Rc3{;1tR;muxR6-f(Rw>$6%%?Rq%|$Z}okK`P1#VgzD?(V~Q}MVKdHf5MTW5=+Hw=%nrtbw_D-O@*Y!GBgu4SijBrYO`1|OHIf13soq{*5{_(l<3HttC}-bHJ0e7C3+T!iZW29n3l^_@lj>QajKAd#GSXK^df4yq5>)7lsW6#DOHwgc3mO>4OWB%OEq(;X92$-1iv4IrK&R<VD^Gp^?1GX<R!blV7bk-3Yj^`D2$R`N^YZ+R%gbpLt)T1k=YsR#-_lo=Y}{>&sp~DTr<phW=Q1x3vp)6YR)-jh6-qWk#(t51-VX)m}m19UPI0;M1;w<h?J7la-6hYfr)h#0pfYvwxf%tJL}1229+fvg&x3oc;i@*OO+v${f*|a*?<x*RQbvF0Lp>!!H|#Y{2o#R6$LG_BI&V0#(V>Y$kG@}WRL?aowXk;Oh_2876Yqm;hfYGl))|(s2>7g9#PdfnG2YZs6-;N02pBvzFtC&Kr#kd;o6x;F{vj(1wykxY@x|D*&3TiDXOPbW%4s<i?6@XkeXQ-g>9@MX`#-e_)TjGrE$;>zF;dtDnrLnCI|WWl7$76)Im}98ZW5paXSULUz4~!eB^VYz-I;<_5%AO@pYd`CaY{Tu`07Tixj6`^@|l7#*-Y0DYFAgvYxOM=r(X-VnS3SB`s9)ta1@3hb5(H!d(YYA~rt=!qid2YgBCj@mdp^LZ@kUlq`BSBaT|Wr|IO-c#XL;j!yTTmkrZ)2}ZnCj*Vt}Amf^5y<}-vHm_(^QX`x5jjE;Vidip{BLOqX4>6*Trp%an)2{R7Bxs(^HNXk$P7Q&rP7lM=aYTZVKvNd6!U3U{D^+w~1o;ED{Nxg+qP|h79(%3%1|WV+eHy|inDMysFo>a;|6lp@k0O5}MPy+lCU%%c%6hOM$DlKTMH>{z*+KQCB03>!4!T7ZP(dt3lkx~nWDSx;F_2NQ7s(<8GsKZz(}=^A&afbR=OwxJ8Rq(OZVZ)(N?MS_UL+%}E>lbksAGj)XNgc8l~Fyl2CA}!SOrYOHkg|^S_^gDSSy&6(FW?ig<^faCJhH9sZfs8-b9|cq{d<RNf^F>;U{7EX)sX#jbV*RfHi5O1S(m?j~0nSWSVdsC`-+%<fm5hdsmV)>sUo8C#y0j-myxMl2sV>@d7%3gTk1CGHi&Z5Bv!$=z$tA@4<pBbZuA(E7B5%`YI~I08E#cYAj|j+b|as&LI5DWi2eAM^;>qFSiwgTaFpk4L@2p*c{;YZrZXSs<I+UK?Wt*<^?ib(^_hVyB7G?-%|_)C4~U%<jEhOXJ(DAC#o`WPi;lEJ}4!=^FjJgcI%Pd0CI5gZT=z<wgy%ecXTmlxK*DG3NMhB!BaI*^0-mXRJ*hW5uF7=5GIjXR~90>2`T#+i5-*(B|JU86_U0g5$`>Ej?qIZyFxL_!C$oN&y4)^;8cNP1G=})bl+NCyLW#5+@((I%UIY!;0+eh2krA4@Bd}}<U2vAL9To2FF~pE3bok!a`Ug>cTZnne%fdR0u?pJ8lae#Or!!-yG{WPcRTGb$=!Rhv+@}^fN!7+`P?<`nq@A~P7A<X>9nr0$cB|aQ<a;DI{pLfPct7b^Obg5w-MFW4^X3f?)K)&k3a)hWH(lCbyn_gp86JkcR#=0X<dK^goa+{8|1^ipWD2DcjNY(-Amu@6rm<35h<u~`{DY9uOS<s&z;@85BT2S`0A?>o^;~VwTGwIemuMJ<1GR!oY_djj~ECVmTT0|JMf$0Fxt7ztF5*Be;ZYP4=RbX=qcNk19r)EJg3s+MBc9O5rpCspr$VE?5up)Sy@4!^U7D9_77`!&q7B7H~cLmCJz1=)D}i<h~a9T*?99)bmgD_y8GD*k?*#c59=SbS%^pX^KaHK0O2p8Z+*G7=-Qy(>Pq+B2c6b;-4pj{RKCoufB2`3&*0^{a(Eup=NjWqWQoViEh>im0<<S4y2f$AuCL$#Lc`V)HQfE?b3knU^jqB@-{V9<CpJfm{lPuO`KDbJsg9QmrZK1to&x_G+@EcT9@Rj-M$b0n9mo|AOdc%0Fg7uXUhE+faOQ$(!@5$1-bFU_qfHtW7@4An%DGCzP;zRZXGul|la?SiK|Mo3quJ%9VGhy@oo#h^#2n@UnnO#auKcqy6i(=RUUA9jSg1K=t*-1)hV#nE9zC*WTbgsVJ-dM`z>?aocrxN#Zo@J}yJ=db*32_Q0Cy?#%<WWcKqAI7gkl}vl42cd8^CXt@d`+Dpc3vN21JZW!(2v%9mArH01cUPDUH40xYjt9H4eY{Ja$*q6M#e~QtJMmyl3cBB`GRO>M84jsInKjK8e;3(jA`ri0uaYh>^%_Rv=dZF)Mk+nQs;wW^<050t>AF1yVoqz=trQVNF3+D~m)}*<7>e%~@8{lYIvfG&v&+wlhjq+p0H_p(!a9S<ICeXVZpNNuHunGbOQNFd-mh4$6$~qqjgxk+k>-*Au&;(CS{TD&g7!(-vk0O+dB|3yJ_?9nZig!<_N(uO_nepkUc{rE>6wW^b$<+W4$!*gL3EGml!3=4m_=No#w}qI0xBx_VHT1E*XsgdG9qS~X`O-Y_aXA#&tkfuyj|)bMm9NX7JuOI5E1bs{5=x+Q@EiC|y>CKk{oAykusvU>z^6%a_H*gc$N42mLx;zWH=V(TTdG-nz6>fXF-?X{82r8!MaEWN7!RCq=#Cm3T%3c&iGzS#I1EWJ0x;&G8e8)^AoZU?Imt*GDe-6*~|UBLa@<(3+4L8udaffozbX;^YLub<_c%b+E+E+d52o4}Vqg<``8UcT8`xk9VV_pk<TT)wmZ&RJUAZY!}yemQY)d~9Ou(4oC!N5+2n+G|IwTI03X0yyWpr`~@2(dTK*P4t)K92p;c+UrsY9Ez&xk5$3)@glndk>Om#@C;Vt_l|oMpdIy$G0@UO(Z7h*7iTD+NeyjS&NW_!8H0<>UND!!e%4)Q5d}BNt0J0G+9GJSLU4r;$Tfi_XXfoH7&`bGDVir(VFk{!MRUpWiYA)VWK}aKEUOl^X>dxz0*6Wt7&n?M0J)3I032(c7V`~SiJlW_#wxJX7NQi1mKt|}gLORyOb`m~3q(nu8hs||O++-4)>ECiBEk07(4FZr|0?-Lv4WncFjI9(N712*{!oop>?suX)5<nQBWODm1}O$=I_a14jKgMq*3#f%+^SYR3@;o8lRkJyK-3^4B5YkZ$ZSCV#AJ!xj7f9B8VjW$n93lAUZ4>zND@hx>x@?&&(g5w_#9&5v9&B=83~|Vywzc$@OxN3jPL*Nye%8gy(7SA84f%LAX^9q(|)ozorf5jKA?wu&YrZ8Pv<PNY`NtAM!t}Ew#YZ8SQR!j3rJZi%$)*7mZITIA?GZEM;k}F1S|zso%0lp-~ubWfQ1-HJ+wrJ7^+y{b!Y+0V1T#fq6?aL0Q!uPfrVjd9xX~d^Loe@bAe4A77bW7x(8qrXA%R}V-u8#n5ihs#`=()OHfPrzZa(LY4RE<zfm{|XyuFA-2rl<T0|VVpy(H{pKOu@9UftmBqRV#LC~|Y8BQ-<k3dP8Gn}vMjKO5ai80kw5OP_Z_dqNz$)&=Qq63s`Fh44aK=w-9hOw!ys(C3%4~L$4hcGAZ9g4#@7|#hm(I6l)-A6Il74;1U{#X%8BdWrqq{~EOwL%jKj45l0E6&@PTONK}J||Mc@hFC_HyI%ZE0QX;q^5dAhC`j5K#l}mxAUy`;lz>XkkN>*(oT|x#tR^u+9I~IU9p31Y%j3jSqZoZMJa|mZC>hd$fGdb1M?782I4q0TSGk_=9)4D!rVlB!z~T6>TqRGi#Wn?rCZ;0THkhB=T$vmhaPfMvWb}aIFREJ%W*u)6@$BL6E*le#Q`W+rUDw{QJI3$C>u?uNF=sP=mxY<1NI7P$+6s$rG}2k`I-T3)lE$|YL;2obmgB5%8>D#WKuA(Abf=Y+V-Hl5OBg-7)nco$y#stn$FO|q633OwMGW$CBTKNG#iGcqU{CU#Ziz(TDV&yf=PPoPwF5*D2=#4{1Di52BkS5Qn52h&RJ^4^sHjYl3Hx_FCpn-Y#VS6v&_N>x<pqF7_UxD$??e3@w!*eXVv0y%842*m@lIehAGEu#Do5Nwig6H$Dv?oU`9<0fR>AA&S-tWuJ&ZGH1e`Y@CdWAyhs4~v~YHz^h=JpCk?ycVuJz$dx;NLgh)g&;)C^2s%5&CnXERPQZfi?ADqpk+APYx9|?PqpGk|5u2Fi2(!Y;6$WXv(N48_u^kd?7uEA8a$vLxOkrhXQmLu8@P)o5c?!mGDG)c*U$DdhboSu_yRRCxZ1O~oD-cfipSU|-%3zo(+M!Mv5^-9b#jQU<7bw602U{o7>t*V7CZywocmzS__api>q3MiTvR#moIB{Y^$jpeYImMU``gC7rBLE476iF&EpEdfYqxKLkYg-3>B>vd8P@X-blKw~YL^5Kx@89K>*!(bqK>z96Sg8H1GUSuQH7gQn&p)Cc}iV`U`kOvy?!4$^J)*?%lEKjHsxCltUjpV!{%)ZpI@UzFlm&PI(dK}hNcerTo)u25poQnh}^^tuMjlP-PPQoA;jnmXRLYx8s5;l9bd7d!QNp@jS4wHN$&O;p#kuj+GqU+3~_&|vj9<TX1NC^iPqoM|Xh;odC$o`?fE5hQESR81gBsD3n<EOH*w4dS$WrdZ;L#bPzKwF#vPmRZW^LG|+3n?YVd;}UNMptKhkr3ibrib3o306-EPM7&G0ZN7tRtMTl&N+*RP!X*+%~>lBZvYP!amqkkHX0tQpgl6=bLo7cXGjP3XtxdvNT;1WBRrhU2<Zv+0Z-JXN&ZmLWh+jgAW;xZilQRmf?`y)k23j4g-An0bt%vFA3Yc|sZA^ukZ7R8EGbH-9tM~QJR){)pIyeDQigdyjTh`{HMxV?t8niv%O{jhk{lqlmyfzI`=s$D9V6JgjC3#D3J!6O><BZy;d)lkjy}jPC`D`@l^Bs9<HsF2I>;{#l|U64EhxbFM&(y9NcKP)RMk;awsEmn2dIG9!>t{a*#RK^g3eX$8c9kEUeW#|*28!(bismvtJ!t!*%92Sn6H-uY%%&&*Y!lG)c_n9Z4kL-mS7XlWb#Y2*7IP;^{O?%V5P{`pCeBP^w3L=tQ5@_{Z~C#Gv-=MDuklq)~2~xBgH>sW#cgQjI%M3pOn>4RM%67k+xBvH(hP7?XuOk07lRLdZ{{Jw(t=ZtpeW3v8zw}W7LTP>q}la01B_imQtRkKZ)Ft*Q#DydMQx~Ot}DNIf9|XVmFj{je?1znrM(bnhclbDktU|N7%M|SbnQ~-rLgQUG24LDT&}{e_>861xnQz5KAMiR2&e`GbNQD2~YN(pWcghA7RQgOz1AG1ggSG`Y?!L=gdZ<O8$eYrBOYxkpQwScnnjk&a8N3LArV_f!6`^b;o_twacVvL<SinqX%9xB9vS(tErTvqxJpB=%<j80QMv!E0In{zXutq9;cEYlF<*z=!azV<75o*dRk<}Ad$MSrCL>~2Dsi+)|dJWLSS&|srq#Mlxd0tEcF}}Q6_y{V&J#B1ofKhB=+QSMtbIz1sdT68eAGyKA>qaS`{jty%Hfr1EjQFo3Bk`8$o~?*3+Ya%%y&S;CBijbLq)uAi*SH+|Xyk9o$NRH^4Zvp|db@k;Rj@c-R7Rde)(;(>&;w$w;AzAkUitqVRf*Y_D}{f{I5bAA^t-GW>*e%2LIE7>D>ZMv}@Jzu-s$glA3$>K(>%hxc4a;d#&w3#Xz;-i!SMxPN+Zk}h{+w?xEaxi{{-uN?B5b50%JcntE+nprwHxszgzJ1h6c_s0W{p-~FX!XRw{kixhCW_WAe?cDk&Uu~SahF6n(zxw#naTbk@5ySBqbByA`Ah6&rj_&cZ8|NN&?_Cuk$=BBIU7$elHVY~qKX_m#3o}2H3!=m*{CSmbOId!rvWgL3;$FKOk3acV#4cZ@dqb{M)YvIGJdJMmJIS)v&%FcXS=?Foop(E}ciBCBX|c@g`n_ln<!Y}RNP<Xux}R`V2~L9HeTTv>$LA~O@i!UC@DQ_+AqA8gyn`fRC<BGo?w#(QI@?)!576nJ`2f0_>z@4E<B#4MRYcr6(5K|oW?&`42!4hPptbq=iS9cmF>3z1`*fel`;4mWR+IJbzwdssO83d!-hA}#+Jgrh9|JjWte^U((>nh5ir(IL;CIDC`wkZm9l`K`k!OdVG=y7Bs+17!?3mtxf^`Y~V9xShh;Y6q47-$MK+iZ_QS2W+5SJny1yRJd3=i-#!7N&^coNh3qXCUi7`zn^x8kR@G6J{Q-gz-QSc`=_1@T%XR)JbU$jNA}#o(Z?h&alnMOB4<z-Xl@trUxok~fxOtxrdH$RgW!A!noCk@ZRTa-%nc>ZNKRi*#;`gW@YK7>T7hVAGUnswa*36w#g~*D{+HE3HLiHKSprI2=4^G9EW7D9C~@p__sS4bMzOdB=kn|Gu#=|Ko$m(!;w_rqe(nJYk>z!2)<hdp|FNryrEwK|9PwVKc2xB8K4?S#W5f3vT+FwVGl$*qJ05jf(n4BA)?Pwksq0u@UvZH84ny@7Y>-P|r{x^e2J}E>9jgxKQlt%X{$|^Gy^@4=MCPQNhc@j%_)>5Nl4^WzEy^7Ne9HJZhMZe>alB7(JwU8hdcbE-rbiTjNZGKX1DH>5whb4qFw=wdy6SchHoCo^ap>1n0MREul6cT%<i?ki?25u+XBX-ct5K#i?<~4G^Z?Sg@+;0tJb_ED>-(Pb;8BkBDBx)8%D?;$0O$Mq)t1K#pj@M`$hL(n&Gt_$$xuT=0r?wG5_68j>IqqLb+gU_fzq2g+Hq4(%;sm81pRcPll6R}8kIaE=M~0q_R16jaLcK0&0gruQsvcyrF;D<&SR2m}hC*S`+mnH9Vt*C{gcrh9b<aQRBHEK&?y-z`f$$<1PRX|aPg26IcZD6?cdAY&tpGgD*ra1V&gq5@sqO~HLVq5}n>>bwU+9?C{otY1W7*sQZ)xmB9x!$U(UHx;C*5l?x3{*1XqQ#0Xjf8yD`)tOkNeR<rk7Eu7{j0sk%?agViV3NMfiDQ_ebtV>EzIx2ToOEVgvldxF(xL_u5wWzdA0!92*U-LRhPIHh3!I!KMZBf7hE{xt5{*GYT4IP@5Y>W+nkd8%q-~XcqWxew)CN(HpXQpgMSf25@>AjCK0Hk1ptu#J$sg^8CMvKy)Y7#Z&h;3_nil$k`yW!zdJbMP{3?ZEw&i7oBoSNFLmQf8d>L1M^88NJOjTyd1yp{v#_(Eb`l77v!&VVBNanHB!NvQp07JQhT9^ZRH96zU6z>|n$r7{u%xtz{6sS3U0zP|@X>0R^1+(#hHH4d|LEv*Ha|!6pirKsE#G~oKQ&Hi^1EGE)MN36PJqL(>r0ar8Neel;NtZH|^8Q)$UOCT_Xcs+25)5)i4Q}5_MOa4}hDoIq3+6eF9!|-K4%~;^2H?1mI*~YOFNNPcvKR@FxwId*d3H-Wi<BEQ6WNZ$0)C|WNUXZwvm;UoyvM~Ohn9-hb>+6SZ7RVLuF#&Fp)}XG6ZK`GiOI6@n6dnGtDXr&@;sn(y58s~J45p^YBbLA_|b+5Y0aoNPkqV88`px%ae4R^^^V@zC0y(-g=%%dtV(xM_LemZsYi^M<0{R8P<EXLc@RQ>OSn<Vnhp-B^2M-9_cYWS1`Go(mvuDod07(c0%a2CP|kE+)7Pek@PhMUV~D#it@13pAGcuyLsEp^7b!!-X7cQ+GW^B8x<E?i<kqOv)aZ`kX;_ii%kb#5uI%Jqi8<gtt6HTq;&{iMEv|mx4vJFLLBS!5qr>v`oC1<fkeI)Vg~kE*?2+BQulMqM^a72ClJh*;UjMs{WeMY=0Ec3X;@ScyGLbOqSVk(<n=v|ZILW@mNcB4VzDOy!fFQ#nj9P<%!N-j~v+;Wj%_JEVS3_tcfDN0TOVvx~q;;072lyx|%W7MnwKt(<%Akk)C?Q)_a{Fkb16Wg>sIt^#FZ^=MT(4*>R(UB!@=8%wtWcVG_5(+}`uOtw?!BvQKr_7#N!_-$-n@;e&e>XR5M9dzGz%Y1DO`5VMY}#r0l>0f@DNNR%WVq9mwh@Wh(_lhmx%<VFPe20Wef%B53bAyjOfR+<Ouc1&a1fANdO5)VzxobgloV|ZOqvvvl_!K{CrJx9?mwXF@wIng(2F~hjirpMLxMi@b8c@vO5wJtt;CUY3o^+Y(O4^pWR6rLn@9`p$AeE>9b(zXg6H1xtBE%gmsHBQm^JXgmb8LL>0RXdKr9tq9d%;9VCx5`8>ZC?N?S*_W(x<G<K#S@?E#E4e|B103f82N(X<DLiEYKXumjT7dTUEP;>^b>h)3e#A|~Gj^fsP@=w@SDk-zrYJjSlY}qq7`w6|Xh)a25rl(6bC?ok{Ngb9%QHH3^mOvhz?-a<rm@#{w%&jnhJnA*9DT4ywQc%=_Q7Ql+{qHtNTX3KEaGi%kmg4#z&Gm@A&RQ$^Hg#5DoxJ}SkCEej7eRJ`l((uP!a!uEnv!w}qalaaWqv|15n;!I1JhkfPezWkxX<ip?m={jezDB`bc}S3CBrI>0Lv&7^r&YzYos-dnMEZ6YZSuTDIj|Vwx)xm$nc<cl4Jv5>1Sf;r(x+2fTf>_rJsf+eUhesXQ9;d><s<zPzrOT!|=BNLwxL}KPsqi*PAAvbm+J^0LEhysceA$69J^p3iaKTBsUrtsANZ>LgQs4QH#ghhn2K}Bc@Z8cZ|?|eB;CQukWni`#>2xw0~3yuKnG-eslBT1NuUB82^cHa*XKX*4_2D{~UhCI*f<yp19Y2`x0H~D?#kE9syAJ-D%wx-?ILmc72X_RxZ<r^k`jjFb)f&P33P)v#-Mick+%;zOwTO{HKQT;$!yN=ip;@JG*D@bx)q?wBO!5alL!`Lign7-CG~C=)y=VtutaYcoZ)CR3L@T(%rxBQjF|3)Qh`-RIYpW!?hpZd;Hc}P!-t?k=@I8DBkoGzmS**g~Hp$oy+T=-08G#VE5b08()9A{^5J+F}UsX?AzS20Mszl)bo2qo#L2A_zH(C7Li&4Th*%1+W0-BU@2k=Y{9YU`pu$iHJqYTr!X=R+BOG<b6Q|!EFiN;UnnUSgCMJhlTr(Tg&*(4GCbS{`bZ^ZU7Odn>!AKLwV^y!U@IgJVzEi#v(i<l>D|b@oK|9o&^)T-5e%%iMObTS4?-$t#M_PU(3LBFW@g5Xtf{xLiUWg7d>bFHUZrpFu{&7#gQ}-rj8!&V3y`J2{ur{Tzd|1w)cIy*$8$S88^5HWmKwi)W&|H7l|F|E;;+7AINnOeS!A?(+2?sG;f=9PZ$V87FUdf-<Sl3{b{W7G;D26WoLW#D6z;ELLdhwEgf76tR?iG3ZrY&WW#X#Roa3-N^zq<vFkzzi?PAX;hmjBO)CMwz!P$x3Yd+6nm-+U*j90p8H~GP4Y%z>E6cgK!0?OI8HapV6<E*W+ruP6P5`u1Uv5*deb%Uan$=+=yvCOzGHoO+vwZc0=*sF068vm{3Yy9=4-|qWEaeQKIa&q5f@$kWeNAgPMwZLi7dD*NG!I6F19MR(4WkG7p*@wcFe@9M?Q$gj*2b+xBGI!ww*P8Q9{19jCYVAZ|ekPnHj)2eqW_}rO8)93GeC@7W;Q}o7X$#gnm~v>bz2MSCpEN@y0f%KG)?;#q&quw)kHPj6AJJkT{F(A86x?U8Q`36<(_nrq1c#j}2)`epsXi>s-DUjrZujIxb}Wc}jCbw+7i)LlW?!pKUa?FE3&Mq^L3@3{T4_YSMTp1d(0KLHwVd%;wkW09(z5_6W7%xRZ;rAk;Hi&bk>m=^e4LiDGDmJRX{u)*_Yh3R|Mou*9$`cIMNje2iL)3{4Z;}k^hpxBko>G{eO8`}d{F4Sb&Olt%g>*P(GTCnCuVLCLP-Z{(z!|g=$=43Xf}9?P@%UBV$=<~9+0@t0Q0U3j@u%8^cX%`9+Esi+RMor9wmsM9FpdE^q%veO83%t_<58*Uwk1geEpN_{6LsEZ-htgq~l1dopzfaH_B)&uu~NFDe~~k<4o7zc>jKP<s3J5dWf6k)k!^iuChaGaS_)#vvKVn>q-c?W_uosr4;*$JuYMQ)8pEMg9{v357a8E5UsZWH#%8&Cj3$i9&~Jj!A17krB3_3QRNK|^O&+Tc6EK^r=oUGUIXhcI9~~%p)v{J5K;Y@8uenbKz(w#4;Htd?9ZzTG^PCNjS#@GUn%{1)w3t5Sfi;e&FE2nVpSntc^5}@`OL<tAAqzp+NaqwKTNuOmOhEo?;}TRKYqdwWsdOg(nrs8p6Pd<lYJ>ZTwka||FwKo`jW<%$uB3Zzjqc|25wD!nQ7(z=G7J}y^|lz#WS4PNNnlAM))~b@x^&|Di^@A*4FNx#gl{h4I=t<5;_eoQrB1LOALWQeHoiryMJZ#(^Wdvd7X^vH`hP-LGt!XLm^brq}b)kV?r9!=iCf1PhbsMDyaCCHoq{XE)1jozc8XsXNuD-jV)Zs@YE8mV|p&lL2|m&20?I(xk94e8rioZo2t^8<l894U=VMy&rB)*I(hKr9E!!PH47$fausIkmh73~hmINVq35E9Ln1GIrk$7LA5qF2hkObWc}YRd6^me%6frPjD#tzuBU-}|3ESfzwpWu)V7X)?WcCKlK<#O03Qzrm5kbwVL&mT%q~`uVqr6DN"
 def _package_entries(pkg_name):
  import base64 as _b64, zlib as _zlib
  srcs = _zlib.decompress(_b64.b85decode(_PACKAGE_BLOB)).decode("utf-8").split("\0")

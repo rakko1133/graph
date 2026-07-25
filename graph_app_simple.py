@@ -25,7 +25,6 @@
     立ち上がってしまい、シンプル版がシンプルでなくなるためです。
 """
 
-import os
 import sys
 
 from graph_app import GraphApp
