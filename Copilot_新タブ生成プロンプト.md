@@ -136,6 +136,9 @@ register_tab(MyToolTab())
 
 ## 送ったあとにやること（人間側）
 1. 出てきたファイルを `graph_tab_<名前>.py` として保存する。
-2. `graph_app.py` 冒頭の import 群に、指定された1行を足す。
-3. `起動.bat` で起動し、タブが増えて動くか確認する。
-4. （あれば）`python tests/test_app.py` などのテストを流す。
+2. **`python check_tab.py graph_tab_<名前>`（リポジトリでは `python tools/check_tab.py …`）で自動チェック**。
+   import→GraphApp組み立て→サンプル波形で描画→（あれば）draw_overlay/設定の往復まで通し、
+   各項目の PASS/FAIL を出す。**すべて PASS なら「使えるコード」**。この段階では `graph_app.py` はまだ触らない。
+3. NG が出たら、そのメッセージを Copilot に貼って直させる → 2 を再実行。
+4. すべて PASS したら `graph_app.py` 冒頭の import 群に、指定された1行を足して採用する。
+5. `起動.bat` で起動して確認。必要なら `python tests/test_app.py` も流す。
