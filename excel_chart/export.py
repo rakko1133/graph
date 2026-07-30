@@ -72,7 +72,7 @@ def _excel_installed():
 
 
 def export_excel_chart(data, spec=None, out_path="chart.xlsx", *,
-                       engine="auto", visible=False,
+                       engine="auto", visible=False, extra_sheets=None,
                        x=None, y=None, chart_type="折れ線", **spec_kwargs):
     """データと書式から Excel グラフを書き出す中心関数。
 
@@ -95,18 +95,21 @@ def export_excel_chart(data, spec=None, out_path="chart.xlsx", *,
 
     eng = choose_engine(engine, out_path)
     if eng == "com":
-        path = com_engine.write(spec, df, out_path, visible=visible)
+        path = com_engine.write(spec, df, out_path, visible=visible,
+                                extra_sheets=extra_sheets)
     else:
-        path = openpyxl_engine.write(spec, df, out_path)
+        path = openpyxl_engine.write(spec, df, out_path, extra_sheets=extra_sheets)
     return path, eng
 
 
 def export_from_config(data, config, out_path="chart.xlsx", *,
-                       engine="auto", only_file=None, visible=False):
+                       engine="auto", only_file=None, visible=False,
+                       extra_sheets=None):
     """既存 GUI の設定 JSON（_collect_config 形式 / プリセット）を書式に使う。"""
     spec = ChartSpec.from_app_config(config, only_file=only_file)
     return export_excel_chart(data, spec=spec, out_path=out_path,
-                              engine=engine, visible=visible)
+                              engine=engine, visible=visible,
+                              extra_sheets=extra_sheets)
 
 
 def _validate(spec, df):

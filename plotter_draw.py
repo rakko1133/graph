@@ -5,7 +5,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from plotter_format import _eng   # オシロ格子の s/div・V/div 表示で使用
+from plotter_format import _eng, is_dark_bg   # オシロ格子の表示・地色の明暗判定
 
 
 DEFAULT_STYLE = {
@@ -631,16 +631,6 @@ def _draw_3d(ax, series, chart_type, fonts=None, data_labels=False, zlabel=""):
             _data_labels_3d(ax, x, y, z, st["color"], fs)
 
 
-def _is_dark(color):
-    """色（名前/HEX）が暗いか（相対輝度<0.45）。目盛り色などの自動切替に使う。"""
-    try:
-        from matplotlib.colors import to_rgb
-        r, g, b = to_rgb(color)
-        return (0.299 * r + 0.587 * g + 0.114 * b) < 0.45
-    except Exception:
-        return True
-
-
 def _apply_scope(ax, scope, bg_color=""):
     """オシロスコープ風の div グリッドと表示範囲を設定する。
 
@@ -661,7 +651,7 @@ def _apply_scope(ax, scope, bg_color=""):
     ax.set_xticks(np.linspace(x0, x1, xd + 1))
     ax.set_yticks(np.linspace(y0, y1, yd + 1))
     bg = bg_color or "#0b0f0b"
-    dark = _is_dark(bg)
+    dark = is_dark_bg(bg)
     ax.grid(True, which="major", color=("#888" if dark else "#aaa"),
             linestyle="-", linewidth=0.6, alpha=0.5)
     ax.set_facecolor(bg)

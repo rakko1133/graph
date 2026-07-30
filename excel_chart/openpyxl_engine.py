@@ -23,8 +23,11 @@ def available():
     return importlib.util.find_spec("openpyxl") is not None
 
 
-def write(spec, df, out_path):
-    """ChartSpec + DataFrame からネイティブ Excel グラフ入り .xlsx を保存する。"""
+def write(spec, df, out_path, extra_sheets=None):
+    """ChartSpec + DataFrame からネイティブ Excel グラフ入り .xlsx を保存する。
+
+    extra_sheets: {シート名: 行のリスト（各行はセル値のリスト）} を追加シートとして
+    同じブックに書く（測定値・統計などの表を同梱するレポート用途）。"""
     try:
         from openpyxl import Workbook
     except Exception as e:  # pragma: no cover
@@ -51,6 +54,11 @@ def write(spec, df, out_path):
     chart = _build_chart(spec, df, ws, layout, nrow)
     if chart is not None:
         ws.add_chart(chart, _anchor(len(headers)))
+
+    for name, rows in (extra_sheets or {}).items():
+        es = wb.create_sheet(str(name)[:31])   # Excel のシート名は31文字まで
+        for row in rows:
+            es.append(list(row))
 
     wb.save(out_path)
     return out_path

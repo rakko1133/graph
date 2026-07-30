@@ -73,38 +73,3 @@ def render_one(task):
     return task["path"]
 
 
-def render_sequential(tasks):
-    """逐次出力（図を1つ再利用）。並列が使えない/不要なときのフォールバック。
-    戻り値 (saved_paths, skipped_msgs)。"""
-    import os
-    saved, skipped = [], []
-    if not tasks:
-        return saved, skipped
-    fig = Figure(figsize=tasks[0]["figsize"], dpi=tasks[0]["dpi"])
-    FigureCanvasAgg(fig)
-    ax = _make_ax(fig, tasks[0].get("threed", False))   # 同一バッチは同一投影で固定
-    for t in tasks:
-        try:
-            ax.clear()
-            threed = t.get("threed", False)
-            plotter.plot_series(
-                ax, t["series"], t["ctype"], categories=t["categories"],
-                title=t["title"], xlabel=t["xlabel"], ylabel=t["ylabel"],
-                xlim=t["xlim"], ylim=t["ylim"],
-                secondary_label=t["sec_label"], max_points=t["max_points"],
-                zlabel=t.get("zlabel", ""), view_init=t.get("view_init"), threed=threed,
-                **t["fmt"])
-            _apply_ratio(ax, t.get("ratio"), threed)
-            tight = t.get("tight", True)
-            if not tight:
-                try:
-                    fig.tight_layout()
-                except Exception:
-                    pass
-            fig.savefig(t["path"], dpi=t["dpi"],
-                        bbox_inches=("tight" if tight else None),
-                        transparent=t["transparent"])
-            saved.append(t["path"])
-        except Exception as e:  # noqa: BLE001
-            skipped.append(f"{os.path.basename(t['path'])}（{e}）")
-    return saved, skipped

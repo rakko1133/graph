@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """SI接頭辞つき数値フォーマット（format_eng / parse_eng / eng_125_sequence）。"""
-import numpy as np
 
 
 def _eng(x):
@@ -43,6 +42,21 @@ def parse_eng(text, default=None):
         if ch in _ENG_MULT:
             return num * _ENG_MULT[ch]
     return num                       # 単位のみ（例 '2V'）は倍率なし
+
+
+def is_dark_bg(color, threshold=0.5):
+    """地色（名前/HEX）が暗いか。目盛り・グリッド・文字の色の自動切替に使う。
+
+    以前は plotter_draw（閾値0.45）と GUI 側（0.5）に別々の実装があり、
+    輝度が 0.45〜0.5 の中間色ではオシロの格子だけ「明るい地色」扱い、
+    文字は「暗い地色」扱いという食い違いが起きていた。判定は1本にする。
+    色を解釈できないときは暗い扱い（従来の挙動）。"""
+    try:
+        from matplotlib.colors import to_rgb
+        r, g, b = to_rgb(color)
+    except Exception:   # noqa: BLE001  未知の色指定は従来どおり暗い扱い
+        return True
+    return (0.299 * r + 0.587 * g + 0.114 * b) < threshold
 
 
 def eng_125_sequence(lo, hi, suffix=""):

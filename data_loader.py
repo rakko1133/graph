@@ -1,18 +1,17 @@
-"""CSV / TSV ファイルの読み込み。
+"""表・波形データファイルの読み込み。
 
-文字コード（UTF-8 / UTF-8 BOM付き / Shift_JIS(CP932) など）と
-区切り文字（カンマ / タブ / セミコロン）を自動判定して
-pandas.DataFrame として読み込む。日本語 CSV を想定。
+- CSV/TSV/TXT: 文字コード（UTF-8 / BOM付き / CP932 など）と区切り文字を自動判定
+- Excel (.xlsx/.xlsm/.xls): シート指定可（既定は先頭シート）
+- WAV (.wav): 音声波形を 時間[s]＋ch列 として読む（標準ライブラリのみ）
+- LTspice (.raw): 過渡解析のバイナリ/ASCII波形（AC複素・fastaccessは未対応）
+- TDMS (.tdms): 要 npTDMS ／ MDF (.mf4/.mdf): 要 asammdf ／ HDF5 (.h5/.hdf5): 要 tables か h5py
+  （任意依存。未インストール時は pip コマンド入りの分かりやすいエラーを出す）
 """
 
 import csv
 import os
 
 import pandas as pd
-
-# 試行する文字コード（日本語環境でよくある順）。
-# UTF-8 系を先に試し、最後に必ず成功する latin-1 をフォールバックに置く。
-_ENCODINGS = ["utf-8-sig", "utf-8", "cp932", "shift_jis", "euc-jp", "latin-1"]
 
 # 自動判定で候補とする区切り文字
 _DELIMITERS = [",", "\t", ";", "|"]
@@ -23,6 +22,30 @@ DELIMITER_LABELS = {
     ";": "セミコロン ( ; )",
     "|": "パイプ ( | )",
 }
+
+# 扱える拡張子の一覧。**ここが唯一の定義**。
+# 以前は「ドラッグ&ドロップの受付」「ファイルダイアログのフィルタ文字列」
+# 「フォルダ読み込みの対象」が別々に書かれており、実際にダイアログのフィルタ
+# だけ .net が抜けていた（D&Dでは開けるのに、参照ボタンからは選べない）。
+EXT_GROUPS = (
+    ("CSV/TSV", (".csv", ".tsv", ".txt")),
+    ("Excel", (".xlsx", ".xls", ".xlsm")),
+    ("波形/計測", (".wav", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5")),
+)
+# 受け付ける全拡張子
+ACCEPT_EXTS = tuple(e for _name, exts in EXT_GROUPS for e in exts)
+# 表データとして直接開ける拡張子（フォルダ一括読み込みの対象）
+TABLE_EXTS = ACCEPT_EXTS
+
+
+def file_dialog_filter():
+    """QFileDialog 用のフィルタ文字列を EXT_GROUPS から組み立てる。"""
+    def pat(exts):
+        return " ".join("*" + e for e in exts)
+    parts = ["データ (" + pat(ACCEPT_EXTS) + ")"]
+    parts += [f"{name} ({pat(exts)})" for name, exts in EXT_GROUPS]
+    parts.append("すべて (*.*)")
+    return ";;".join(parts)
 
 
 def _japanese_score(text):
@@ -146,19 +169,126 @@ def _normalize_columns(df):
     return df
 
 
-def load_table(path, encoding=None, delimiter=None):
-    """CSV/TSV/Excel を読み込み (DataFrame, 使用した encoding, 使用した delimiter) を返す。
+def excel_sheet_names(path):
+    """Excelブックのシート名一覧を返す（読めない場合は空リスト）。"""
+    try:
+        return list(pd.ExcelFile(path).sheet_names)
+    except Exception:
+        return []
 
-    encoding / delimiter を None にすると自動判定する。.xlsx/.xls/.xlsm は Excel として読む。
+
+def _load_wav(path):
+    """WAV音声を 時間[s]＋ch1..chN のDataFrameにする（8/16/32bit PCM対応）。"""
+    import wave
+    import numpy as np
+    with wave.open(path, "rb") as w:
+        ch, sw, fr, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+        raw = w.readframes(n)
+    dtype = {1: np.uint8, 2: np.dtype("<i2"), 4: np.dtype("<i4")}.get(sw)
+    if dtype is None:
+        raise ValueError(f"未対応のサンプル幅です: {sw * 8}bit（8/16/32bit PCMに対応）")
+    a = np.frombuffer(raw, dtype=dtype).astype(float)
+    if sw == 1:
+        a -= 128.0   # 8bitは無符号なので中心を0に
+    a = a.reshape(-1, ch)
+    cols = {"時間[s]": np.arange(a.shape[0], dtype=float) / fr}
+    for i in range(ch):
+        cols[f"ch{i + 1}"] = a[:, i]
+    return pd.DataFrame(cols)
+
+
+def _is_float(tok):
+    try:
+        float(tok)
+        return True
+    except ValueError:
+        return False
+
+
+def _load_tdms(path):
+    """NI TDMS を読む（要 npTDMS）。グループ/チャンネルを列に展開する。"""
+    try:
+        from nptdms import TdmsFile
+    except ImportError as e:
+        raise ValueError("TDMS の読み込みには npTDMS が必要です（pip install npTDMS）。") from e
+    td = TdmsFile.read(path)
+    groups = td.groups()
+    cols = {}
+    for g in groups:
+        for chan in g.channels():
+            name = f"{g.name}/{chan.name}" if len(groups) > 1 else str(chan.name)
+            try:   # 波形属性があれば時間軸も作る（最初の1本だけ）
+                if "時間[s]" not in cols:
+                    cols["時間[s]"] = chan.time_track()
+            except (KeyError, ValueError):
+                pass
+            cols[name] = chan[:]
+    if not cols:
+        raise ValueError("TDMS内にチャンネルが見つかりません。")
+    return pd.DataFrame({k: pd.Series(v) for k, v in cols.items()})
+
+
+def _load_mdf(path):
+    """車載計測 MDF (.mf4/.mdf) を読む（要 asammdf）。"""
+    try:
+        from asammdf import MDF
+    except ImportError as e:
+        raise ValueError("MDF の読み込みには asammdf が必要です（pip install asammdf）。") from e
+    with MDF(path) as m:
+        df = m.to_dataframe()
+    df = df.reset_index()
+    if df.columns[0] in ("timestamps", "time", "index"):
+        df = df.rename(columns={df.columns[0]: "時間[s]"})
+    return df
+
+
+def _load_hdf5(path):
+    """HDF5 を読む。pandas形式（要 tables）→ 汎用h5py（1D/2D数値データセット）の順に試す。"""
+    try:
+        df = pd.read_hdf(path)
+        if hasattr(df, "to_frame"):
+            df = df.to_frame()
+        return df.reset_index(drop=False)
+    except Exception:
+        pass
+    try:
+        import h5py
+    except ImportError as e:
+        raise ValueError("HDF5 の読み込みには tables または h5py が必要です"
+                         "（pip install h5py）。") from e
+    cols = {}
+    with h5py.File(path, "r") as f:
+        def visit(name, obj):
+            if not isinstance(obj, h5py.Dataset) or obj.dtype.kind not in "fiu":
+                return
+            short = name.split("/")[-1]
+            key = short if short not in cols else name
+            if obj.ndim == 1:
+                cols[key] = obj[...]
+            elif obj.ndim == 2 and obj.shape[1] <= 64:   # 2Dは列に展開
+                arr = obj[...]
+                for j in range(arr.shape[1]):
+                    cols[f"{key}[{j}]"] = arr[:, j]
+        f.visititems(visit)
+    if not cols:
+        raise ValueError("HDF5 内に数値データセット（1D/2D）が見つかりません。")
+    return pd.DataFrame({k: pd.Series(v) for k, v in cols.items()})
+
+
+def load_table(path, encoding=None, delimiter=None, sheet=None):
+    """表・波形ファイルを読み込み (DataFrame, 使用encoding, 使用delimiter) を返す。
+
+    encoding / delimiter は CSV/TSV系のみ意味を持ち、None なら自動判定。
+    sheet は Excel のシート名/番号（None=先頭）。その他の形式は拡張子で自動判別。
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"ファイルが見つかりません: {path}")
 
-    # --- Excel（先頭シート）---
     ext = os.path.splitext(path)[1].lower()
+    # --- Excel ---
     if ext in (".xlsx", ".xlsm", ".xls"):
         try:
-            df = pd.read_excel(path)
+            df = pd.read_excel(path, sheet_name=sheet if sheet is not None else 0)
         except ImportError as e:
             if ext == ".xls":   # 旧形式 .xls は openpyxl では読めず xlrd が必要
                 raise ValueError('.xls の読み込みには xlrd が必要です'
@@ -168,6 +298,15 @@ def load_table(path, encoding=None, delimiter=None):
         if df.shape[1] == 0:
             raise ValueError("シートから列を読み取れませんでした。")
         return _normalize_columns(df), "excel", "excel"
+    # --- 波形・計測形式 ---
+    if ext == ".wav":
+        return _normalize_columns(_load_wav(path)), "wav", ""
+    if ext == ".tdms":
+        return _normalize_columns(_load_tdms(path)), "tdms", ""
+    if ext in (".mf4", ".mdf"):
+        return _normalize_columns(_load_mdf(path)), "mdf", ""
+    if ext in (".h5", ".hdf5"):
+        return _normalize_columns(_load_hdf5(path)), "hdf5", ""
 
     if encoding is None:
         encoding = detect_encoding(path)

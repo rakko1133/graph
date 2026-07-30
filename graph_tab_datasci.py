@@ -1,0 +1,382 @@
+# -*- coding: utf-8 -*-
+"""DataSciMixin: 「データサイエンス」タブの解析アクション。
+
+選択中のY系列に対し、線形回帰（線形性）・記述統計・相関・正規性検定などを計算して表で表示する。
+実体の計算は datasci モジュール（GUI 非依存）に置き、ここは取得→計算→表示の橋渡しに徹する。
+"""
+from graph_app_common import *  # noqa: F401,F403
+
+
+class DataSciMixin:
+    # ---- 共通: 解析対象 (t, y) の取得 ----
+    def _ds_xy(self):
+        """データサイエンスタブの対象コンボから (x, y) を取得。x は現在のX軸列。"""
+        disp = self.ds_target.currentText()
+        if not disp:
+            self.notify("データタブでY系列を選択してください。", "warn")
+            return None, None, None
+        t, y = self._xy_by_disp(disp)   # AdvancedMixin と共用（同一クラスのメソッド）
+        if t is None:
+            self.notify("対象の数値データが取得できません。", "warn")
+            return None, None, None
+        return disp, t, y
+
+    def _ds_show(self, title, rows):
+        """[(項目, 値文字列), ...] を結果テーブルに表示する。各行に「表示」チェックを付ける。"""
+        had = bool(getattr(self, "_ds_annotations", None))
+        self._ds_annotations = []   # 新しい解析を表示したら前回の注記はリセット
+        self.ds_title.setText(title)
+        self.ds_table.setRowCount(len(rows))
+        for r, (k, v) in enumerate(rows):
+            self.ds_table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(k)))
+            self.ds_table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(v)))
+            cb = QtWidgets.QCheckBox()
+            cb.setToolTip("チェックすると、この項目の値をグラフ上に注記表示します。")
+            cb.toggled.connect(self._refresh_ds_annotations)
+            self.ds_table.setCellWidget(r, 2, cb)
+        if had and getattr(self, "_has_drawn", False):
+            self.draw_graph()   # 前回の注記を消す
+
+    def _refresh_ds_annotations(self, *_):
+        """「表示」にチェックされた行を集めてグラフへ注記表示する。"""
+        anns = []
+        for r in range(self.ds_table.rowCount()):
+            cb = self.ds_table.cellWidget(r, 2)
+            if cb is not None and cb.isChecked():
+                k = self.ds_table.item(r, 0)
+                v = self.ds_table.item(r, 1)
+                if k is not None and v is not None:
+                    anns.append(f"{k.text()} = {v.text()}")
+        self._ds_annotations = anns
+        if self.datasets:   # 特殊表示直後でも通常グラフへ再描画して反映
+            self.draw_graph()
+
+    @staticmethod
+    def _fmt(v):
+        if v is None:
+            return "—"
+        if isinstance(v, bool):
+            return "はい" if v else "いいえ"
+        if isinstance(v, int):
+            return str(v)
+        try:
+            return f"{float(v):.6g}"
+        except (TypeError, ValueError):
+            return str(v)
+
+    # ---- 線形回帰（線形性） ----
+    def run_regression(self):
+        disp, t, y = self._ds_xy()
+        if t is None:
+            return
+        d = datasci.linear_regression(t, y)
+        if not d:
+            self.notify("回帰に十分なデータがありません。", "warn")
+            return
+        f = self._fmt
+        rows = [
+            ("点数 n", f(d["n"])),
+            ("傾き slope", f(d["slope"])),
+            ("切片 intercept", f(d["intercept"])),
+            ("相関 r (ピアソン)", f(d["r"])),
+            ("決定係数 R²", f(d["r2"])),
+            ("p値 (傾き=0)", f(d["p_value"])),
+            ("傾きの標準誤差", f(d["std_err"])),
+            ("RMSE (残差)", f(d["rmse"])),
+            ("直線性誤差 [%FS]", f(d["linearity_error_pct"])),
+        ]
+        sp = datasci.correlation(t, y, "spearman")
+        if sp:
+            rows.append(("相関 (スピアマン)", f(sp["r"])))
+        self._ds_show(f"線形回帰: {disp}（Y vs X）", rows)
+        if self.ds_fit_check.isChecked():
+            # 既存の近似曲線(線形)機能でグラフに直線を重ねる
+            self.trend_combo.setCurrentText("線形")
+            self.draw_graph()
+
+    # ---- 記述統計 ----
+    def show_describe(self):
+        disp, t, y = self._ds_xy()
+        if t is None:
+            return
+        d = datasci.describe(y)
+        if not d:
+            self.notify("数値データがありません。", "warn")
+            return
+        f = self._fmt
+        order = [
+            ("件数", "count"), ("平均", "mean"), ("中央値", "median"),
+            ("標準偏差 σ", "std"), ("分散", "var"), ("最小", "min"), ("最大", "max"),
+            ("範囲", "range"), ("変動係数 CV", "cv"), ("歪度 skew", "skew"),
+            ("尖度 kurtosis", "kurtosis"), ("第1四分位 Q1", "p25"),
+            ("中央 Q2", "p50"), ("第3四分位 Q3", "p75"), ("四分位範囲 IQR", "iqr"),
+        ]
+        self._ds_show(f"記述統計: {disp}", [(lbl, f(d.get(k))) for lbl, k in order])
+
+    # ---- 正規性検定 ----
+    def run_normality(self):
+        disp, t, y = self._ds_xy()
+        if t is None:
+            return
+        d = datasci.normality(y)
+        if not d:
+            self.notify("正規性検定には scipy が必要です（または点数不足）。", "warn")
+            return
+        f = self._fmt
+        rows = [
+            ("W統計量", f(d["W"])),
+            ("p値", f(d["p_value"])),
+            ("5%有意で正規とみなせる", f(d["normal_5pct"])),
+        ]
+        self._ds_show(f"正規性検定 (Shapiro-Wilk): {disp}", rows)
+
+    # ---- 相関行列（選択中の全系列） ----
+    def show_corr_matrix(self):
+        items = self._selected_series_items()
+        if len(items) < 2:
+            self.notify("相関行列には2系列以上をデータタブで選択してください。", "warn")
+            return
+        named = []
+        for fl, col, disp in items:
+            t, y = self._xy_by_disp(disp)
+            if y is not None:
+                named.append((disp, y))
+        names, mat = datasci.correlation_matrix(named, "pearson")
+        if mat is None:
+            self.notify("相関行列を計算できませんでした。", "warn")
+            return
+        self._show_corr_window(names, mat)
+
+    def _show_corr_window(self, names, mat):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("相関行列（ピアソン）")
+        dlg.resize(min(120 + 90 * len(names), 900), min(120 + 30 * len(names), 700))
+        lay = QtWidgets.QVBoxLayout(dlg)
+        n = len(names)
+        tbl = QtWidgets.QTableWidget(n, n)
+        tbl.setHorizontalHeaderLabels(names)
+        tbl.setVerticalHeaderLabels(names)
+        for i in range(n):
+            for j in range(n):
+                v = float(mat[i, j])
+                it = QtWidgets.QTableWidgetItem(f"{v:.3f}")
+                it.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                # 相関の強さで色付け（赤=正・青=負）
+                a = max(0.0, min(1.0, abs(v)))
+                if v >= 0:
+                    it.setBackground(QtGui.QColor(255, int(255 * (1 - a)), int(255 * (1 - a))))
+                else:
+                    it.setBackground(QtGui.QColor(int(255 * (1 - a)), int(255 * (1 - a)), 255))
+                tbl.setItem(i, j, it)
+        lay.addWidget(tbl)
+        btn = QtWidgets.QPushButton("閉じる")
+        btn.clicked.connect(dlg.accept)
+        lay.addWidget(btn)
+        dlg.exec()
+
+    # ---- 任意関数フィッティング ----
+    def run_custom_fit(self):
+        """モデル式とパラメータ初期値を指定して非線形フィット（scipy curve_fit）。"""
+        disp, t, y = self._ds_xy()
+        if t is None:
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"任意関数フィット: {disp}")
+        form = QtWidgets.QFormLayout(dlg)
+        last = getattr(self, "_fit_last", {})
+        e_expr = QtWidgets.QLineEdit(last.get("expr", "a*exp(-x/b)+c"))
+        e_expr.setToolTip("変数 x とパラメータ名で書くモデル式。\n"
+                          "使える関数: sin/cos/tan/exp/log/log10/sqrt/abs など"
+                          "（数学チャンネルの数式と同じ）。")
+        e_par = QtWidgets.QLineEdit(last.get("params", "a, b, c"))
+        e_par.setToolTip("フィットするパラメータ名（カンマ区切り）")
+        e_p0 = QtWidgets.QLineEdit(last.get("p0", "1, 1, 0"))
+        e_p0.setToolTip("各パラメータの初期値（カンマ区切り・パラメータ名と同順）")
+        c_add = QtWidgets.QCheckBox("フィット曲線を新しいデータとして追加（グラフに重ねられる）")
+        c_add.setChecked(True)
+        form.addRow("モデル式 f(x) =", e_expr)
+        form.addRow("パラメータ", e_par)
+        form.addRow("初期値", e_p0)
+        form.addRow(c_add)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok
+                                        | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if not dlg.exec():
+            return
+        expr = e_expr.text().strip()
+        params = [p.strip() for p in e_par.text().split(",") if p.strip()]
+        try:
+            p0 = [float(v) for v in e_p0.text().split(",")]
+        except ValueError:
+            self.notify("初期値は数値をカンマ区切りで入力してください。", "warn")
+            return
+        if not expr or not params or len(p0) != len(params):
+            self.notify("式・パラメータ名・初期値（同数）を入力してください。", "warn")
+            return
+        self._fit_last = {"expr": expr, "params": e_par.text(), "p0": e_p0.text()}
+        try:
+            d = datasci.fit_custom(t, y, expr, params, p0)
+        except Exception as e:  # noqa: BLE001  収束失敗・式エラーなど
+            self.notify(f"フィットできませんでした:\n{e}\n\n"
+                        "初期値を変える・式を見直すと収束することがあります。", "warn")
+            return
+        if not d:
+            self.notify("フィットに十分なデータがありません（要scipy・点数>パラメータ数+1）。", "warn")
+            return
+        f = self._fmt
+        rows = [("モデル式", f"f(x) = {expr}"), ("点数 n", f(d["n"]))]
+        for nm, v, err in d["params"]:
+            rows.append((f"{nm}", f"{v:.6g} ± {err:.3g}"))
+        rows += [("決定係数 R²", f(d["r2"])), ("RMSE (残差)", f(d["rmse"]))]
+        self._ds_show(f"任意関数フィット: {disp}", rows)
+        if c_add.isChecked():
+            import pandas as pd
+            xname = self.x_combo.currentText() or "x"
+            df = pd.DataFrame({xname: d["x"], f"fit({disp})": d["yfit"]})
+            self.register_dataset(
+                f"FIT: {disp}", df,
+                status=(f"フィット完了: R²={f(d['r2'])}。曲線を『{{label}}』として追加しました"
+                        "（ツリーでチェックすると重ね描きできます）。"))
+        else:
+            self._set_status(f"フィット完了: R²={f(d['r2'])}")
+
+    # ---- t検定・分散分析 ----
+    def run_t_test(self):
+        """t検定（1標本 / 対応なしWelch / 対応あり）。対象Aはこのタブの対象コンボ。"""
+        disp, t, y = self._ds_xy()
+        if t is None:
+            return
+        others = [d for _fl, _c, d in self._selected_series_items() if d != disp]
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"t検定: {disp}")
+        form = QtWidgets.QFormLayout(dlg)
+        kind = QtWidgets.QComboBox()
+        kind.addItems(["1標本（母平均μ0と比較）", "対応なし2標本（Welch）", "対応あり2標本"])
+        e_mu = QtWidgets.QLineEdit("0")
+        cb_b = QtWidgets.QComboBox(); cb_b.addItems(others)
+        form.addRow("種類", kind)
+        form.addRow("μ0（1標本のとき）", e_mu)
+        form.addRow("対象B（2標本のとき）", cb_b)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok
+                                        | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if not dlg.exec():
+            return
+        ki = kind.currentIndex()
+        b = None
+        if ki > 0:
+            if not cb_b.currentText():
+                self.notify("2標本の検定には対象Bの系列もデータタブで選択してください。", "warn")
+                return
+            _tb, b = self._xy_by_disp(cb_b.currentText())
+        d = datasci.t_test(y, b=b, mu=_parse_float(e_mu.text(), 0.0) or 0.0,
+                           paired=(ki == 2))
+        if not d:
+            self.notify("t検定を計算できませんでした（要scipy・点数を確認）。", "warn")
+            return
+        f = self._fmt
+        name = ["1標本", "対応なし(Welch)", "対応あり"][ki]
+        rows = [("種類", name), ("平均 A", f(d["mean_a"]))]
+        if d["mean_b"] is not None:
+            rows.append(("平均 B", f(d["mean_b"])))
+        rows += [("t統計量", f(d["t"])), ("p値", f(d["p_value"]))]
+        if d["df"] is not None:
+            rows.append(("自由度", f(d["df"])))
+        rows.append(("5%有意差あり", f(d["sig_5pct"])))
+        self._ds_show(f"t検定（{name}）: {disp}"
+                      + (f" vs {cb_b.currentText()}" if ki > 0 else ""), rows)
+
+    def run_anova(self):
+        """一元配置分散分析。選択中の全Y系列を群として比較する。"""
+        items = self._selected_series_items()
+        if len(items) < 2:
+            self.notify("分散分析には2系列以上をデータタブで選択してください。", "warn")
+            return
+        groups = []
+        for _fl, _c, disp in items:
+            _t, y = self._xy_by_disp(disp)
+            if y is not None:
+                groups.append((disp, y))
+        d = datasci.anova_oneway(groups)
+        if not d:
+            self.notify("分散分析を計算できませんでした（要scipy）。", "warn")
+            return
+        f = self._fmt
+        rows = [("F統計量", f(d["F"])), ("p値", f(d["p_value"])),
+                ("5%有意差あり", f(d["sig_5pct"]))]
+        for name, n, mean, std in d["groups"]:
+            rows.append((f"{name}", f"n={n}, 平均={mean:.6g}, σ={std:.6g}"))
+        self._ds_show(f"一元配置ANOVA（{len(d['groups'])}群）", rows)
+
+    def _build_tab_datasci(self):
+        outer = QtWidgets.QScrollArea(); outer.setWidgetResizable(True)
+        w = QtWidgets.QWidget(); outer.setWidget(w)
+        v = QtWidgets.QVBoxLayout(w)
+
+        v.addWidget(self._bold("統計解析（回帰・記述統計・相関・正規性）"))
+        info = QtWidgets.QLabel("選択中のY系列を、現在のX軸列に対して解析します。"
+                                "データタブでX軸とY系列を選んでから実行してください。")
+        info.setWordWrap(True); info.setStyleSheet("color:#555;")
+        v.addWidget(info)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("対象:"))
+        self.ds_target = QtWidgets.QComboBox()
+        self.ds_target.setToolTip("解析するY系列。データタブでY系列を選ぶと候補に出ます")
+        row.addWidget(self.ds_target, 1)
+        v.addLayout(row)
+
+        # 回帰（線形性）
+        b_reg = QtWidgets.QPushButton("線形回帰（Y vs X）")
+        b_reg.setToolTip("傾き・切片・R²・相関r・直線性誤差[%FS] を計算（線形性の評価）")
+        b_reg.clicked.connect(self.run_regression)
+        self.ds_fit_check = QtWidgets.QCheckBox("回帰直線を重ねる")
+        self.ds_fit_check.setToolTip("回帰実行時に近似曲線（線形）をグラフへ重ねて表示します")
+        reg_row = QtWidgets.QHBoxLayout()
+        reg_row.addWidget(b_reg); reg_row.addWidget(self.ds_fit_check); reg_row.addStretch(1)
+        v.addLayout(reg_row)
+
+        # 統計・正規性・相関行列
+        brow = QtWidgets.QHBoxLayout()
+        b_desc = QtWidgets.QPushButton("記述統計"); b_desc.clicked.connect(self.show_describe)
+        b_desc.setToolTip("平均/中央値/標準偏差/分散/歪度/尖度/四分位 など")
+        b_norm = QtWidgets.QPushButton("正規性検定"); b_norm.clicked.connect(self.run_normality)
+        b_norm.setToolTip("Shapiro-Wilk 検定（scipy 必要）")
+        b_corr = QtWidgets.QPushButton("相関行列"); b_corr.clicked.connect(self.show_corr_matrix)
+        b_corr.setToolTip("選択中の全Y系列どうしのピアソン相関を行列で表示")
+        brow.addWidget(b_desc); brow.addWidget(b_norm); brow.addWidget(b_corr)
+        v.addLayout(brow)
+
+        # 任意関数フィット・検定
+        brow2 = QtWidgets.QHBoxLayout()
+        b_cfit = QtWidgets.QPushButton("任意関数フィット…")
+        b_cfit.setToolTip("モデル式（例: a*exp(-x/b)+c）とパラメータ初期値を指定して\n"
+                          "非線形フィット。パラメータ±標準誤差とR²を表示し、\n"
+                          "フィット曲線を新データとして重ね描きできます（scipy 必要）。")
+        b_cfit.clicked.connect(self.run_custom_fit)
+        b_tt = QtWidgets.QPushButton("t検定…")
+        b_tt.setToolTip("1標本（母平均と比較）／対応なし2標本（Welch）／対応あり2標本（scipy 必要）")
+        b_tt.clicked.connect(self.run_t_test)
+        b_an = QtWidgets.QPushButton("ANOVA")
+        b_an.setToolTip("一元配置分散分析。選択中の全Y系列を群として比較します（scipy 必要）")
+        b_an.clicked.connect(self.run_anova)
+        brow2.addWidget(b_cfit); brow2.addWidget(b_tt); brow2.addWidget(b_an)
+        v.addLayout(brow2)
+
+        self.ds_title = self._bold("結果")
+        v.addWidget(self.ds_title)
+        hint = QtWidgets.QLabel("右端の「表示」にチェックした項目は、その値をグラフに注記表示します。")
+        hint.setWordWrap(True); hint.setStyleSheet("color:#555;")
+        v.addWidget(hint)
+        self.ds_table = QtWidgets.QTableWidget(0, 3)
+        self.ds_table.setHorizontalHeaderLabels(["項目", "値", "表示"])
+        hh = self.ds_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.ds_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._wire_table_export(self.ds_table, "統計解析")
+        v.addWidget(self.ds_table, 1)
+        return outer

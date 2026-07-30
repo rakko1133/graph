@@ -1,7 +1,9 @@
 """高度解析：マスク/リミット合否、アイダイアグラム、ジッタ、シリアルプロトコル解読。
 
 ハイエンドオシロ相当の解析機能を後処理で提供する。プロトコル解読は
-UART（1線）、I2C（SCL/SDA）、SPI（SCK/MOSI[/CS]）に対応。
+UART（1線）、I2C（SCL/SDA）、SPI（SCK/MOSI[/CS]）、
+CAN（1線・標準/拡張ID・デスタッフィング・CRC15検証）、
+LIN（1線・break/sync/PID/チェックサム検証）、1-Wire（1線・標準速度）に対応。
 """
 
 import numpy as np
@@ -11,10 +13,9 @@ import analysis
 
 # ----------------------------------------------------------------- 共通
 def auto_threshold(y):
-    top, base = analysis.histogram_top_base(y)
-    if top is None:
-        return float(np.nanmean(y))
-    return (top + base) / 2.0
+    """ロジック判定のしきい値（Top/Base の中点。取れなければ平均）。"""
+    level = analysis.mid_level(y, require_span=False)
+    return float(np.nanmean(y)) if level is None else level
 
 
 def _logic(y, threshold):
@@ -24,26 +25,7 @@ def _logic(y, threshold):
 
 def crossings(t, y, level, edge="both"):
     """level を横切る時刻（線形補間）を返す。edge: rising/falling/both。"""
-    t = np.asarray(t, dtype=float)
-    y = np.asarray(y, dtype=float)
-    below = y < level
-    up = np.where(below[:-1] & ~below[1:])[0]
-    dn = np.where(~below[:-1] & below[1:])[0]
-
-    def interp(idx):
-        idx = np.asarray(idx, dtype=int)
-        if idx.size == 0:
-            return np.asarray([], dtype=float)
-        y1, y2 = y[idx], y[idx + 1]
-        denom = y2 - y1
-        frac = np.where(denom != 0.0, (level - y1) / np.where(denom != 0.0, denom, 1.0), 0.0)
-        return t[idx] + frac * (t[idx + 1] - t[idx])
-
-    if edge == "rising":
-        return interp(up)
-    if edge == "falling":
-        return interp(dn)
-    return np.sort(np.concatenate([interp(up), interp(dn)]))
+    return analysis.crossing_times(t, y, level, edge=edge)
 
 
 def _level_at(t, logic, time):
@@ -278,6 +260,293 @@ def decode_i2c(t, scl, sda, threshold=None):
         flush_byte()
         events.append({"time": float(t[idx]),
                        "type": "START" if kind == "S" else "STOP"})
+    return events
+
+
+# ----------------------------------------------------------------- CAN
+def _can_crc15(bits):
+    """CAN の CRC-15（多項式 0x4599）。SOF〜データ末尾のデスタッフ後ビット列に対して計算。"""
+    crc = 0
+    for b in bits:
+        inv = (b & 1) ^ ((crc >> 14) & 1)
+        crc = (crc << 1) & 0x7FFF
+        if inv:
+            crc ^= 0x4599
+    return crc
+
+
+def decode_can(t, y, bitrate, threshold=None, dominant="low"):
+    """CAN（1線）を解読してフレーム一覧を返す。
+
+    dominant="low": RXピン等でドミナント=Low の信号（既定）。
+    dominant="high": CANH-CANL の差動などドミナント=High の信号。
+    標準(11bit)・拡張(29bit)ID、ビットスタッフィング除去、CRC-15検証に対応。
+    各要素 {time, id, ext, rtr, dlc, data(list), hex, crc_ok}。
+    """
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if threshold is None:
+        threshold = auto_threshold(y)
+    logic = _logic(y, threshold)
+    dom = (1 - logic) if dominant == "low" else logic   # 1=ドミナント
+    bit_t = 1.0 / float(bitrate)
+    tend = t[-1]
+    n = len(t)
+    frames = []
+    i = 0
+    while i < n - 1:
+        if not (dom[i] == 0 and dom[i + 1] == 1):   # recessive→dominant = SOF候補
+            i += 1
+            continue
+        sof_t = t[i + 1]
+        frame, end_t = _read_can_frame(t, dom, sof_t, bit_t, tend)
+        if frame is not None:
+            frames.append(frame)
+            i = max(int(np.searchsorted(t, end_t)), i + 1)
+        else:
+            i += 1
+    return frames
+
+
+def _read_can_frame(t, dom, sof_t, bit_t, tend):
+    """SOF位置から1フレームを読む。失敗時は (None, _)。戻り値 (frame, フレーム終端時刻)。"""
+    state = {"k": 0, "run_val": None, "run_len": 0}
+    crc_bits = []   # CRC計算対象（SOF〜データ末尾のデスタッフ後ビット）
+
+    def read_raw():
+        bt = sof_t + (state["k"] + 0.5) * bit_t
+        state["k"] += 1
+        if bt > tend:
+            return None
+        idx = min(int(np.searchsorted(t, bt)), len(dom) - 1)
+        return 0 if dom[idx] else 1   # CAN値（0=ドミナント）
+
+    def next_bit():
+        """デスタッフィング付きで1ビット読む（スタッフ相はSOF〜CRC末尾）。"""
+        b = read_raw()
+        if b is None:
+            return None
+        if state["run_len"] == 5:      # 直前5連続 → これはスタッフビット
+            if b == state["run_val"]:
+                return None            # スタッフエラー（フォーム崩れ）
+            state["run_val"], state["run_len"] = b, 1
+            b = read_raw()
+            if b is None:
+                return None
+        if b == state["run_val"]:
+            state["run_len"] += 1
+        else:
+            state["run_val"], state["run_len"] = b, 1
+        return b
+
+    def take(nbits, into_crc=True):
+        v = 0
+        for _ in range(nbits):
+            b = next_bit()
+            if b is None:
+                return None
+            if into_crc:
+                crc_bits.append(b)
+            v = (v << 1) | b
+        return v
+
+    # SOF（ドミナント=0）はビット位置0。読み出しはID先頭（位置1）から始める
+    state["k"] = 1
+    state["run_val"], state["run_len"] = 0, 1
+    crc_bits.append(0)
+    ident = take(11)
+    b1 = take(1)          # RTR（標準）または SRR（拡張）
+    ide = take(1)
+    if None in (ident, b1, ide):
+        return None, sof_t
+    if ide:               # 拡張フレーム
+        id_ext = take(18)
+        rtr = take(1)
+        take(2)           # r1, r0
+        if None in (id_ext, rtr):
+            return None, sof_t
+        full_id = (ident << 18) | id_ext
+    else:
+        rtr = b1
+        take(1)           # r0
+        full_id = ident
+    dlc = take(4)
+    if dlc is None:
+        return None, sof_t
+    ndata = 0 if rtr else min(dlc, 8)
+    data = []
+    for _ in range(ndata):
+        v = take(8)
+        if v is None:
+            return None, sof_t
+        data.append(v)
+    crc_calc = _can_crc15(crc_bits)
+    crc = take(15, into_crc=False)
+    if crc is None:
+        return None, sof_t
+    read_raw()            # CRCデリミタ（以降スタッフなし）
+    read_raw()            # ACKスロット（受信ノードが居ないと recessive のまま＝判定しない）
+    end_t = sof_t + (state["k"] + 10) * bit_t   # ACKデリミタ＋EOF(7)+IFS(3)ぶん進める
+    frame = {"time": float(sof_t), "id": int(full_id), "ext": bool(ide),
+             "rtr": bool(rtr), "dlc": int(dlc), "data": [int(d) for d in data],
+             "hex": " ".join(f"{d:02X}" for d in data),
+             "crc_ok": bool(crc_calc == crc)}
+    return frame, end_t
+
+
+# ----------------------------------------------------------------- LIN
+def decode_lin(t, y, baud=19200, threshold=None):
+    """LIN（1線）を解読。break→sync(0x55)→PID→データ→チェックサムを返す。
+
+    チェックサムは classic（データのみ）/ enhanced（PID込み）の両方式で照合し、
+    どちらかが一致すれば ok とする。各要素 {time, type, ...}。
+    """
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if threshold is None:
+        threshold = auto_threshold(y)
+    logic = _logic(y, threshold)
+    bit_t = 1.0 / float(baud)
+    events = []
+    n = len(t)
+    i = 0
+    while i < n - 1:
+        if not (logic[i] == 1 and logic[i + 1] == 0):
+            i += 1
+            continue
+        low_start = t[i + 1]
+        j = i + 1
+        while j < n - 1 and logic[j + 1] == 0:
+            j += 1
+        low_len = t[min(j + 1, n - 1)] - low_start
+        if low_len < 11 * bit_t:      # breakは11ビット時間以上のLow
+            i += 1
+            continue
+        events.append({"time": float(low_start), "type": "BREAK"})
+        # break後のバイト列をUARTとして読む（次のbreakまたは終端まで）
+        seg_start = t[min(j + 1, n - 1)]
+        seg_bytes = _lin_read_bytes(t, logic, seg_start, bit_t)
+        if not seg_bytes:
+            i = j + 1
+            continue
+        vals = [b["value"] for b in seg_bytes]
+        k = 0
+        if vals and vals[0] == 0x55:
+            events.append({"time": seg_bytes[0]["time"], "type": "SYNC", "value": 0x55})
+            k = 1
+        if k < len(vals):
+            pid = vals[k]
+            fid = pid & 0x3F
+            p0 = (fid ^ (fid >> 1) ^ (fid >> 2) ^ (fid >> 4)) & 1
+            p1 = (~((fid >> 1) ^ (fid >> 3) ^ (fid >> 4) ^ (fid >> 5))) & 1
+            pid_ok = pid == (fid | (p0 << 6) | (p1 << 7))
+            events.append({"time": seg_bytes[k]["time"], "type": "PID",
+                           "value": fid, "ok": bool(pid_ok)})
+            data = vals[k + 1:-1]
+            if data or len(vals) > k + 1:
+                csum = vals[-1]
+
+                def _lin_sum(vals0):
+                    """LINのチェックサム＝キャリー巻き込み加算の反転。"""
+                    s = 0
+                    for v in vals0:
+                        s += v
+                        if s > 0xFF:
+                            s = (s & 0xFF) + 1
+                    return (~s) & 0xFF
+
+                classic = _lin_sum(data) if data else None
+                enhanced = _lin_sum([pid] + data)
+                ok = csum in (classic, enhanced)
+                for bi, v in zip(seg_bytes[k + 1:-1], data):
+                    events.append({"time": bi["time"], "type": "data", "value": v})
+                events.append({"time": seg_bytes[-1]["time"], "type": "CSUM",
+                               "value": csum, "ok": bool(ok)})
+        i = max(int(np.searchsorted(t, seg_bytes[-1]["time"] + 10 * bit_t)), j + 1)
+    return events
+
+
+def _lin_read_bytes(t, logic, start_t, bit_t, max_bytes=12):
+    """start_t 以降のUART(8N1)バイトを、アイドルが2バイト時間続くまで読む。"""
+    out = []
+    tend = t[-1]
+    cur = start_t
+    n = len(t)
+    while len(out) < max_bytes:
+        # 次のスタートビット（立下り）を探す
+        i = int(np.searchsorted(t, cur))
+        while i < n - 1 and not (logic[i] == 1 and logic[i + 1] == 0):
+            i += 1
+        if i >= n - 1:
+            break
+        st = t[i + 1]
+        if st - cur > 20 * bit_t and out:   # フレーム間ギャップで打ち切り
+            break
+        if st + 10 * bit_t > tend:
+            break
+        val = 0
+        for k in range(8):
+            idx = min(int(np.searchsorted(t, st + (1.5 + k) * bit_t)), n - 1)
+            val |= (int(logic[idx]) & 1) << k
+        out.append({"time": float(st), "value": val})
+        cur = st + 10 * bit_t
+    return out
+
+
+# ----------------------------------------------------------------- 1-Wire
+def decode_onewire(t, y, threshold=None, time_scale=1.0):
+    """1-Wire（標準速度）を解読。リセット/プレゼンス/バイト列を返す。
+
+    Lowパルス幅で判定: >480µs=リセット、<20µs=1、20〜120µs=0（LSBファースト）。
+    time_scale: 時間軸が秒でない場合の倍率（例: msの列なら1e-3）。
+    """
+    t = np.asarray(t, dtype=float) * float(time_scale)
+    y = np.asarray(y, dtype=float)
+    if threshold is None:
+        threshold = auto_threshold(y)
+    logic = _logic(y, threshold)
+    n = len(t)
+    # Lowパルス（立下り→立上り）を列挙
+    pulses = []
+    i = 0
+    while i < n - 1:
+        if logic[i] == 1 and logic[i + 1] == 0:
+            start = t[i + 1]
+            j = i + 1
+            while j < n - 1 and logic[j + 1] == 0:
+                j += 1
+            end = t[min(j + 1, n - 1)]
+            pulses.append((start, end - start))
+            i = j + 1
+        else:
+            i += 1
+    events = []
+    bits, bit_t0 = [], None
+    last_reset_end = None
+    for start, width in pulses:
+        if width >= 480e-6:              # リセットパルス
+            if bits:                      # 中途半端なビットは破棄
+                bits, bit_t0 = [], None
+            events.append({"time": float(start), "type": "RESET"})
+            last_reset_end = start + width
+            continue
+        # リセット直後の最初のLow（60µs級）はスレーブのプレゼンス応答
+        if (last_reset_end is not None and not bits
+                and start - last_reset_end < 500e-6 and width >= 40e-6):
+            events.append({"time": float(start), "type": "PRESENCE"})
+            last_reset_end = None
+            continue
+        last_reset_end = None
+        bit = 1 if width < 20e-6 else 0   # スロットのLow幅で0/1判定
+        if not bits:
+            bit_t0 = start
+        bits.append(bit)
+        if len(bits) == 8:
+            val = 0
+            for k, b in enumerate(bits):  # LSBファースト
+                val |= (b & 1) << k
+            events.append({"time": float(bit_t0), "type": "data", "value": int(val)})
+            bits, bit_t0 = [], None
     return events
 
 

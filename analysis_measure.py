@@ -4,8 +4,9 @@ import numpy as np
 
 from analysis_common import (sampling_rate, find_signal_peaks, _trapz,
                              _zero_crossing_period, _edge_time,
-                             histogram_top_base, _mid_crossings)
-from analysis_spectrum import dominant_frequency, find_spectral_peaks
+                             histogram_top_base, _mid_crossings,
+                             crossing_times, mid_level)
+from analysis_spectrum import dominant_frequency
 
 
 def measurements(t, y):
@@ -81,9 +82,8 @@ def measurements(t, y):
     add("サンプル数", float(y.size), "点")
     add("サンプリング周波数", sampling_rate(t), "Hz")
 
-    # --- 追加測定（中央値/リプル/スルーレート/サイクル統計/ヒストグラム由来）---
+    # --- 追加測定（中央値/スルーレート/サイクル統計/ヒストグラム由来）---
     add("中央値 Median", float(np.nanmedian(y)) if has else None, "V")
-    add("リプル(AC RMS)", float(np.nanstd(y)) if has else None, "V")
     sr = slew_rate(t, y)
     add("スルーレート(立上り最大)", sr.get("rise"), "V/s")
     add("スルーレート(立下り最大)", sr.get("fall"), "V/s")
@@ -183,22 +183,11 @@ def edge_intervals(t, y, level=None):
     if np.isfinite(y).sum() < 4:
         return {}
     if level is None:
-        top, base = histogram_top_base(y)
-        if top is None or top <= base:
+        level = mid_level(y)
+        if level is None:
             return {}
-        level = (top + base) / 2.0
-    up, dn = _mid_crossings(t, y, level)
-
-    def cross_times(idx):
-        idx = np.asarray(idx, dtype=int)
-        if idx.size == 0:
-            return np.asarray([], dtype=float)
-        y1, y2 = y[idx], y[idx + 1]
-        denom = y2 - y1
-        f = np.where(denom != 0.0, (level - y1) / np.where(denom != 0.0, denom, 1.0), 0.0)
-        return t[idx] + f * (t[idx + 1] - t[idx])
-
-    ut, dt_ = cross_times(up), cross_times(dn)
+    ut = crossing_times(t, y, level, edge="rising")
+    dt_ = crossing_times(t, y, level, edge="falling")
     res = {}
     if ut.size >= 2:
         res["rise_to_rise"] = float(np.mean(np.diff(ut)))
@@ -222,10 +211,9 @@ def pulse_metrics(t, y, level=None):
     if finite.sum() < 4:
         return out
     if level is None:
-        top, base = histogram_top_base(y)
-        if top is None or top <= base:
+        level = mid_level(y)
+        if level is None:
             return out
-        level = (top + base) / 2.0
     up, down = _mid_crossings(t, y, level)
     out["rising_edges"] = float(len(up))
     # 高区間（up→次のdown）と低区間（down→次のup）の幅
@@ -312,10 +300,8 @@ def phase_delay(t, y1, y2):
 
 
 def analyze(t, y, n_peaks=5, smooth=0):
-    """ピーク・測定・FFT をまとめて返す便利関数。smooth で平滑化してピーク検出。"""
+    """ピーク・測定をまとめて返す便利関数。smooth で平滑化してピーク検出。"""
     return {
         "peaks": find_signal_peaks(y, t=t, n=n_peaks, smooth=smooth),
-        "troughs": find_signal_peaks(y, t=t, n=n_peaks, mode="min", smooth=smooth),
         "measurements": measurements(t, y),
-        "spectral_peaks": find_spectral_peaks(t, y, n=n_peaks),
     }

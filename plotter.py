@@ -96,16 +96,9 @@ _SCOPE_TYPES = ("折れ線", "散布図")
 # X↔Y 入れ替えが意味を持つ種別（2Dで x,y 両方を持つもの）
 _SWAP_TYPES = ("折れ線", "散布図", "面", "積み上げ面", "ステップ", "ステム",
                "2Dヒストグラム", "hexbin")
-# 3D で描くとき、種別名 → 3D描画の種類（_draw_3d が使う）
-_THREED_KIND = {"散布図": "scatter", "折れ線": "line", "棒": "bar", "曲面": "surface"}
 # 旧バージョンの『3D…』種別名 → 新しい2D種別名（3Dフラグは別途ON）
 _OLD_3D_ALIASES = {"3D散布図": "散布図", "3D折れ線": "折れ線",
                    "3D棒": "棒", "3D曲面": "曲面"}
-
-
-def can_be_3d(chart_type):
-    """『3D表示』チェックが効く種別か（3D描画に対応するか）。"""
-    return CHART_INFO.get(chart_type, {}).get("dim3") in ("optional", "always")
 
 
 def always_3d(chart_type):
@@ -393,7 +386,6 @@ def plot_series(
 
 def build_series_from_df(df, chart_type, x_col, y_cols):
     """単一 DataFrame から系列リストと categories を作る（後方互換・簡易用途）。"""
-    info = CHART_INFO[chart_type]
     y_cols = list(y_cols or [])
     categories = None
     series = []

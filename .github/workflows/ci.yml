@@ -38,5 +38,21 @@ jobs:
           python -m pyflakes $(git ls-files '*.py' | grep -vE '^(graph_onefile|tools/)') 2>&1 \
             | grep "undefined name '" | grep -v "may be undefined" && exit 1 || echo "no undefined names"
 
+      - name: Build single-file editions
+        # 生成物は git で管理しない（本体1行の修正で1万行超の差分が出るため）。
+        # CI では毎回ビルドして、結合が壊れていないことを確かめる。
+        run: |
+          python tools/build_onefile.py
+          python tools/build_simple_onefile.py
+
       - name: Run tests (offscreen)
         run: python -m pytest tests/ -v
+
+      - name: Upload single-file editions
+        # 「1ファイルだけ持ち出す」用途はここから取得できる
+        uses: actions/upload-artifact@v4
+        with:
+          name: single-file-editions
+          path: |
+            graph_onefile.py
+            graph_simple_onefile.py

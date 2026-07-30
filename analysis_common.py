@@ -243,7 +243,55 @@ def histogram_top_base(y, bins=256):
 
 def _mid_crossings(t, y, level):
     """level を上下に横切る位置（上昇・下降）を返す。"""
-    below = y < level
+    below = np.asarray(y, dtype=float) < level
     up = np.where(below[:-1] & ~below[1:])[0]
     down = np.where(~below[:-1] & below[1:])[0]
     return up, down
+
+
+def crossing_times(t, y, level, edge="both"):
+    """level を横切る時刻を線形補間で返す。edge: rising / falling / both。
+
+    交差の添字は `_mid_crossings` と同じ規約（`y < level` を基準に上昇・下降を
+    判定）。y2 == y1 のタイ点は補間できないので、その区間の始点の時刻を返す
+    （従来の実装と同じ扱い）。
+
+    以前は同じ補間が advanced.crossings と edge_intervals に写経されていた。
+    NaN の扱い・タイ点の扱いを片方だけ直すと測定値が食い違うため1本にする。
+    """
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    up, down = _mid_crossings(t, y, level)
+
+    def interp(idx):
+        idx = np.asarray(idx, dtype=int)
+        if idx.size == 0:
+            return np.asarray([], dtype=float)
+        y1, y2 = y[idx], y[idx + 1]
+        denom = y2 - y1
+        frac = np.where(denom != 0.0,
+                        (level - y1) / np.where(denom != 0.0, denom, 1.0), 0.0)
+        return t[idx] + frac * (t[idx + 1] - t[idx])
+
+    if edge == "rising":
+        return interp(up)
+    if edge == "falling":
+        return interp(down)
+    return np.sort(np.concatenate([interp(up), interp(down)]))
+
+
+def mid_level(y, require_span=True):
+    """ロジックのしきい値＝Top/Base の中点。決められなければ None。
+
+    require_span=True なら Top<=Base（振幅なし）も「決められない」とみなす。
+    False にすると Top/Base が取れた時点で中点を返す（auto_threshold の従来動作）。
+
+    以前は auto_threshold / edge_intervals / pulse_metrics が同じ計算を
+    別々に書いており、measurements() 1回で histogram_top_base が何度も走っていた。
+    """
+    top, base = histogram_top_base(y)
+    if top is None or base is None:
+        return None
+    if require_span and top <= base:
+        return None
+    return (top + base) / 2.0
