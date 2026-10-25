@@ -10,6 +10,7 @@
 
 import csv
 import os
+import re
 
 import pandas as pd
 
@@ -275,6 +276,77 @@ def _load_hdf5(path):
     return pd.DataFrame({k: pd.Series(v) for k, v in cols.items()})
 
 
+def _looks_headerless(path, encoding, delimiter):
+    """先頭の非空行が全て素の数値なら『ヘッダ無し』とみなして True を返す。
+
+    pd.read_csv は既定で先頭行を列名にするため、ヘッダの無い数値CSVでは先頭
+    サンプルが列名に消え、1行失われる（列名も数値文字列になる）。先頭行の全
+    トークンが数値ならその行はデータ＝ヘッダ無しと判断する。1トークンでも非数値
+    （列見出しらしい文字）があればヘッダありとみなす（保守的側＝誤検出で既存の
+    ヘッダ付きCSVを壊さない）。"""
+    try:
+        with open(path, encoding=encoding, errors="replace") as f:
+            first = ""
+            for line in f:
+                if line.strip():
+                    first = line.rstrip("\r\n")
+                    break
+    except (OSError, LookupError):
+        return False
+    if not first:
+        return False
+    if delimiter and len(delimiter) == 1:
+        toks = first.split(delimiter)
+    elif delimiter:
+        toks = re.split(delimiter, first)
+    else:
+        toks = [first]
+    toks = [t.strip() for t in toks]
+    return bool(toks) and all(t != "" and _is_float(t) for t in toks)
+
+
+# 桁区切りは『3桁ごとのカンマ』が整った形だけを対象にする
+# （欧州式の小数カンマ '1,5' を 15 や 1 に壊さないため）。
+_THOUSANDS_RE = re.compile(r"^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?$")
+
+
+def _coerce_numeric_columns(df):
+    """読み込み直後の文字列(object)列を、桁区切り・SI接頭辞/単位付き数値なら数値列へ戻す。
+
+    pd.read_csv は '1,234'（桁区切り）や '3.3k' '1.2V'（単位付き）を数値にできず
+    NaN にするため、列ごと数値列判定から漏れたり、混在行が黙って脱落する。これを
+    アプリ共通の数値規約（parse_eng: m=ミリ, k=キロ…。'1.2V' は単位のみで 1.2）で
+    数値化し、素の to_numeric より多く値を救えて8割以上が数値になる列だけ置き換える。
+    数値化できない列・一部しか数値でない列・桁区切りでないカンマを含む値はそのまま
+    （カテゴリ扱いや欧州式小数を壊さない）。"""
+    from plotter_format import parse_eng
+
+    def parse1(v):
+        if not isinstance(v, str):
+            return v
+        s = v.strip()
+        if not s:
+            return None
+        if _THOUSANDS_RE.match(s):       # 1,234 / -5,000 / 12,345.6
+            s = s.replace(",", "")
+        elif "," in s:                   # 桁区切りでないカンマ（欧州式小数等）は数値化しない
+            return None
+        return parse_eng(s, default=None)
+
+    for c in df.columns:
+        s = df[c]
+        if s.dtype.kind in "biufc":      # 既に数値/bool/complex は触らない
+            continue
+        sample = s.dropna().astype(str).head(200)   # 判定は先頭サンプルで安く行う
+        if sample.empty:
+            continue
+        raw_ok = pd.to_numeric(sample, errors="coerce").notna().mean()
+        new_ok = pd.to_numeric(sample.map(parse1), errors="coerce").notna().mean()
+        if new_ok >= 0.8 and new_ok > raw_ok:    # 救えて、かつ8割以上が数値の列だけ
+            df[c] = pd.to_numeric(s.map(parse1), errors="coerce")
+    return df
+
+
 def load_table(path, encoding=None, delimiter=None, sheet=None):
     """表・波形ファイルを読み込み (DataFrame, 使用encoding, 使用delimiter) を返す。
 
@@ -313,10 +385,15 @@ def load_table(path, encoding=None, delimiter=None, sheet=None):
     if delimiter is None:
         delimiter = detect_delimiter(path, encoding)
 
+    # ヘッダ有無を判定する。先頭行が全て数値なら『ヘッダ無し』とみなし（header=None）、
+    # 先頭サンプルが列名に消えて1行失われるのを防ぐ。列名は後で 列1,列2… を付ける。
+    headerless = _looks_headerless(path, encoding, delimiter)
+    header = None if headerless else 0
+
     # 単一文字区切りは高速な C エンジンで読み、失敗時のみ柔軟な python エンジンへ
     # フォールバックする（C は python の約7倍速い）。複数文字区切り等は python。
     use_c = bool(delimiter) and len(delimiter) == 1
-    base_kwargs = dict(sep=delimiter, skip_blank_lines=True)
+    base_kwargs = dict(sep=delimiter, skip_blank_lines=True, header=header)
 
     def _read(**extra):
         if use_c:
@@ -336,6 +413,12 @@ def load_table(path, encoding=None, delimiter=None, sheet=None):
 
     if df.shape[1] == 0:
         raise ValueError("列を読み取れませんでした。区切り文字を確認してください。")
+
+    if headerless:   # 既定の整数列名(0,1,…)は分かりにくいので 列1,列2… にする
+        df.columns = [f"列{i + 1}" for i in range(df.shape[1])]
+
+    # 桁区切り '1,234' や SI接頭辞/単位付き '3.3k' '1.2V' を数値列へ復元する。
+    df = _coerce_numeric_columns(df)
 
     return _normalize_columns(df), encoding, delimiter
 
