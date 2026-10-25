@@ -51,6 +51,12 @@ PACKAGES = {
                     "__init__"],
 }
 
+# ---- 同梱する単一モジュール（平坦化せず「本物のモジュール」として持つ）----
+# code_export は _num / _lit 等のヘルパ名が他モジュール（plotter_draw._num 等）と
+# 衝突し得るので、平坦化すると後勝ちで潰れる。excel_chart と同じく独立した名前空間へ
+# exec する。code_export は stdlib のみ依存・内部モジュール非依存なので単独で動く。
+EMBED_MODULES = ["code_export"]
+
 # ---- 結合前に落とす塊（1ファイル版では呼び出し元が無く、死にコードになるもの）----
 # (相対パス, 開始マーカ, 終了マーカ または None=ファイル末尾まで, 説明)
 # 開始マーカは**必ず1回だけ**一致すること。落とす範囲にトップレベル定義が
@@ -309,6 +315,77 @@ def package_sources(compact=False):
     return PACKAGE_TAIL.replace("{names}", repr(names)).replace("{blob}", blob)
 
 
+MODULE_TAIL = '''
+
+_EMBED_MODULE_NAMES = {names}
+_EMBED_MODULE_BLOB = "{blob}"
+
+
+def _embed_module_entries():
+    """埋め込んだ単一モジュールのソースを (名前 -> ソース) に復元する。"""
+    import base64 as _b64, zlib as _zlib
+    srcs = _zlib.decompress(_b64.b85decode(_EMBED_MODULE_BLOB)).decode("utf-8").split("\\0")
+    return dict(zip(_EMBED_MODULE_NAMES, srcs))
+
+
+def _install_module(mod_name):
+    """同梱した単一モジュール（code_export 等）を本物のモジュールとして sys.modules に載せる。
+
+    平坦化（同一名前空間への展開）だと同名ヘルパ（_num 等）が後勝ちで潰れるので、
+    excel_chart と同様に types.ModuleType で独立した名前空間を作り、そこで exec する。"""
+    import types as _types
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
+    src = _embed_module_entries()[mod_name]
+    mod = _types.ModuleType(mod_name)
+    mod.__file__ = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                mod_name + ".py")
+    sys.modules[mod_name] = mod
+    try:
+        exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    return mod
+'''
+
+
+def module_sources(compact=False):
+    """EMBED_MODULES のソースを、実行時に exec できる形の Python コードにする。
+
+    単一モジュール（パッケージでない）を、平坦化せず本物のモジュールとして持つ。
+    package_sources と同じく zlib+base85 の1行に畳んで埋め込み、その場で復元照合する。
+    """
+    if not EMBED_MODULES:
+        return ""
+    import base64
+    import zlib
+
+    names, srcs = [], []
+    for m in EMBED_MODULES:
+        path = os.path.join(ROOT, m + ".py")
+        src = open(path, encoding="utf-8").read()
+        if compact:
+            src = compact_source(src)
+        if not src.endswith("\n"):
+            src += "\n"
+        if "\0" in src:                     # 区切りに使う文字が中に居たら困る
+            raise SystemExit(f"[失敗] NUL を含むソース: {m}.py")
+        compile(src, path, "exec")          # 埋め込む前に構文を確かめる
+        names.append(m)
+        srcs.append(src)
+    blob = base64.b85encode(zlib.compress("\0".join(srcs).encode("utf-8"), 9)).decode("ascii")
+    if '"' in blob or "\\" in blob:
+        raise SystemExit("[失敗] base85 に引用符/バックスラッシュが混じった")
+    back = zlib.decompress(base64.b85decode(blob)).decode("utf-8").split("\0")
+    if back != srcs:                        # 復元できることをその場で確かめる
+        raise SystemExit("[失敗] 埋め込んだモジュールを復元できない")
+    raw = sum(len(s.encode("utf-8")) for s in srcs)
+    print(f"  同梱モジュールを圧縮: {raw / 1024:.0f} KB → {len(blob) / 1024:.0f} KB "
+          f"（{len(names)} モジュール、復元して照合済み）")
+    return MODULE_TAIL.replace("{names}", repr(names)).replace("{blob}", blob)
+
+
 def _same_ast(before, after, what):
     """変換の前後で構文木が完全に一致することを確かめる（文字列の中身も含む）。
 
@@ -553,6 +630,12 @@ def build(out_path=None, header=None, transform=None, tail="", compact=True,
                           r"\1" + pkg + " = _install_package(\"" + pkg + "\")", text)
         if n != 1:
             raise SystemExit(f"[失敗] `import {pkg}` が {n} 件（期待 1）")
+    # 同梱する単一モジュールの import も、埋め込みソースからの install 呼び出しに置き換える
+    for mod in EMBED_MODULES:
+        text, n = re.subn(r"(?m)^([ \t]*)import " + re.escape(mod) + r"[ \t]*$",
+                          r"\1" + mod + " = _install_module(\"" + mod + "\")", text)
+        if n != 1:
+            raise SystemExit(f"[失敗] `import {mod}` が {n} 件（期待 1）")
     check_cuts_unused(text)
     text = dedup_top_level_assigns(text)    # 同名・同内容のトップレベル代入を1本化
 
@@ -561,7 +644,7 @@ def build(out_path=None, header=None, transform=None, tail="", compact=True,
     # 圧縮ビルドのときは、埋め込む前にこちらも個別に縮めておく。
     pack_compact = compact or os.environ.get("ONEFILE_PACK_COMPACT") == "1"
     body = ("\n".join(external) + "\n\n" + text + "\n"
-            + package_sources(pack_compact) + tail)
+            + package_sources(pack_compact) + module_sources(pack_compact) + tail)
     if compact:
         before = len(body.encode("utf-8"))
         body = compact_source(body)
