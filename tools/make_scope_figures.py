@@ -8,7 +8,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import jp_font; jp_font.setup_japanese_font()
 
-OUT = r"C:\Users\motto\OneDrive\デスクトップ\グラフ\オシロ機能_図"
+OUT = r"C:\Users\motto\OneDrive\デスクトップ\グラフ\docs\オシロ機能_図"
 os.makedirs(OUT, exist_ok=True)
 BLUE, RED, GRAY, GREEN = "#1f77b4", "#d62728", "#888888", "#2ca02c"
 
