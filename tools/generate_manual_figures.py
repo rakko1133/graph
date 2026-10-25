@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(HERE, "説明書_図")
+OUT = os.path.join(HERE, "docs", "説明書_図")
 os.makedirs(OUT, exist_ok=True)
 sys.path.insert(0, HERE)
 import plotter, jp_font
