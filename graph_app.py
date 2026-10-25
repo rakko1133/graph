@@ -97,10 +97,24 @@ class HostMixin:
         import pandas as pd
         df = self.datasets[fl]
         xname = self.x_combo.currentText()
-        raw = df[xname].to_numpy() if xname in df.columns else df.iloc[:, 0].to_numpy()
-        t = pd.to_numeric(pd.Series(raw), errors="coerce").to_numpy(dtype=float)
-        if np.isnan(t).mean() > 0.5:  # 非数値Xはインデックスを時間軸とみなす
-            t = np.arange(len(t), dtype=float)
+        col_x = df[xname] if xname in df.columns else df.iloc[:, 0]
+        sx = pd.Series(col_x)
+        if pd.api.types.is_datetime64_any_dtype(sx):
+            # 日時列は to_numeric がエポックからのナノ秒(≈1.7e18)にしてしまうので、
+            # 先頭サンプルからの経過秒[float]へ（周波数Hz・周期sが正しく出る）。描画
+            # 側(_coerce_x)と同じ変換なので測定と描画のX軸が食い違わない。
+            t = plotter.elapsed_seconds(sx)
+        else:
+            t = pd.to_numeric(sx, errors="coerce").to_numpy(dtype=float)
+            if np.isnan(t).mean() > 0.5:   # 非数値X: 文字列の日時か、カテゴリか
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    dt = pd.to_datetime(sx, errors="coerce")
+                if dt.notna().mean() > 0.5:
+                    t = plotter.elapsed_seconds(dt)        # 日時→経過秒
+                else:
+                    t = np.arange(len(sx), dtype=float)    # カテゴリ等はサンプル番号
         y = pd.to_numeric(pd.Series(df[col].to_numpy()), errors="coerce").to_numpy(dtype=float)
         if gated:
             t, y = self._apply_measure_window(t, y)

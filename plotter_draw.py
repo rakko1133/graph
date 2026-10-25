@@ -24,9 +24,32 @@ def style_for(series):
     return s
 
 
+def elapsed_seconds(values):
+    """日時列を『先頭サンプルからの経過秒(float)』へ変換する。
+
+    datetime64 列や日時文字列を、to_numeric（＝エポックからのナノ秒や全NaN）に
+    頼らず実時間[秒]にする。NaT は NaN。測定(series_xy)と描画で同一の時間軸を
+    使うための共通関数（周波数Hz・周期s・立上り時間sが正しく出る）。"""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dt = pd.to_datetime(pd.Series(values), errors="coerce")
+    valid = dt.dropna()
+    if valid.empty:
+        return np.full(len(dt), np.nan, dtype=float)
+    return ((dt - valid.iloc[0]) / pd.Timedelta(seconds=1)).to_numpy(dtype=float)
+
+
 def _coerce_x(values):
-    """X 軸の値を数値 / 日時 / カテゴリへ変換し (values, kind) を返す。"""
+    """X 軸の値を数値 / 日時 / カテゴリへ変換し (values, kind) を返す。
+
+    日時は『先頭からの経過秒(float)』にして kind="numeric" で返す。こうすると
+    測定(series_xy)側と同じ時間軸になり、周波数・周期・立上り時間が正しく出る。
+    以前は datetime64 をそのまま float 化してエポックからのナノ秒(≈1.7e18)の軸に
+    なり、日付目盛りにもならず、測定と意味が食い違っていた。"""
     s = pd.Series(values)
+    # 日時dtypeは to_numeric がナノ秒整数にしてしまうので、数値判定より先に経過秒へ。
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return elapsed_seconds(s), "numeric"
     num = pd.to_numeric(s, errors="coerce")
     if num.notna().mean() >= 0.8:
         return num.to_numpy(dtype=float), "numeric"
@@ -37,7 +60,7 @@ def _coerce_x(values):
         except Exception:
             dt = pd.Series([pd.NaT] * len(s))
     if dt.notna().mean() >= 0.8:
-        return dt.to_numpy(), "datetime"
+        return elapsed_seconds(dt), "numeric"   # 日時→経過秒[float]
     return s.astype(str).to_numpy(), "category"
 
 
