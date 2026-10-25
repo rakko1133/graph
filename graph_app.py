@@ -256,6 +256,8 @@ class UIBuildMixin:
         fm.addSeparator()
         self._menu_action(fm, "設定を保存...", self.save_config_dialog, "Ctrl+Shift+S")
         self._menu_action(fm, "設定を読み込み...", self.load_config_dialog, None)
+        self._menu_action(fm, "設定から Python コードを出力...", self.export_code_dialog, None,
+                          tip="現在の設定を再現する .py / .ipynb を書き出す")
         fm.addSeparator()
         self._menu_action(fm, "終了", self.close, "Ctrl+Q")
         # 編集
@@ -4441,6 +4443,11 @@ class PersistenceMixin:
     def _collect_config(self):
         return {
             "files": [self.meta[l]["path"] for l in self.datasets],
+            "file_meta": {l: {"path": self.meta.get(l, {}).get("path", ""),
+                              "enc": self.meta.get(l, {}).get("enc"),
+                              "delim": self.meta.get(l, {}).get("delim"),
+                              "sheet": self.meta.get(l, {}).get("sheet")}
+                          for l in self.datasets},
             "x_col": self.x_combo.currentText(),
             "z_col": self.z_combo.currentText() if hasattr(self, "z_combo") else "",
             "x_leftmost": self.xleft_check.isChecked(),
@@ -4648,6 +4655,25 @@ class PersistenceMixin:
         self._apply_config(cfg)
         self.draw_graph()
         self._set_status(f"設定を読み込み: {path}")
+
+    def export_code_dialog(self):
+        """現在の設定を再現する Python コード（.py / .ipynb）を書き出す。"""
+        if not self.datasets:
+            self.notify("先にファイルを追加してください。", "warn")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Python コードを出力",
+            os.path.join(self.last_dir, "graph_reproduce.py"),
+            "Python (*.py);;Jupyter Notebook (*.ipynb)")
+        if not path:
+            return
+        try:
+            import code_export
+            code_export.export_code(self._collect_config(), path)
+            self._set_status(f"コードを出力: {path}")
+            self.notify(f"コードを出力しました: {path}", "info")
+        except Exception as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self, "出力エラー", str(e))
 
     def _try_restore_session(self):
         cfg = config_io.load_last_session()
