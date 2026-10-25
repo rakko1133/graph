@@ -100,8 +100,8 @@ C:\.venv\Scripts\pythonw graph_app_simple.py
 無ければ自動でビルドしてから起動します。手動でビルドする場合:
 
 ```bash
-python tools/build_onefile.py          # graph_onefile.py（通常版・全機能）
-python tools/build_simple_onefile.py   # graph_simple_onefile.py（シンプル版）
+python tools/build_onefile.py          # 単一ファイル版/graph_onefile.py（通常版・全機能）
+python tools/build_simple_onefile.py   # 単一ファイル版/graph_simple_onefile.py（シンプル版）
 ```
 
 > CI でも毎回ビルドして、結合が壊れていないことを検証しています。
@@ -112,8 +112,8 @@ python tools/build_simple_onefile.py   # graph_simple_onefile.py（シンプル�
 
 | | 行数 | サイズ | 見た目テンプレート | 起動時の表示 |
 |---|---:|---:|---|---|
-| `graph_onefile.py` | 12,643 | 618 KB | LabPlot風/Veusz風/KST2風/Igor Pro風＋外観のみ切替 | 全部 |
-| `graph_simple_onefile.py` | **10,214** | **482 KB** | **無し**（標準の見た目のみ） | 基本 |
+| `単一ファイル版/graph_onefile.py` | 12,643 | 618 KB | LabPlot風/Veusz風/KST2風/Igor Pro風＋外観のみ切替 | 全部 |
+| `単一ファイル版/graph_simple_onefile.py` | **10,214** | **482 KB** | **無し**（標準の見た目のみ） | 基本 |
 
 シンプル版は**配って動かすためのファイル**なので、コメント・docstring・空行を
 落として作ります（動作は1ビットも変わりません。説明は元のモジュール側にあります）。

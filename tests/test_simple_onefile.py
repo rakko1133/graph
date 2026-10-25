@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.join(ROOT, "単一ファイル版"))
 
 import config_io  # noqa: E402
 config_io.load_last_session = lambda: None
@@ -46,7 +47,7 @@ FEATURES = (
 def _build_and_import():
     builder = importlib.import_module("build_simple_onefile")
     builder.build()
-    path = os.path.join(ROOT, "graph_simple_onefile.py")
+    path = os.path.join(ROOT, "単一ファイル版", "graph_simple_onefile.py")
     assert os.path.isfile(path)
     mod = importlib.import_module("graph_simple_onefile")
     return importlib.reload(mod) if "graph_simple_onefile" in sys.modules else mod
@@ -73,7 +74,7 @@ def test_simple_onefile_is_compact():
     「読むコード」は元のモジュール側にあるので、動かすための1ファイルからは
     説明文を落としてよい。落としても動作は1ビットも変わらない。"""
     S = sys.modules.get("graph_simple_onefile") or _build_and_import()
-    path = os.path.join(ROOT, "graph_simple_onefile.py")
+    path = os.path.join(ROOT, "単一ファイル版", "graph_simple_onefile.py")
     src = open(path, encoding="utf-8").read()
     assert S.__doc__, "先頭の説明（これは何のファイルか）は残す"
     body = src.split('"""', 2)[-1].lstrip("\n")   # 先頭の改行は分割の副産物
@@ -91,7 +92,7 @@ def test_simple_onefile_has_no_look_templates():
     S = sys.modules.get("graph_simple_onefile") or _build_and_import()
     assert set(S.GraphApp._UI_STYLES) == {"standard"}
     assert not hasattr(S.GraphApp, "_set_ui_style")
-    src = open(os.path.join(ROOT, "graph_simple_onefile.py"), encoding="utf-8").read()
+    src = open(os.path.join(ROOT, "単一ファイル版", "graph_simple_onefile.py"), encoding="utf-8").read()
     body = src.split('"""', 2)[-1]          # 冒頭の説明文は対象外
     for word in ("LabPlot風", "Veusz風", "KST2風", "Igor Pro風",
                  "配置は変えずに外観だけ"):
