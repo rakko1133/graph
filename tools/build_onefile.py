@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""全モジュールを1つの graph_onefile.py に結合するビルダー。
+"""全モジュールを1つの 単一ファイル版/graph_onefile.py に結合するビルダー。
 
 内部importを除去し、モジュール修飾（plotter. など）を平坦化して単一名前空間にする。
-使い方:  python tools/build_onefile.py   → プロジェクト直下に graph_onefile.py を生成
+使い方:  python tools/build_onefile.py   → 単一ファイル版/graph_onefile.py を生成
 """
 import os, re
 
 # このスクリプトは tools/ 配下にある前提。ROOT はその親（プロジェクト直下）。
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, "graph_onefile.py")
+OUT = os.path.join(ROOT, "単一ファイル版", "graph_onefile.py")
 
 # 連結順（facade analysis.py と graph_app_mixins/__init__.py は不要なので除外）
 ORDER = [
@@ -657,6 +657,7 @@ def build(out_path=None, header=None, transform=None, tail="", compact=True,
     if indent_width:
         body = shrink_indent(body, indent_width)
     out = header + body
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     open(out_path, "w", encoding="utf-8").write(out)
     # サイズは**バイト**で出す（len(str) は文字数なので、日本語コメントが多いこの
     # ファイルでは実ファイルサイズと2〜3割ずれる）

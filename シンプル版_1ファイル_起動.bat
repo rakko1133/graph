@@ -6,13 +6,13 @@ set "PY=C:\.venv\Scripts\python.exe"
 set "PYW=C:\.venv\Scripts\pythonw.exe"
 if not exist "%PY%" set "PY=python"
 if not exist "%PYW%" set "PYW=pythonw"
-if not exist "graph_simple_onefile.py" (
-  echo Building graph_simple_onefile.py ...
+if not exist "単一ファイル版\graph_simple_onefile.py" (
+  echo Building 単一ファイル版\graph_simple_onefile.py ...
   "%PY%" tools\build_simple_onefile.py
 )
-if not exist "graph_simple_onefile.py" (
+if not exist "単一ファイル版\graph_simple_onefile.py" (
   echo Build failed. Run the setup bat first.
   pause
   exit /b 1
 )
-start "" "%PYW%" graph_simple_onefile.py
+start "" "%PYW%" 単一ファイル版\graph_simple_onefile.py

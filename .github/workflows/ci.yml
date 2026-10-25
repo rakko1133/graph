@@ -35,7 +35,7 @@ jobs:
 
       - name: Syntax / undefined-name check (logic modules)
         run: |
-          python -m pyflakes $(git ls-files '*.py' | grep -vE '^(graph_onefile|tools/)') 2>&1 \
+          python -m pyflakes $(git ls-files '*.py' | grep -vE '^(単一ファイル版/|tools/)') 2>&1 \
             | grep "undefined name '" | grep -v "may be undefined" && exit 1 || echo "no undefined names"
 
       - name: Build single-file editions
@@ -54,5 +54,5 @@ jobs:
         with:
           name: single-file-editions
           path: |
-            graph_onefile.py
-            graph_simple_onefile.py
+            単一ファイル版/graph_onefile.py
+            単一ファイル版/graph_simple_onefile.py

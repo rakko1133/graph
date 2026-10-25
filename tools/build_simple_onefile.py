@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build_onefile                                    # noqa: E402
 
 ROOT = build_onefile.ROOT
-OUT = os.path.join(ROOT, "graph_simple_onefile.py")
+OUT = os.path.join(ROOT, "単一ファイル版", "graph_simple_onefile.py")
 
 UI = "graph_app.py"  # ui_build はメインに統合済み
 
