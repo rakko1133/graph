@@ -130,7 +130,12 @@ def spectrum_metrics(t, y, n_harm=6, window="hann", half_bins=3):
     spur = power.copy()
     spur[0] = 0
     spur[fa:fb] = 0
-    sfdr = float(10 * np.log10(p_fund / spur.max())) if spur.max() > 0 else None
+    # SFDR は『基本波ピーク 対 最大スプリアスピーク』で、両方とも単一ビンの最大で
+    # 揃える。分子に p_fund（バンド合算）を使うと、窓漏れのとき分子だけ主ローブ数ビン
+    # ぶん膨らみ、単一ビンのスプリアスと比べて SFDR が過大評価になる。
+    fund_peak = float(power[fa:fb].max())
+    spur_peak = float(spur.max())
+    sfdr = float(10 * np.log10(fund_peak / spur_peak)) if spur_peak > 0 else None
 
     return {"f0": f0, "THD_pct": thd, "THD_dB": thd_db, "SNR_dB": snr,
             "SINAD_dB": sinad, "ENOB_bits": enob, "SFDR_dB": sfdr}

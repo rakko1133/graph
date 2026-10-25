@@ -19,10 +19,51 @@ def sampling_rate(t):
     return 1.0 / dt if dt > 0 else None
 
 
-def _simple_peaks(sig, distance=1):
-    """scipy が無い場合の素朴な極大検出。"""
+def _simple_peaks(sig, distance=1, prominence=None):
+    """scipy が無い場合の極大検出。scipy.signal.find_peaks の振る舞いに寄せる。
+
+    - prominence: 各ピークの左右で、そのピークより高いサンプル（無ければ端）までの
+      間の最小値を base とし、peak - max(左base, 右base) を顕著さとする。値を渡すと
+      その顕著さ未満のピークを捨てる。
+    - distance: ピーク間の最小サンプル間隔。高いピークから優先して採用し、採用済み
+      ピークから distance 未満のピークを捨てる（find_peaks と同じ高さ基準）。
+    返り値: (idx, proms)。idx は時間順、proms は対応する顕著さ。
+
+    以前は distance を無視し顕著さも返さなかったため、scipy の有無で主ピークの
+    本数・順位が食い違っていた。"""
+    sig = np.asarray(sig, dtype=float)
+    n = sig.size
     idx = np.where((sig[1:-1] > sig[:-2]) & (sig[1:-1] >= sig[2:]))[0] + 1
-    return idx
+    if idx.size == 0:
+        return idx, np.asarray([], dtype=float)
+
+    proms = np.empty(idx.size, dtype=float)
+    for k, p in enumerate(idx):
+        h = sig[p]
+        i, left = p - 1, h
+        while i >= 0 and sig[i] < h:        # h 以上に達するまでの左側最小値
+            left = min(left, sig[i]); i -= 1
+        j, right = p + 1, h
+        while j < n and sig[j] < h:          # 右側最小値
+            right = min(right, sig[j]); j += 1
+        proms[k] = h - max(left, right)
+
+    if prominence is not None:
+        keep = proms >= prominence
+        idx, proms = idx[keep], proms[keep]
+        if idx.size == 0:
+            return idx, proms
+
+    if distance and distance > 1 and idx.size > 1:
+        keep = np.zeros(idx.size, dtype=bool)
+        removed = np.zeros(idx.size, dtype=bool)
+        for k in np.argsort(sig[idx])[::-1]:         # 高いピークから採用
+            if removed[k]:
+                continue
+            keep[k] = True
+            removed |= np.abs(idx - idx[k]) < distance   # 近接ピーク（自身含む）を除去
+        idx, proms = idx[keep], proms[keep]
+    return idx, proms
 
 
 def smooth_signal(y, window):
@@ -69,8 +110,8 @@ def find_signal_peaks(y, t=None, n=5, prominence_frac=0.05, distance=None,
         idx, props = find_peaks(sig, **kwargs)
         proms = props.get("prominences")
     else:
-        idx = _simple_peaks(sig, distance or 1)
-        proms = None
+        idx, proms = _simple_peaks(
+            sig, distance=int(distance) if distance else 1, prominence=prom)
 
     if len(idx) == 0:
         return []

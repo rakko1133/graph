@@ -86,13 +86,26 @@ def describe(y):
             d["kurtosis"] = 0.0
     except Exception:
         if std > 0:
-            z = (y - mean) / std
-            d["skew"] = float(np.mean(z ** 3))
-            d["kurtosis"] = float(np.mean(z ** 4) - 3.0)
+            d["skew"], d["kurtosis"] = _moment_skew_kurtosis(y, mean)
         else:
             d["skew"] = 0.0
             d["kurtosis"] = 0.0
     return d
+
+
+def _moment_skew_kurtosis(y, mean):
+    """scipy 非搭載時の歪度・過剰尖度（scipy.stats と同じ母モーメント定義）。
+
+    scipy.stats.skew/kurtosis は母モーメント（分母＝母標準偏差 m2**0.5。ddof=0）で
+    定義される。以前のフォールバックは標本標準偏差(ddof=1)で z 標準化していたため、
+    歪度で係数 ((N-1)/N)**1.5、尖度で ((N-1)/N)**2 ぶん系統的にずれ、小標本ほど
+    大きく外れた。母分散 m2 で正規化して scipy 経路と一致させる。"""
+    d0 = np.asarray(y, dtype=float) - mean
+    m2 = float(np.mean(d0 ** 2))
+    if m2 <= 0:
+        return 0.0, 0.0
+    return (float(np.mean(d0 ** 3) / m2 ** 1.5),
+            float(np.mean(d0 ** 4) / m2 ** 2 - 3.0))
 
 
 def correlation(x, y, method="pearson"):
