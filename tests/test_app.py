@@ -50,6 +50,48 @@ def _wave():
                          "電流": np.cos(2 * np.pi * 500 * t)})
 
 
+def test_datetime_x_axis_is_elapsed_seconds():
+    """回帰(issue #1): 日時列をX軸にしても時間軸が経過秒になり周波数が正しい。
+
+    以前は series_xy / _coerce_x が日時を数値化して、文字列日時→サンプル番号、
+    datetime64→エポックからのナノ秒(≈1.7e18) になり、測定(Hz・秒)が黙って桁違いに
+    狂っていた。両経路を『先頭サンプルからの経過秒』へ統一したことを固定する。
+    """
+    import analysis
+    from plotter_draw import _coerce_x, elapsed_seconds
+
+    fs, f0, n = 1000.0, 100.0, 1000          # 1kHz サンプリング / 100Hz 信号
+    i = np.arange(n)
+    y = np.sin(2 * np.pi * f0 * i / fs)
+    start = pd.Timestamp("2024-01-01 00:00:00")
+    dt64 = pd.to_datetime([start + pd.Timedelta(seconds=k / fs) for k in i])
+    strs = [d.strftime("%Y-%m-%d %H:%M:%S.%f") for d in dt64]
+
+    # 共通ヘルパ: 経過秒[s]（ナノ秒でもサンプル番号でもない）
+    es = elapsed_seconds(dt64.to_numpy())
+    assert np.allclose(np.diff(es), 1 / fs)
+    assert es.max() < 1.0                      # 秒であってナノ秒(≈1.7e18)ではない
+    xv, kind = _coerce_x(dt64.to_numpy())      # 描画経路: 日時→数値(経過秒)
+    assert kind == "numeric" and xv.max() < 1.0
+
+    # 測定経路: datetime64 と 文字列日時 の両方で 1kHz/100Hz を復元する
+    for xcol in (dt64, np.array(strs, dtype=object)):
+        w = _make_app(pd.DataFrame({"時間": xcol, "電圧": y}), x="時間")
+        t, yy = w.series_xy("t.csv", "電圧")
+        assert abs(1.0 / np.median(np.diff(t)) - fs) < 1.0      # サンプリング≈1kHz
+        freqs, amp = analysis.fft_spectrum(t, yy)
+        assert abs(float(freqs[1:][np.argmax(amp[1:])]) - f0) < 2.0   # ピーク≈100Hz
+        w.close()
+
+    # 回帰防止: 数値Xは従来どおり / 非日時文字列はサンプル番号
+    w = _make_app(pd.DataFrame({"時間": i / fs, "電圧": y}), x="時間")
+    assert abs(1.0 / np.median(np.diff(w.series_xy("t.csv", "電圧")[0])) - fs) < 1.0
+    w.close()
+    w = _make_app(pd.DataFrame({"時間": [f"c{k}" for k in i], "電圧": y}), x="時間")
+    assert np.allclose(w.series_xy("t.csv", "電圧")[0], np.arange(n))
+    w.close()
+
+
 # ---------------- スモーク（GUI が壊れていないか）----------------
 def test_construct():
     w = _make_app(_wave())
