@@ -224,6 +224,7 @@ class DataIOMixin:
         thread.one_done.connect(_on_one)
         thread.progressed.connect(_on_progress)
         thread.finished.connect(_on_finished)
+        thread.finished.connect(thread.deleteLater)   # 完了スレッドを溜めない
         self.progress_strip.start(f"読み込み中…（0/{len(jobs)}）", len(jobs))
         thread.start()
         return thread
@@ -236,12 +237,17 @@ class DataIOMixin:
             self._set_status("読み込みの中止を要求しました（実行中の1件が終わり次第停止）。")
 
     def _stop_background_tasks(self):
-        """終了時にワーカースレッドを止める（スレッド生存中の破棄を避ける）。"""
+        """終了時にワーカースレッドを止める（スレッド生存中の破棄で異常終了しないように）。"""
         thread = getattr(self, "_load_thread", None)
-        if thread is not None:
-            thread.cancel()
-            thread.wait(5000)
-            self._load_thread = None
+        if thread is not None and thread.isRunning():
+            thread.cancel()                       # 実行中の1件が終わり次第停止する
+            if not thread.wait(30000):
+                # 巨大ファイルの load_table 実行中は cancel が効かず終わらない。実行中
+                # スレッドを抱えたまま破棄すると "QThread: Destroyed while thread is
+                # still running" で異常終了するので、最終手段で終了させてから待つ。
+                thread.terminate()
+                thread.wait()
+        self._load_thread = None
 
     def wait_for_loads(self, timeout_ms=30000):
         """非同期読み込みの完了を待つ（スクリプト・テストから使う同期用）。
