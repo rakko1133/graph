@@ -54,8 +54,14 @@ class HostMixin:
                 try:
                     fn(self, self.ax)
                 except Exception:
-                    applog.get_logger().debug(
-                        "draw_overlay 失敗: %s", getattr(plugin, "key", "?"), exc_info=True)
+                    # 毎フレーム呼ばれるので、同じタブは初回だけ warning、以降は debug に
+                    # 落とす（ログ氾濫を避けつつ、握りつぶしで不具合が隠れないようにする）。
+                    key = getattr(plugin, "key", "?")
+                    seen = self.__dict__.setdefault("_overlay_warned", set())
+                    log = applog.get_logger()
+                    (log.debug if key in seen else log.warning)(
+                        "draw_overlay 失敗: %s", key, exc_info=True)
+                    seen.add(key)
 
     def _collect_plugin_config(self):
         """各登録タブの collect_config(app) を集めて {key: 設定dict} で返す。"""
@@ -66,8 +72,9 @@ class HostMixin:
                 try:
                     out[plugin.key] = fn(self)
                 except Exception:
-                    applog.get_logger().debug(
-                        "collect_config 失敗: %s", getattr(plugin, "key", "?"), exc_info=True)
+                    applog.get_logger().warning(
+                        "collect_config 失敗（このタブの設定は保存されません）: %s",
+                        getattr(plugin, "key", "?"), exc_info=True)
         return out
 
     def _apply_plugin_config(self, saved):
@@ -80,8 +87,10 @@ class HostMixin:
                 try:
                     fn(self, saved.get(plugin.key, {}))
                 except Exception:
-                    applog.get_logger().debug(
-                        "apply_config 失敗: %s", getattr(plugin, "key", "?"), exc_info=True)
+                    key = getattr(plugin, "key", "?")
+                    applog.get_logger().warning(
+                        "apply_config 失敗（設定を復元できません）: %s", key, exc_info=True)
+                    self.notify(f"タブ「{key}」の設定を復元できませんでした。", "warn")
 
     def series_xy(self, fl, col, gated=False):
         """指定系列(fl,col)の (t, y) を数値配列で返す。
@@ -4322,6 +4331,7 @@ class BatchMixin:
             if use_pool:
                 try:
                     import concurrent.futures as _cf
+                    from concurrent.futures.process import BrokenProcessPool
                     workers = min(8, (os.cpu_count() or 1))
                     with _cf.ProcessPoolExecutor(max_workers=workers) as ex:
                         futs = {ex.submit(batch_render.render_one, t): t for t in tasks}
@@ -4334,6 +4344,8 @@ class BatchMixin:
                                 break
                             try:
                                 saved.append(fut.result())
+                            except BrokenProcessPool:
+                                raise      # ワーカー異常終了は致命的→外側で逐次へ切替
                             except Exception as e:  # noqa: BLE001
                                 skipped.append(
                                     f"{os.path.basename(futs[fut]['path'])}（{e}）")
@@ -4341,10 +4353,11 @@ class BatchMixin:
                             prog.setLabelText(f"出力中… {done}/{total}")
                             prog.setValue(done)
                             QtWidgets.QApplication.processEvents()
-                except Exception as e:  # noqa: BLE001  プール作成失敗/壊れ→逐次へ
+                except Exception as e:  # noqa: BLE001  プール作成失敗/ワーカー崩壊→逐次へ
                     self._set_status(f"並列出力に失敗、逐次に切替: {e}")
                     use_pool = False
                     saved = []        # 部分結果は破棄し、逐次で全件作り直す
+                    skipped = []      # 途中までのスキップも破棄（逐次で付け直す）
             if not use_pool:
                 for idx, t in enumerate(tasks, 1):
                     if prog.wasCanceled():
@@ -4666,7 +4679,11 @@ class PersistenceMixin:
         if not cfg:
             self.notify("設定を読み込めませんでした。", "warn")
             return
-        self._apply_config(cfg)
+        try:
+            self._apply_config(cfg)
+        except Exception as exc:  # noqa: BLE001  型不正な設定でも未捕捉で落とさない
+            applog.get_logger().warning("設定の適用に失敗", exc_info=True)
+            self.notify(f"設定の一部を適用できませんでした（{exc}）。", "warn")
         self.draw_graph()
         self._set_status(f"設定を読み込み: {path}")
 
