@@ -161,6 +161,15 @@ def _edge_time(t, y, rising=True, lo=0.1, hi=0.9):
         above = y > level
         return np.where(above[:-1] & ~above[1:] & fin[:-1] & fin[1:])[0]
 
+    def cross_time(i, level):   # i と i+1 の間で level を横切る時刻を線形補間する
+        # サンプル時刻差 t[after]-t[i_lo] のままだと交差を直前サンプルに丸めてしまい、
+        # 立上り/立下り時間が最大 ±dt ずれる（遷移が数サンプルの高速エッジで相対誤差大）。
+        # crossing_times と同じく線形補間して、量子化誤差を無くす。
+        y1, y2 = y[i], y[i + 1]
+        if y2 == y1:
+            return t[i]
+        return t[i] + (level - y1) / (y2 - y1) * (t[i + 1] - t[i])
+
     if rising:
         lo_idx = up_cross(y_lo)
         if lo_idx.size == 0:
@@ -170,7 +179,7 @@ def _edge_time(t, y, rising=True, lo=0.1, hi=0.9):
         after = after[after > i_lo]     # 同じ立上りで 90% に到達する点
         if after.size == 0:
             return None
-        return float(t[int(after[0])] - t[i_lo])
+        return float(cross_time(int(after[0]), y_hi) - cross_time(i_lo, y_lo))
     else:
         hi_idx = down_cross(y_hi)
         if hi_idx.size == 0:
@@ -180,7 +189,7 @@ def _edge_time(t, y, rising=True, lo=0.1, hi=0.9):
         after = after[after > i_hi]     # 同じ立下りで 10% に到達する点
         if after.size == 0:
             return None
-        return float(t[int(after[0])] - t[i_hi])
+        return float(cross_time(int(after[0]), y_lo) - cross_time(i_hi, y_hi))
 
 
 def _window(name, n):
@@ -242,10 +251,16 @@ def histogram_top_base(y, bins=256):
 
 
 def _mid_crossings(t, y, level):
-    """level を上下に横切る位置（上昇・下降）を返す。"""
-    below = np.asarray(y, dtype=float) < level
-    up = np.where(below[:-1] & ~below[1:])[0]
-    down = np.where(~below[:-1] & below[1:])[0]
+    """level を上下に横切る位置（上昇・下降）を返す。
+
+    NaN は「上」「下」どちらでもない扱いにし、両端が有限の区間だけを交差とみなす。
+    こうしないと `y < level` が NaN に対し常に False（＝閾値以上扱い）になり、欠測が
+    1点あるだけで 下→NaN→下 が偽の立上り＋立下りに化ける（_edge_time と同じ規約）。"""
+    y = np.asarray(y, dtype=float)
+    below = y < level
+    fin = np.isfinite(y)
+    up = np.where(below[:-1] & ~below[1:] & fin[:-1] & fin[1:])[0]
+    down = np.where(~below[:-1] & below[1:] & fin[:-1] & fin[1:])[0]
     return up, down
 
 
