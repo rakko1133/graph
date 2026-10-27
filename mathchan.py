@@ -192,6 +192,20 @@ def binary(xa, ya, xb, yb, op):
     return xa, r
 
 
+def _cumtrapz(y, x):
+    """台形則の累積積分（initial=0）。scipy 非搭載時のフォールバック。
+
+    以前は右端矩形則 cumsum(y*dx) で、台形則の scipy.cumulative_trapezoid と値が
+    一致せず（例: y=x を [0,1] で積分して 0.55 vs 真値 0.5）、scipy の有無で ∫y dt
+    が変わっていた。台形則で累積して一致させる。"""
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    r = np.zeros_like(y)
+    if y.size >= 2:
+        r[1:] = np.cumsum(0.5 * (y[1:] + y[:-1]) * np.diff(x))
+    return r
+
+
 def unary(x, y, op, param=None):
     """単一系列の演算。param は移動平均の窓長やローパスのカットオフ[Hz]。"""
     x = np.asarray(x, dtype=float)
@@ -201,8 +215,7 @@ def unary(x, y, op, param=None):
             from scipy.integrate import cumulative_trapezoid
             r = cumulative_trapezoid(y, x, initial=0.0)
         except Exception:
-            dx = np.diff(x, prepend=x[0])
-            r = np.cumsum(y * dx)
+            r = _cumtrapz(y, x)        # 台形則（scipy と一致）
         return x, r
     if op == "微分 dA/dt":
         return x, np.gradient(y, x)
