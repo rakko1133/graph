@@ -1304,6 +1304,113 @@ def test_session_restore_skips_huge_selection():
     assert "自動描画を省略" in w.notify_bar.current_text()
 
 
+def test_batch_worker_count_bounded_by_memory():
+    """一括出力の並列ワーカー数が、枚数・CPU・空きメモリで安全側に抑えられること。
+
+    16GB 機でワーカーが増えすぎてスワップ→フリーズするのを防ぐための要。"""
+    import psutil
+    w = _make_app(_wave())
+    try:
+        cpu_cap = min(8, os.cpu_count() or 1)
+        assert 1 <= w._batch_worker_count(500) <= cpu_cap
+        assert w._batch_worker_count(1) == 1               # 枚数が少なければ増やさない
+        assert w._batch_worker_count(500) <= 500
+        # 空きメモリが乏しいと 1（＝呼び出し側が逐次へ落とす）になる
+        orig = psutil.virtual_memory
+        psutil.virtual_memory = staticmethod(
+            lambda: type("VM", (), {"available": 300 * 1024 ** 2})())
+        try:
+            assert w._batch_worker_count(500) == 1
+        finally:
+            psutil.virtual_memory = orig
+    finally:
+        w.close()
+
+
+def test_batch_export_parallel_is_memory_bounded_and_complete():
+    """一括出力の並列経路が、同時処理数を一定に抑えつつ全ファイルを漏れなく出すこと。
+
+    全タスクを一度にワーカーへ投入すると pickle 済みデータが山積みになり 16GB 機が
+    固まる。処理中（submit 済み・未完了）の枚数が workers*2 を超えないこと、かつ
+    出力が1ファイル1枚ずつ過不足なく揃うことを、プロセスを起こさずスレッドで確認する。"""
+    import tempfile, shutil, threading, time
+    import concurrent.futures as cf
+    import batch_render
+    workers = 2
+
+    df = _wave()
+    w = _make_app(df)
+    out_dir = tempfile.mkdtemp()
+    probe = {"live": 0, "max_live": 0, "running": 0, "max_running": 0}
+    lock = threading.Lock()
+
+    def fake_render(task):               # 実描画の代わり：並行数を測り、空ファイルを書く
+        with lock:
+            probe["running"] += 1
+            probe["max_running"] = max(probe["max_running"], probe["running"])
+        time.sleep(0.01)                 # 並行ウィンドウが観測できる程度の負荷
+        with open(task["path"], "wb") as f:
+            f.write(b"x")
+        with lock:
+            probe["running"] -= 1
+        return task["path"]
+
+    class _ProbeExecutor:                # ThreadPool を包んで「処理中の枚数」を測る
+        def __init__(self, n):
+            self._ex = cf.ThreadPoolExecutor(max_workers=n)
+        def submit(self, fn, *a, **k):
+            with lock:
+                probe["live"] += 1
+                probe["max_live"] = max(probe["max_live"], probe["live"])
+            fut = self._ex.submit(fn, *a, **k)
+            fut.add_done_callback(lambda f: self._dec())
+            return fut
+        def _dec(self):
+            with lock:
+                probe["live"] -= 1
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            self._ex.shutdown(wait=True)
+            return False
+
+    # 8ファイル（＝閾値超え）を同じ列構成で用意。テンプレ列は選択済みの 電圧/電流。
+    labels = []
+    for i in range(8):
+        lab = f"f{i:02d}.csv"
+        w.datasets[lab] = df.copy()
+        w.meta[lab] = {"path": lab, "enc": "utf-8", "delim": ","}
+        w._add_file_item(lab)
+        labels.append(lab)
+
+    orig_thr = graph_app.BATCH_PARALLEL_THRESHOLD
+    orig_render = batch_render.render_one
+    orig_dir = QtWidgets.QFileDialog.getExistingDirectory
+    try:
+        graph_app.BATCH_PARALLEL_THRESHOLD = 4          # 少数でも並列経路に入れる
+        batch_render.render_one = fake_render
+        w._batch_worker_count = lambda total: workers   # ワーカー数を固定して検証
+        w._make_batch_executor = lambda n: _ProbeExecutor(n)
+        w._batch_options_dialog = lambda: {
+            "title": "{name}", "fmt": "png", "dpi": 80, "transparent": False}
+        QtWidgets.QFileDialog.getExistingDirectory = staticmethod(
+            lambda *a, **k: out_dir)
+        w.batch_export()
+
+        produced = [f for f in os.listdir(out_dir) if f.endswith(".png")]
+        total = len(w.datasets)                          # t.csv ＋ 追加8枚
+        assert len(produced) == total, f"{len(produced)}/{total} 枚しか出ていない"
+        assert probe["max_running"] <= workers, "同時描画数が workers を超えた"
+        assert probe["max_live"] <= workers * 2, \
+            f"処理中の枚数が上限を超えた（{probe['max_live']} > {workers * 2}）＝一括投入"
+    finally:
+        graph_app.BATCH_PARALLEL_THRESHOLD = orig_thr
+        batch_render.render_one = orig_render
+        QtWidgets.QFileDialog.getExistingDirectory = orig_dir
+        w.close()
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 # ---------------- スクリプト単体実行用ランナー ----------------
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

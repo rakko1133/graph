@@ -4195,6 +4195,37 @@ class BatchMixin:
         return {"title": title_edit.text().strip(), "fmt": fmt_combo.currentText(),
                 "dpi": dpi_spin.value(), "transparent": trans.isChecked()}
 
+    def _batch_worker_count(self, total):
+        """一括出力の並列ワーカー数を、CPU・空きメモリ・枚数から安全側に決める。
+
+        ワーカーは1つずつ matplotlib/numpy/pandas と図データ（pickle されたコピー）を
+        抱えるため、数を増やしすぎると 16GB 級 PC では物理メモリを使い切ってスワップし、
+        画面全体が固まる。空きメモリから同時に走らせても安全な数を見積もり、CPU 数・
+        枚数と合わせて一番小さい値を採る。1 になった場合は呼び出し側が逐次へ落とす。"""
+        workers = min(8, os.cpu_count() or 1)
+        try:
+            import psutil
+            avail = psutil.virtual_memory().available
+            # ワーカー1つあたりの常駐メモリの概算（ライブラリ固定費＋図データ＋描画ピーク）。
+            # 空きの 60% までに収め、残りは OS とメインプロセス（全データ保持）に残す。
+            per_worker = 900 * 1024 ** 2          # ~0.9GB/worker
+            cap = int((avail * 0.6) // per_worker)
+            workers = min(workers, max(1, cap))
+        except Exception:        # noqa: BLE001  psutil 無し等は 16GB 想定で控えめに
+            workers = min(workers, 3)
+        return max(1, min(workers, total))
+
+    def _make_batch_executor(self, workers):
+        """一括出力用の ProcessPoolExecutor を作る（テストで差し替え可能にするため分離）。
+
+        max_tasks_per_child で一定枚数ごとにワーカーを作り直し、長時間バッチでの
+        メモリ断片化・肥大を抑える（Python 3.11+。古い版は引数非対応なので握りつぶす）。"""
+        import concurrent.futures as _cf
+        try:
+            return _cf.ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=25)
+        except TypeError:        # 3.10 以前は max_tasks_per_child 引数が無い
+            return _cf.ProcessPoolExecutor(max_workers=workers)
+
     def batch_export(self):
         """読み込んだ各ファイルを、現在の設定で個別に描画してファイル名ごとに一括保存する。"""
         if not self.datasets:
@@ -4303,27 +4334,49 @@ class BatchMixin:
         canceled = False
         try:
             # ファイル数が多いときだけ別プロセス並列（spawn/ピクル/フォント設定の
-            # 固定費があるので少数では逆効果）。失敗時は必ず逐次へフォールバックする。
-            use_pool = total >= BATCH_PARALLEL_THRESHOLD
+            # 固定費があるので少数では逆効果）。ワーカー数は空きメモリから安全側に決め、
+            # ワーカーが 1 しか取れない（＝メモリ逼迫）なら逐次に落とす。失敗時も必ず逐次へ。
+            workers = (self._batch_worker_count(total)
+                       if total >= BATCH_PARALLEL_THRESHOLD else 1)
+            use_pool = workers >= 2
             if use_pool:
                 try:
                     import concurrent.futures as _cf
-                    workers = min(8, (os.cpu_count() or 1))
-                    with _cf.ProcessPoolExecutor(max_workers=workers) as ex:
-                        futs = {ex.submit(batch_render.render_one, t): t for t in tasks}
-                        done = 0
-                        for fut in _cf.as_completed(futs):
+                    done = 0
+                    tasks_it = iter(tasks)
+                    # 同時にワーカーへ投入するタスク数の上限。全タスクを一度に submit
+                    # すると pickle 済みデータが山積みになって 16GB 機ではメモリが枯渇する。
+                    # 1 件終わるごとに 1 件だけ追加投入し、処理中の枚数を一定に保つ。
+                    max_inflight = workers * 2
+                    with self._make_batch_executor(workers) as ex:
+                        inflight = {}
+                        for _ in range(max_inflight):
+                            t = next(tasks_it, None)
+                            if t is None:
+                                break
+                            inflight[ex.submit(batch_render.render_one, t)] = t
+                        while inflight:
                             if prog.wasCanceled():
                                 canceled = True
-                                for f in futs:
+                                for f in inflight:
                                     f.cancel()
                                 break
-                            try:
-                                saved.append(fut.result())
-                            except Exception as e:  # noqa: BLE001
-                                skipped.append(
-                                    f"{os.path.basename(futs[fut]['path'])}（{e}）")
-                            done += 1
+                            # 完了待ち。timeout で定期的に抜けて進捗更新と
+                            # キャンセル確認を行い、GUI を固まらせない。
+                            finished, _pending = _cf.wait(
+                                inflight, timeout=0.1,
+                                return_when=_cf.FIRST_COMPLETED)
+                            for fut in finished:
+                                t = inflight.pop(fut)
+                                try:
+                                    saved.append(fut.result())
+                                except Exception as e:  # noqa: BLE001
+                                    skipped.append(
+                                        f"{os.path.basename(t['path'])}（{e}）")
+                                done += 1
+                                nt = next(tasks_it, None)   # 1件終わったら1件補充
+                                if nt is not None and not prog.wasCanceled():
+                                    inflight[ex.submit(batch_render.render_one, nt)] = nt
                             prog.setLabelText(f"出力中… {done}/{total}")
                             prog.setValue(done)
                             QtWidgets.QApplication.processEvents()
