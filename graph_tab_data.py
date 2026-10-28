@@ -16,7 +16,8 @@ class DataIOMixin:
         paths = []
         for url in event.mimeData().urls():
             p = url.toLocalFile()
-            if p and os.path.splitext(p)[1].lower() in self._ACCEPT_EXTS:
+            # 組み込み拡張子に加え、register_loader で登録された形式も受け付ける
+            if p and os.path.splitext(p)[1].lower() in data_loader.accepted_exts():
                 paths.append(p)
         if not paths:
             return
@@ -268,7 +269,8 @@ class DataIOMixin:
             self._load_folder(d)
 
     def _load_folder(self, d):
-        exts = set(data_loader.TABLE_EXTS)   # 回路(.asc/.net)は誤爆実行を避けて除外
+        # 組み込み＋登録ローダーの対応拡張子。回路(.asc/.net)は誤爆実行を避けて対象外
+        exts = set(data_loader.accepted_exts())
         try:
             names = sorted(os.listdir(d))
         except OSError as e:

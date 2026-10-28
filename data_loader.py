@@ -32,17 +32,57 @@ EXT_GROUPS = (
     ("Excel", (".xlsx", ".xls", ".xlsm")),
     ("波形/計測", (".wav", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5")),
 )
-# 受け付ける全拡張子
+# 受け付ける全拡張子（組み込み形式。登録ローダーも含めた実際の受付は accepted_exts()）
 ACCEPT_EXTS = tuple(e for _name, exts in EXT_GROUPS for e in exts)
 # 表データとして直接開ける拡張子（フォルダ一括読み込みの対象）
 TABLE_EXTS = ACCEPT_EXTS
+
+
+# ---- ローダーのプラグイン機構 ------------------------------------------------
+# 「拡張子 → 読み込みハンドラ」の登録表。新しいファイル形式は register_loader() で
+# 足せる（load_table のディスパッチ分岐を編集しなくてよい）。組み込み形式も同じ表に
+# 登録してあり、本体と差し込みで扱いを分けない。ハンドラの約束:
+#   handler(path, *, encoding, delimiter, sheet) -> (DataFrame, used_encoding, used_delimiter)
+# 未登録の拡張子は既定の CSV/TSV ローダー（_load_csv）が処理する。
+_LOADERS = {}
+
+
+def register_loader(exts, handler):
+    """拡張子（'.foo' 単体かタプル）に読み込みハンドラを登録する（同じ拡張子は後勝ち）。
+
+    handler(path, *, encoding, delimiter, sheet) は
+    (DataFrame, 使用encoding, 使用delimiter) を返すこと（CSV以外は encoding/delimiter を
+    空文字などにしてよい）。本体（load_table）を一切触らずに対応形式を増やせる。"""
+    if isinstance(exts, str):
+        exts = (exts,)
+    for e in exts:
+        _LOADERS[e.lower()] = handler
+    return handler
+
+
+def get_loader(ext):
+    """拡張子に対応する登録ハンドラを返す（無ければ None＝既定のCSVローダーが使われる）。"""
+    return _LOADERS.get(ext.lower())
+
+
+def loader_exts():
+    """登録済みハンドラの拡張子一覧（昇順）。"""
+    return tuple(sorted(_LOADERS))
+
+
+def accepted_exts():
+    """読み込みを受け付ける拡張子（組み込み ACCEPT_EXTS＋登録ローダー）。
+
+    D&D・フォルダ走査・ファイルダイアログのフィルタはこれを使うので、register_loader
+    した形式も自動的に開ける（組み込みだけが欲しいときは ACCEPT_EXTS を参照）。"""
+    return tuple(sorted(set(ACCEPT_EXTS) | set(_LOADERS)))
 
 
 def file_dialog_filter():
     """QFileDialog 用のフィルタ文字列を EXT_GROUPS から組み立てる。"""
     def pat(exts):
         return " ".join("*" + e for e in exts)
-    parts = ["データ (" + pat(ACCEPT_EXTS) + ")"]
+    parts = ["データ (" + pat(accepted_exts()) + ")"]   # 登録ローダーの形式も含める
     parts += [f"{name} ({pat(exts)})" for name, exts in EXT_GROUPS]
     parts.append("すべて (*.*)")
     return ";;".join(parts)
@@ -275,39 +315,40 @@ def _load_hdf5(path):
     return pd.DataFrame({k: pd.Series(v) for k, v in cols.items()})
 
 
-def load_table(path, encoding=None, delimiter=None, sheet=None):
-    """表・波形ファイルを読み込み (DataFrame, 使用encoding, 使用delimiter) を返す。
-
-    encoding / delimiter は CSV/TSV系のみ意味を持ち、None なら自動判定。
-    sheet は Excel のシート名/番号（None=先頭）。その他の形式は拡張子で自動判別。
-    """
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"ファイルが見つかりません: {path}")
-
+# ---- 組み込みローダー（いずれも register_loader で登録する。未登録拡張子は _load_csv）----
+def _load_excel(path, *, encoding=None, delimiter=None, sheet=None):
     ext = os.path.splitext(path)[1].lower()
-    # --- Excel ---
-    if ext in (".xlsx", ".xlsm", ".xls"):
-        try:
-            df = pd.read_excel(path, sheet_name=sheet if sheet is not None else 0)
-        except ImportError as e:
-            if ext == ".xls":   # 旧形式 .xls は openpyxl では読めず xlrd が必要
-                raise ValueError('.xls の読み込みには xlrd が必要です'
-                                 '（pip install "xlrd>=2.0.1"）。') from e
-            raise ValueError("Excel(.xlsx) の読み込みには openpyxl が必要です"
-                             "（pip install openpyxl）。") from e
-        if df.shape[1] == 0:
-            raise ValueError("シートから列を読み取れませんでした。")
-        return _normalize_columns(df), "excel", "excel"
-    # --- 波形・計測形式 ---
-    if ext == ".wav":
-        return _normalize_columns(_load_wav(path)), "wav", ""
-    if ext == ".tdms":
-        return _normalize_columns(_load_tdms(path)), "tdms", ""
-    if ext in (".mf4", ".mdf"):
-        return _normalize_columns(_load_mdf(path)), "mdf", ""
-    if ext in (".h5", ".hdf5"):
-        return _normalize_columns(_load_hdf5(path)), "hdf5", ""
+    try:
+        df = pd.read_excel(path, sheet_name=sheet if sheet is not None else 0)
+    except ImportError as e:
+        if ext == ".xls":   # 旧形式 .xls は openpyxl では読めず xlrd が必要
+            raise ValueError('.xls の読み込みには xlrd が必要です'
+                             '（pip install "xlrd>=2.0.1"）。') from e
+        raise ValueError("Excel(.xlsx) の読み込みには openpyxl が必要です"
+                         "（pip install openpyxl）。") from e
+    if df.shape[1] == 0:
+        raise ValueError("シートから列を読み取れませんでした。")
+    return _normalize_columns(df), "excel", "excel"
 
+
+def _load_wav_tab(path, **_opts):
+    return _normalize_columns(_load_wav(path)), "wav", ""
+
+
+def _load_tdms_tab(path, **_opts):
+    return _normalize_columns(_load_tdms(path)), "tdms", ""
+
+
+def _load_mdf_tab(path, **_opts):
+    return _normalize_columns(_load_mdf(path)), "mdf", ""
+
+
+def _load_hdf5_tab(path, **_opts):
+    return _normalize_columns(_load_hdf5(path)), "hdf5", ""
+
+
+def _load_csv(path, *, encoding=None, delimiter=None, sheet=None):
+    """既定のローダー: CSV/TSV/テキスト（文字コード・区切りを自動判定）。"""
     if encoding is None:
         encoding = detect_encoding(path)
     if delimiter is None:
@@ -338,6 +379,30 @@ def load_table(path, encoding=None, delimiter=None, sheet=None):
         raise ValueError("列を読み取れませんでした。区切り文字を確認してください。")
 
     return _normalize_columns(df), encoding, delimiter
+
+
+register_loader((".xlsx", ".xlsm", ".xls"), _load_excel)
+register_loader(".wav", _load_wav_tab)
+register_loader(".tdms", _load_tdms_tab)
+register_loader((".mf4", ".mdf"), _load_mdf_tab)
+register_loader((".h5", ".hdf5"), _load_hdf5_tab)
+
+
+def load_table(path, encoding=None, delimiter=None, sheet=None):
+    """表・波形ファイルを読み込み (DataFrame, 使用encoding, 使用delimiter) を返す。
+
+    encoding / delimiter は CSV/TSV系のみ意味を持ち、None なら自動判定。
+    sheet は Excel のシート名/番号（None=先頭）。その他の形式は拡張子で自動判別する。
+
+    拡張子ごとの読み込みは登録表（register_loader）に委譲する。登録が無い拡張子は
+    既定の CSV/TSV ローダーが処理するので、新形式は register_loader() だけで足せる。
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"ファイルが見つかりません: {path}")
+
+    ext = os.path.splitext(path)[1].lower()
+    handler = get_loader(ext) or _load_csv   # 未登録拡張子は既定のCSV/TSVローダー
+    return handler(path, encoding=encoding, delimiter=delimiter, sheet=sheet)
 
 
 def numeric_columns(df):

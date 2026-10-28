@@ -1083,6 +1083,50 @@ def test_extension_list_has_one_source():
     assert set(data_loader.TABLE_EXTS) == set(data_loader.ACCEPT_EXTS)
 
 
+def test_builtin_loaders_registered_and_csv_fallback():
+    """組み込み形式は登録表に載り、未登録拡張子は既定のCSVローダーに落ちること。"""
+    import data_loader
+    for e in (".xlsx", ".xls", ".xlsm", ".wav", ".tdms", ".mf4", ".mdf", ".h5", ".hdf5"):
+        assert data_loader.get_loader(e) is not None, f"{e} のローダーが未登録"
+    # CSV/TSV/TXT は明示登録せず、既定ローダー(_load_csv)がフォールバックで処理する
+    for e in (".csv", ".tsv", ".txt"):
+        assert data_loader.get_loader(e) is None
+    # 組み込みだけのとき、受付拡張子は従来の ACCEPT_EXTS と一致
+    assert set(data_loader.accepted_exts()) == set(data_loader.ACCEPT_EXTS)
+
+
+def test_loader_registry_is_pluggable():
+    """本体(load_table)を触らずに、新しい拡張子のローダーを足せること。
+
+    拡張性の肝: register_loader するだけで load_table がそのハンドラを使い、
+    受付拡張子(accepted_exts)にも自動で載る。大文字小文字も区別しない。"""
+    import data_loader
+    import tempfile
+    sentinel = pd.DataFrame({"時刻": [0, 1], "値": [10.0, 20.0]})
+    calls = []
+
+    def _loader(path, **opts):
+        calls.append(path)
+        return sentinel, "custom-enc", ""
+
+    data_loader.register_loader((".zzz", ".ZQ2"), _loader)
+    tmp = os.path.join(tempfile.gettempdir(), "probe.zzz")
+    open(tmp, "w").close()
+    try:
+        assert data_loader.get_loader(".ZZZ") is _loader      # 大文字小文字非依存
+        assert ".zzz" in data_loader.accepted_exts()
+        assert "*.zzz" in data_loader.file_dialog_filter()    # ダイアログにも載る
+        df, enc, delim = data_loader.load_table(tmp)          # load_table が委譲
+        assert enc == "custom-enc" and list(df.columns) == ["時刻", "値"]
+        assert calls == [tmp]
+    finally:
+        data_loader._LOADERS.pop(".zzz", None)
+        data_loader._LOADERS.pop(".zq2", None)
+        os.remove(tmp)
+    # 後片付け後は元に戻る（他テストへ影響しない）
+    assert set(data_loader.accepted_exts()) == set(data_loader.ACCEPT_EXTS)
+
+
 def test_dark_background_check_is_shared():
     """地色の明暗判定が1本で、グラフ側とGUI側で食い違わないこと。"""
     import plotter
