@@ -1411,6 +1411,69 @@ def test_batch_export_parallel_is_memory_bounded_and_complete():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+def test_decimate_for_export_matches_worker_output_pixel_identical():
+    """一括出力の事前間引きが、ワーカー側の間引き（フルデータ）と画素まで一致すること。
+
+    事前間引きの唯一の約束＝『出力画像は従来と変わらない』を機械的に担保する。"""
+    import plotter
+    import batch_render
+    n = 50000
+    t = np.linspace(0, 1, n)
+    y = np.sin(2 * np.pi * 50 * t) + 0.1 * np.random.default_rng(0).standard_normal(n)
+    series = [{"label": "y", "x": t, "y": y, "style": None,
+               "axis": "primary", "kind": "", "yerr": None}]
+    max_points = graph_app.DECIMATE_TARGET
+
+    def render_png(srs):
+        task = {"series": srs, "categories": None, "ctype": "折れ線",
+                "title": "t", "xlabel": "x", "ylabel": "y",
+                "xlim": None, "ylim": None, "sec_label": "", "max_points": max_points,
+                "fmt": {}, "ratio": None, "zlabel": "", "view_init": None,
+                "threed": False, "figsize": (6.4, 4.8), "tight": True,
+                "dpi": 90, "transparent": False, "font_name": None}
+        import io
+        buf = io.BytesIO()
+        task["path"] = buf
+        return batch_render.render_one(task) and buf.getvalue()
+
+    # (A) 従来: フルデータを渡し、ワーカー側で間引き
+    full_png = render_png([dict(s) for s in series])
+    # (B) 新: 事前間引きしてから渡す（ワーカー側は素通り）
+    dec = plotter.decimate_for_export(series, "折れ線", max_points)
+    assert len(dec[0]["y"]) <= max_points, "事前間引きで点数が減っていない"
+    # 概形（最小・最大）が保たれている＝包絡が崩れていない
+    assert abs(float(dec[0]["y"].max()) - float(y.max())) < 1e-9
+    assert abs(float(dec[0]["y"].min()) - float(y.min())) < 1e-9
+    dec_png = render_png(dec)
+    assert full_png == dec_png, "事前間引きの出力が従来と画素一致しない"
+
+
+def test_decimate_for_export_skips_when_unsafe():
+    """近似曲線・XY入替・単位換算・3Dのときは事前間引きせず従来挙動を保つこと。"""
+    import plotter
+    n = 20000
+    t = np.linspace(0, 1, n)
+    series = [{"label": "y", "x": t, "y": np.sin(t), "style": None,
+               "axis": "primary", "kind": "", "yerr": None}]
+    mp = graph_app.DECIMATE_TARGET
+    # 近似曲線ON → 間引かない（同一オブジェクトを返す）
+    assert plotter.decimate_for_export(series, "折れ線", mp,
+                                       trendline={"type": "線形"}) is series
+    # XY入替ON → 間引かない
+    assert plotter.decimate_for_export(series, "折れ線", mp, swap_xy=True) is series
+    # 単位換算あり → 間引かない
+    assert plotter.decimate_for_export(series, "折れ線", mp, yscale="2*x") is series
+    # 3D → 間引かない
+    assert plotter.decimate_for_export(series, "折れ線", mp, threed=True) is series
+    # 面/ステム（min/max間引き対象外の種別）→ 間引かない
+    assert plotter.decimate_for_export(series, "面", mp) is series
+    # 誤差バー付き → その系列は間引かない
+    s_err = [{"label": "y", "x": t, "y": np.sin(t), "style": None,
+              "axis": "primary", "kind": "", "yerr": np.full(n, 0.1)}]
+    out = plotter.decimate_for_export(s_err, "折れ線", mp)
+    assert len(out[0]["y"]) == n
+
+
 # ---------------- スクリプト単体実行用ランナー ----------------
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

@@ -702,3 +702,33 @@ def decimate_minmax(x, y, max_points):
     idx[0::2] = first
     idx[1::2] = second
     return x[idx], y[idx]
+
+
+def _decimate_series_entry(sr, line, default_skind, max_points):
+    """1系列を、_draw_xy の間引きと同一判定・同一アルゴリズムで事前間引きする。
+
+    一括出力で pickle/転送する前にデータ量を減らす用途。曖昧さの無い素直な系列
+    （数値X・誤差バー無し・line/scatter/step・点数が max_points 超）だけを対象にし、
+    それ以外は sr をそのまま返す（描画側の間引きに委ねれば結果は変わらない）。
+    間引き後は点数が max_points 以下になるので、ワーカー側の間引きは素通りする。"""
+    x_raw = sr.get("x")
+    if x_raw is None or sr.get("y") is None or sr.get("yerr") is not None:
+        return sr
+    skind = sr.get("kind") or default_skind or ("line" if line else "scatter")
+    if skind not in ("line", "scatter", "step"):
+        return sr
+    y = _num(sr["y"])
+    if len(y) <= max_points:
+        return sr
+    x, kind = _coerce_x(x_raw)
+    if kind != "numeric":          # 日時/カテゴリは描画側に委ね、軸整形の差異を避ける
+        return sr
+    xx = np.asarray(x, dtype=float)
+    if skind in ("line", "step"):          # min/max エンベロープ（_draw_xy と同一）
+        nx, ny = decimate_minmax(xx, y, max_points)
+    else:                                  # scatter は等間隔サブサンプル（_draw_xy と同一）
+        step = max(1, len(y) // max_points)
+        nx, ny = xx[::step], y[::step]
+    nsr = dict(sr)
+    nsr["x"], nsr["y"] = nx, ny
+    return nsr

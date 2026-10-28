@@ -4293,6 +4293,13 @@ class BatchMixin:
             except Exception as e:  # noqa: BLE001
                 skipped.append(f"{label}（{e}）")
                 continue
+            # 大容量データは pickle/プロセス間転送の前にここで間引く（描画と同一結果）。
+            # フルデータを丸ごとワーカーへ送らずに済み、転送量とワーカーのメモリが減る。
+            if max_points:
+                series = plotter.decimate_for_export(
+                    series, ctype, max_points, threed=is3d,
+                    trendline=fmt.get("trendline"), swap_xy=fmt.get("swap_xy", False),
+                    xscale=fmt.get("xscale", ""), yscale=fmt.get("yscale", ""))
             stem = os.path.splitext(label)[0]
             sec_label = " / ".join(s["label"] for s in series
                                    if s.get("axis") == "secondary")

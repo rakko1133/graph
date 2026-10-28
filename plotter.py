@@ -19,7 +19,8 @@ from plotter_draw import *     # noqa: F401,F403
 from plotter_draw import (_draw_xy, _draw_hist, _draw_box, _draw_bar, _draw_pie,
                           _draw_area, _draw_stack, _draw_violin, _draw_hist2d,
                           _draw_hexbin, _draw_heatmap, _draw_3d,
-                          _remove_twin, _remove_aux_axes, _apply_scope, _data_labels)
+                          _remove_twin, _remove_aux_axes, _apply_scope, _data_labels,
+                          _decimate_series_entry)
 
 
 CHART_TYPES = [
@@ -136,6 +137,45 @@ SERIES_KINDS = {"自動": "", "折れ線": "line", "棒": "bar", "面": "area",
 
 
 SERIES_AXES = {"主軸": "primary", "第2軸": "secondary"}
+
+
+def decimate_for_export(series, chart_type, max_points, *, threed=False,
+                        trendline=None, swap_xy=False, xscale="", yscale=""):
+    """一括出力で pickle/プロセス間転送する前に、系列を事前間引きして送信量を減らす。
+
+    描画側（_draw_xy）の min/max 間引きと結果が一致するよう、曖昧さの無い素直な条件の
+    ときだけ実施する。満たさないケースは series をそのまま返し、従来どおりワーカー側の
+    間引きに委ねる（＝出力画像は常に従来と一致。安全側で削減機会を見送るだけ）。
+    事前間引き後は点数が max_points 以下になり、ワーカー側の間引きは素通りする。
+
+    除外条件:
+      - max_points が 0（間引きOFF）／3D／XY系でない種別
+      - 近似曲線ON（フル解像度でフィットするため、間引くと係数・R²が変わる）
+      - XY入れ替えON（描画時に x/y を入れ替えてから間引くため）
+      - 単位換算（xscale/yscale）指定あり（式が非単調だと最小/最大点が変わり得る）
+    """
+    if not max_points or threed or chart_type not in _XY_TYPES:
+        return series
+    ttype = str((trendline or {}).get("type", "")).strip()
+    if ttype not in ("", "なし", "（なし）", "none"):   # 近似曲線ONは見送り
+        return series
+    if swap_xy:
+        return series
+
+    def _ident(spec):      # plot_series の _needs と同じ「変換なし」判定
+        return (spec is None or spec == 1.0
+                or (isinstance(spec, str) and spec.strip() in ("", "1")))
+    if not (_ident(xscale) and _ident(yscale)):
+        return series
+
+    default_skind = _XY_DEFAULT_KIND.get(chart_type)
+    line = (chart_type == "折れ線")
+    out, changed = [], False
+    for sr in series:
+        nsr = _decimate_series_entry(sr, line, default_skind, max_points)
+        changed = changed or (nsr is not sr)
+        out.append(nsr)
+    return out if changed else series
 
 
 def plot_series(
