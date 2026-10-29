@@ -1127,6 +1127,71 @@ def test_loader_registry_is_pluggable():
     assert set(data_loader.accepted_exts()) == set(data_loader.ACCEPT_EXTS)
 
 
+def test_builtin_chart_types_registered_and_views():
+    """組み込み18種別が登録表に載り、派生ビュー（CHART_TYPES等）が整合すること。"""
+    import plotter
+    expected = ["折れ線", "面", "積み上げ面", "ステップ", "ステム", "棒", "横棒",
+                "積み上げ棒", "散布図", "ヒストグラム", "2Dヒストグラム", "hexbin",
+                "箱ひげ", "バイオリン", "ヒートマップ", "円", "ドーナツ", "曲面"]
+    assert plotter.CHART_TYPES == expected          # 並び（GUIコンボ順）も一致
+    assert plotter.chart_types() == expected
+    for ct in expected:
+        assert plotter.get_chart_type(ct) is not None, f"{ct} が未登録"
+        assert ct in plotter.CHART_INFO
+    # 分類フラグが派生ビューへ正しく反映される（GUI側の判定が依存）
+    assert set(plotter._PIE_TYPES) == {"円", "ドーナツ"}
+    assert set(plotter._XY_TYPES) == {"折れ線", "散布図", "面", "ステップ", "ステム"}
+    assert set(plotter._SCOPE_TYPES) == {"折れ線", "散布図"}
+    assert set(plotter._SWAP_TYPES) == {"折れ線", "散布図", "面", "積み上げ面",
+                                        "ステップ", "ステム", "2Dヒストグラム", "hexbin"}
+    assert plotter._XY_DEFAULT_KIND == {"折れ線": "line", "散布図": "scatter",
+                                        "面": "area", "ステップ": "step", "ステム": "stem"}
+    assert plotter.always_3d("曲面") and not plotter.always_3d("折れ線")
+
+
+def test_chart_type_registry_is_pluggable():
+    """本体(plot_series)を触らずに、新しいグラフ種別を足せること。
+
+    拡張性の肝: register_chart_type するだけで CHART_TYPES/CHART_INFO と各分類ビュー
+    に自動で載り、plot_series がその種別の draw へ委譲する。"""
+    import plotter
+    from matplotlib.figure import Figure
+    calls = []
+
+    def _draw(ax, series, ctx, spec):
+        calls.append((spec.name, len(series)))
+        ax.plot(series[0]["x"], series[0]["y"])
+        return None
+
+    spec = plotter.ChartType(
+        "テスト種別",
+        info={"use_x": True, "multi_y": True, "multi_file": True, "hint": "テスト"},
+        draw=_draw, is_xy=True, default_kind="line", swap_ok=True, scope_ok=True)
+    plotter.register_chart_type(spec)
+    try:
+        # 登録表・派生ビューに自動で載る（本体のリテラルは不変）
+        assert plotter.get_chart_type("テスト種別") is spec
+        assert "テスト種別" in plotter.CHART_TYPES
+        assert plotter.CHART_INFO["テスト種別"]["hint"] == "テスト"
+        assert "テスト種別" in plotter._XY_TYPES
+        assert "テスト種別" in plotter._SWAP_TYPES
+        assert "テスト種別" in plotter._SCOPE_TYPES
+        assert plotter._XY_DEFAULT_KIND["テスト種別"] == "line"
+        # plot_series が新種別の draw へ委譲する（dispatch は本体に手を入れず拡張）
+        fig = Figure(); ax = fig.add_subplot(111)
+        xs = np.linspace(0, 1, 10)
+        plotter.plot_series(ax, [{"label": "a", "x": xs, "y": xs * 2}], "テスト種別")
+        assert calls == [("テスト種別", 1)]
+        assert len(ax.get_lines()) == 1
+    finally:
+        plotter._CHART_SPECS.pop("テスト種別", None)
+        if "テスト種別" in plotter._CHART_ORDER:
+            plotter._CHART_ORDER.remove("テスト種別")
+        plotter._rebuild_chart_views()
+    # 後片付け後は元の18種別に戻る（他テストへ影響しない）
+    assert "テスト種別" not in plotter.CHART_TYPES and len(plotter.CHART_TYPES) == 18
+
+
 def test_dark_background_check_is_shared():
     """地色の明暗判定が1本で、グラフ側とGUI側で食い違わないこと。"""
     import plotter
