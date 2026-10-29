@@ -4,6 +4,7 @@ import os
 import re
 import string
 import sys
+from typing import Any, Optional, Protocol, Tuple, runtime_checkable
 
 from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets
 from matplotlib.backends.backend_qtagg import (
@@ -42,6 +43,45 @@ NOTIFY_MS = 8000         # 通知バーの自動消灯までの時間（ミリ�
 UI_LEVEL_ORDER = ("基本", "標準", "全部")
 
 
+@runtime_checkable
+class PluginHost(Protocol):
+    """タブプラグインがホスト本体に依存してよい公開契約（狭いファサード）。
+
+    プラグインの build(host) / draw_overlay(host, ax) / collect_config(host) /
+    apply_config(host, cfg) に渡される host は、実体は GraphApp だが、プラグインは
+    この Protocol が宣言する範囲（下記5メソッド）だけに依存すること。ここに無い
+    内部属性・メソッド（アンダースコア名など）に触ると、本体の内部改修でプラグインが
+    壊れる。逆にこの契約さえ守れば、本体の構造が変わってもプラグインは動き続ける。
+
+    GraphApp はこの契約を構造的に満たすので、isinstance(app, PluginHost)
+    （runtime_checkable）で満足を確認できる。新しいホスト実装を作る場合も、この5つ
+    を備えればプラグインを受け入れられる。
+    """
+
+    def draw_graph(self) -> None:
+        """メイングラフを現在の設定で再描画する（各タブの draw_overlay もここで走る）。"""
+        ...
+
+    def analysis_xy_or_warn(self, msg: str = ...) -> Optional[Tuple[Any, Any, str]]:
+        """いま選んでいる解析対象を (t, y, ラベル) で返す。未選択なら通知して None。"""
+        ...
+
+    def series_xy(self, fl: str, col: str, gated: bool = ...) -> Tuple[Any, Any]:
+        """系列 (ファイル, 列) の数値配列 (x, y) を取り出す。"""
+        ...
+
+    def register_dataset(self, base_label: str, df: Any, *, path: Optional[str] = ...,
+                         enc: str = ..., delim: str = ...,
+                         status: Optional[str] = ...) -> str:
+        """生成した表を新しいデータセットとして登録し、確定したラベルを返す。"""
+        ...
+
+    def notify(self, text: str, level: str = ..., detail: str = ...,
+               timeout_ms: int = ...) -> None:
+        """非モーダルの通知バーにメッセージを出す（level: info/ok/warn/error）。"""
+        ...
+
+
 class TabPlugin:
     """解析タブ1枚を表すプラグイン。
 
@@ -51,22 +91,24 @@ class TabPlugin:
       order     : 小さいほど左（＝上のタブ）に来る
       min_level : このタブが現れる最小の表示レベル（基本 < 標準 < 全部）
 
-    build(app) はタブの中身ウィジェットを返す。app は GraphApp インスタンスなので、
-    既存の描画・解析メソッド（app.draw_graph / app.analysis_xy_or_warn 等）を
-    そのまま呼べる。独自ロジックはプラグイン側に持ってもよい。
+    build(app) はタブの中身ウィジェットを返す。app は PluginHost 契約を満たすホスト
+    （実体は GraphApp）。描画・解析はこの契約のメソッド（draw_graph /
+    analysis_xy_or_warn / series_xy / register_dataset / notify）に依存すること。
+    契約外の内部メソッドに触ると本体の改修で壊れる。独自ロジックはプラグイン側に持つ。
 
-    任意で次のメソッドを定義すると、コア（graph_app.py）を触らずに拡張できる:
-      draw_overlay(app, ax)     : 描画のたびに呼ばれ、メイングラフ(ax)へ注記・
-                                  目印などを重ねられる（app.draw_graph で再描画）。
-      collect_config(app)->dict : このタブの設定を保存用 dict で返す（JSON化可能に）。
-      apply_config(app, cfg)    : 保存した dict からこのタブの設定を復元する。
+    任意で次のメソッドを定義すると、コア（graph_app.py）を触らずに拡張できる。
+    いずれの host 引数も PluginHost 契約を満たす:
+      draw_overlay(host, ax)     : 描画のたびに呼ばれ、メイングラフ(ax)へ注記・
+                                   目印などを重ねられる（host.draw_graph で再描画）。
+      collect_config(host)->dict : このタブの設定を保存用 dict で返す（JSON化可能に）。
+      apply_config(host, cfg)    : 保存した dict からこのタブの設定を復元する。
     """
     key = ""
     title = ""
     order = 100
     min_level = "全部"
 
-    def build(self, app):
+    def build(self, app: "PluginHost"):
         raise NotImplementedError(f"{type(self).__name__}.build を実装してください")
 
 
@@ -613,6 +655,7 @@ __all__ = [
     "ProgressStrip",
     "TableLoadThread",
     "UI_LEVEL_ORDER",
+    "PluginHost",
     "TabPlugin",
     "register_tab",
     "registered_tabs",

@@ -914,6 +914,28 @@ def test_plugin_can_draw_overlay_and_persist_settings():
         C._TAB_REGISTRY[:] = [p for p in C._TAB_REGISTRY if p.key != "ov_probe"]
 
 
+def test_plugin_host_contract():
+    """プラグインへ渡すホストの公開契約(PluginHost)を GraphApp が満たすこと。
+
+    拡張性の肝: プラグインはこの5メソッドだけに依存する約束。契約が runtime_checkable
+    Protocol として明文化され、GraphApp が構造的に満たすことを機械的に担保する。"""
+    import graph_app_common as C
+    # 契約は Protocol として存在し、本体に渡すメソッド名が宣言どおり揃っている
+    contract = ("draw_graph", "analysis_xy_or_warn", "series_xy",
+                "register_dataset", "notify")
+    w = graph_app.GraphApp()
+    try:
+        assert isinstance(w, C.PluginHost)          # 構造的部分型として満たす
+        for name in contract:
+            assert callable(getattr(w, name, None)), f"{name} が契約に無い"
+    finally:
+        w.close()
+    # 契約を欠くオブジェクトは満たさない（Protocol が形だけでないことの確認）
+    class _Partial:
+        def draw_graph(self): pass
+    assert not isinstance(_Partial(), C.PluginHost)
+
+
 def test_ui_level_hides_without_destroying():
     """表示レベルは setVisible だけで、ウィジェットも設定も失わないこと。"""
     w = _make_app(_wave())
